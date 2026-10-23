@@ -9,6 +9,8 @@ from pydantic.json_schema import SkipJsonSchema
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from openviking_cli.utils.config.vlm_config import VLMCredential
+# 服务台扩展接入：专属配置独立存放，减少后续合并官方 schema 时的冲突。
+from vikingbot.extensions.feishu_helpdesk.config import FeishuHelpdeskConfig
 
 
 class ChannelType(str, Enum):
@@ -126,6 +128,8 @@ class FeishuChannelConfig(BaseChannelConfig):
     app_secret: str = ""
     encrypt_key: str = ""
     verification_token: str = ""
+    # 服务台扩展接入：默认关闭；启用后由渠道管理器选择服务台子类。
+    helpdesk: FeishuHelpdeskConfig = Field(default_factory=FeishuHelpdeskConfig)
     domain: str = Field(
         default="https://open.feishu.cn",
         description="开放平台域名：飞书用 https://open.feishu.cn，Lark 国际版用 https://open.larksuite.com",

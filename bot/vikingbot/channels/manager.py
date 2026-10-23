@@ -68,6 +68,12 @@ class ChannelManager:
             elif channel_config.type == ChannelType.FEISHU:
                 from vikingbot.channels.feishu import FeishuChannel
 
+                # 服务台扩展接入：仅显式启用时使用子类，消息收发继续继承原有 FeishuChannel。
+                if channel_config.helpdesk.enabled:
+                    from vikingbot.extensions.feishu_helpdesk.channel import FeishuHelpdeskChannel
+
+                    FeishuChannel = FeishuHelpdeskChannel
+
                 channel = FeishuChannel(
                     channel_config,
                     self.bus,

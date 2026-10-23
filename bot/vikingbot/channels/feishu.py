@@ -313,6 +313,14 @@ class FeishuChannel(BaseChannel):
             return getattr(getattr(mention, "id", None), "open_id", None) == bot_id
         return bool(self.config.bot_name and getattr(mention, "name", "") == self.config.bot_name)
 
+    # 服务台扩展接入：从 start() 提取原有事件注册，让子类在同一分发器追加工单事件，
+    # 避免复制整段官方启动流程；基础渠道仍仅注册原有 IM 消息事件。
+    def _event_handler_builder(self):
+        """Build the IM dispatcher; channel extensions may register additional events."""
+        return lark.EventDispatcherHandler.builder(
+            self.config.encrypt_key or "", self.config.verification_token or ""
+        ).register_p2_im_message_receive_v1(self._on_message_sync)
+
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:
@@ -338,15 +346,8 @@ class FeishuChannel(BaseChannel):
             .build()
         )
 
-        # Create event handler (only register message receive, ignore other events)
-        event_handler = (
-            lark.EventDispatcherHandler.builder(
-                self.config.encrypt_key or "",
-                self.config.verification_token or "",
-            )
-            .register_p2_im_message_receive_v1(self._on_message_sync)
-            .build()
-        )
+        # 服务台扩展接入：子类完成追加注册后统一 build，复用原有飞书长连接和消息处理。
+        event_handler = self._event_handler_builder().build()
 
         # Create WebSocket client for long connection
         self._ws_client = lark.ws.Client(
