@@ -4,7 +4,7 @@
 
 ## 工作流程
 
-1. 启动时读取机器人 `open_id`，使用服务台凭据订阅工单创建和更新事件。
+1. 普通飞书 IM 按原路径启动；独立后台任务读取机器人 `open_id`，使用服务台凭据订阅工单创建和更新事件，成功后标记服务台就绪并启动 CLI 保活。
 2. `helpdesk.ticket.created_v1` 直接读取 `event.chat_id`；`helpdesk.ticket.updated_v1` 读取 `event.object.chat_id`。创建时没有绑定群就等待后续更新，不扫描群列表。
 3. 对配置的服务台、当前应用和未关闭工单，先以机器人身份检查是否已在群内。
 4. 未入群时，检查 lark-cli 的本地用户登录态；有可用授权才通过 `im chat.members create --as user` 邀请当前应用，再用机器人身份验证成员状态。未登录时跳过邀请，不记录为已入群。接口返回成功、待审批或部分成功均不能代替成员验证。
@@ -12,7 +12,9 @@
 
 网络超时、连接故障、限流和明确可重试的服务端临时错误会在同一个入群任务内重试，最多尝试 4 次，间隔为 2、5、10 秒，无需等待新的工单事件。同群并发事件共享该任务；每次尝试先检查 Bot 是否已在群内，避免响应超时后重复邀请。权限不足、授权失效、待审批和未登录不自动重试。关单或停止渠道会取消请求及退避等待；重试耗尽后记录失败，后续工单更新事件仍可再次触发入群。
 
-服务台的机器人阶段未必有可加入的群。只有飞书事件提供绑定 `chat_id` 后才能加入，通常发生在转人工时。工单已关闭（状态 50/51/52）不触发邀请，不主动修改工单状态。
+服务台的机器人阶段未必有可加入的群。只有飞书事件提供绑定 `chat_id` 后才能加入，通常发生在转人工时。工单已关闭（状态 50/51/52）不触发邀请，不主动修改工单状态。关闭工单后，尚未完成回写的入群任务不能恢复旧关联；停止渠道会清空工单关联缓存，防止迟到消息携带过期来源。
+
+服务台身份查询或订阅缓慢、超时、权限不足时，不阻塞或停止普通飞书 IM。初始化尚未成功时不处理工单事件；失败会明确记录 `Feishu Helpdesk unavailable; native IM remains active`，不视为服务台可用，也不绕过服务台权限。修复服务台配置、网络或权限后重启渠道重新初始化；不在后台无限重试。停止渠道会取消未完成的初始化、工单和保活任务。
 
 ## 配置
 
@@ -96,7 +98,19 @@ CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的�
 
 文本、富文本、图片下载与卡片图片、引用回复、话题隔离、处理表情、命令授权、发送者白名单，以及下游 Agent/工具/Skills 均使用现有实现。文件、音频等按上游已有解析能力处理，扩展不另行实现解析器。
 
-本扩展只新增工单会话的发现和机器人入群；不新增工单关闭、字段填写、匿名客服身份映射或服务台客服身份发消息等业务。不会以“忽略权限错误”的方式降级处理。
+本扩展只新增工单会话的发现和机器人入群；不新增工单关闭、字段填写、匿名客服身份映射或服务台客服身份发消息等业务。服务台权限错误会禁用本次启动的服务台能力并明确记录，普通 IM 独立运行；不会绕过权限继续处理工单。
+
+## 模型可见的消息来源
+
+工单事件确认群关联后，扩展会在匹配的入站消息 metadata 中写入 `helpdesk_id` 与 `helpdesk_ticket_id`。上下文构建器仅对已确认服务台的群消息，将这些渠道字段按白名单转换为 system 角色的 `Current Message Source (trusted channel metadata)` 区块，供 Skills 识别来源。服务台消息仍使用标准飞书 IM 事件，不能仅凭 `chat_type=group`、群名、@ 或正文工单号判断。
+
+区块固定标记 `source=feishu_helpdesk`，包含 `channel`、`channel_id`、`session_chat_id`、`chat_type`、`helpdesk_id`、`helpdesk_ticket_id`，以及可用的 `message_id`、`reply_to`、`root_id`。普通单聊、未确认服务台关联的群聊或字段不完整时不添加区块，完整模型输入保持原有结构；缺少标记时由 Skill 按未知来源处理，不推定为生产。
+
+只接受渠道生成的白名单字段，不复制 Token、群标题或任意 metadata，用户正文中的同名标记不改变来源。任务执行中接收追加消息时刷新当前区块，保持在前置 system 消息中以便上下文压缩保留；当前消息未确认服务台关联则清除旧区块。后台任务结果不自动添加入站来源。其他渠道不添加该区块。
+
+代码只提供来源，不推定业务环境或授予访问权限。例如，业务 Skill 可以规定“服务台默认生产只读、普通消息先确认环境”，并允许用户明确指定 test、uat 覆盖默认；此策略需随 Skill 部署，测试环境另行选择。
+
+当前群与工单关联沿用内存缓存，不扫描历史工单。重启后尚未收到对应工单事件的群没有来源区块，按来源未知处理；这不证明它是普通群，不应据此猜测生产环境。仅更新 Skill 无法让旧版 bot 自动生成该区块。
 
 本地回归命令（需要项目 bot/test 依赖）：
 
@@ -105,18 +119,21 @@ PYTHONPATH=bot python -m pytest -c bot/pytest.ini \
   bot/tests/test_feishu_helpdesk.py \
   bot/tests/test_feishu_helpdesk_api.py \
   bot/tests/test_feishu_helpdesk_cli.py \
-  bot/tests/test_feishu_outbound_images.py
+  bot/tests/test_feishu_outbound_images.py \
+  bot/tests/test_message_source_context.py \
+  bot/tests/test_agent_loop_outcome.py
 ```
 
 真实环境验收：先在未登录的测试 profile 下确认只有一次跳过提示，没有 `user_info` 请求；完成扫码后确认日志出现 `authorized user keepalive active`。新建工单并转人工，确认日志出现 `Feishu Helpdesk bot admitted` 且群成员列表中有机器人；随后测试 `@Bot` 文本、图片/富文本、话题回复，并检查普通飞书单聊和群聊。邀请出现 `232011` 时，表示授权的用户不在目标群；`232017` 表示该用户没有邀请权限。处理权限或重新授权后，由后续工单更新事件再次尝试，不扫描历史工单。
 
 ## 与官方代码的边界
 
-主要实现放在 `bot/vikingbot/extensions/feishu_helpdesk/`，回归测试和本文均为新增文件。官方代码只有三个接入点：
+主要服务台实现放在 `bot/vikingbot/extensions/feishu_helpdesk/`。官方代码的接入点包括：
 
 - `config/schema.py`：增加可选配置字段。
 - `channels/manager.py`：按开关选择扩展子类。
 - `channels/feishu.py`：将原有事件注册提取为可覆盖的方法，未改变消息处理和回复实现。
+- `agent/context.py` 与 `agent/loop.py`：将入站来源白名单传入模型，并在追加消息时刷新；不包含业务环境默认策略。
 
 ## 接口依据
 

@@ -25,6 +25,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             tenant_token=self._get_tenant_access_token,
         )
         self._helpdesk_tasks: set[asyncio.Task] = set()
+        self._helpdesk_ready = False
         self._join_tasks: dict[str, asyncio.Task] = {}
         self._ticket_chats: OrderedDict[str, str] = OrderedDict()
 
@@ -42,12 +43,29 @@ class FeishuHelpdeskChannel(FeishuChannel):
                 raise RuntimeError("Feishu Helpdesk requires the lark-oapi SDK")
             if not self.config.app_id or not self.config.app_secret:
                 raise ValueError("Feishu Helpdesk requires app_id and app_secret")
-            self.bot_open_id = await self._helpdesk_api.bot_open_id()
-            await self._helpdesk_api.subscribe()
-            self._helpdesk_api.start()
+            # Native IM must not wait for or depend on Helpdesk APIs. The task
+            # starts after super().start() yields with the IM connection running.
+            task = asyncio.create_task(self._initialize_helpdesk())
+            self._helpdesk_tasks.add(task)
+            task.add_done_callback(self._ticket_done)
             await super().start()
         finally:
             await self.stop()
+
+    async def _initialize_helpdesk(self):
+        try:
+            self.bot_open_id = await self._helpdesk_api.bot_open_id()
+            await self._helpdesk_api.subscribe()
+            self._helpdesk_api.start()
+            self._helpdesk_ready = True
+            logger.info("Feishu Helpdesk ready")
+        except Exception as error:
+            # Keep native IM available, but do not admit ticket events without a
+            # successful Helpdesk initialization. Never log response bodies/tokens.
+            logger.error(
+                "Feishu Helpdesk unavailable; native IM remains active: {}",
+                type(error).__name__,
+            )
 
     async def stop(self):
         await super().stop()
@@ -55,6 +73,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
 
     async def _stop_helpdesk(self):
         self._running = False
+        self._helpdesk_ready = False
         tasks = self._helpdesk_tasks | set(self._join_tasks.values())
         for task in tasks:
             task.cancel()
@@ -62,6 +81,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._helpdesk_tasks.clear()
         self._join_tasks.clear()
+        self._ticket_chats.clear()
         await self._helpdesk_api.close()
 
     def _on_ticket_sync(self, data):
@@ -70,7 +90,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             self._loop.call_soon_threadsafe(self._schedule_ticket, data)
 
     def _schedule_ticket(self, data):
-        if not self._running:
+        if not self._running or not self._helpdesk_ready:
             return
         task = asyncio.create_task(self._on_ticket(data))
         self._helpdesk_tasks.add(task)
@@ -148,6 +168,10 @@ class FeishuHelpdeskChannel(FeishuChannel):
             self._join_tasks[chat_id] = task
         try:
             if not await asyncio.shield(task):
+                return
+            # Closure/shutdown may remove the completed join before this waiter
+            # resumes. Only its current owner may establish a ticket binding.
+            if self._join_tasks.get(chat_id) is not task:
                 return
         finally:
             if task.done() and self._join_tasks.get(chat_id) is task:

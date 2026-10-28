@@ -510,7 +510,10 @@ async def test_agent_loop_interrupt_marks_active_and_current_queued_messages(mak
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_steers_same_session_input_into_next_tool_turn(make_loop, temp_dir: Path):
+@pytest.mark.parametrize("channel_type", ["cli", "feishu"])
+async def test_agent_loop_steers_same_session_input_into_next_tool_turn(
+    make_loop, temp_dir: Path, channel_type
+):
     bus = MessageBus()
     provider = _SteerProvider()
     tools = _BlockingSteerRegistry()
@@ -521,12 +524,20 @@ async def test_agent_loop_steers_same_session_input_into_next_tool_turn(make_loo
         max_iterations=3,
     )
     loop.tools = tools
-    session_key = SessionKey(type="cli", channel_id="default", chat_id="steer-session")
+    session_key = SessionKey(type=channel_type, channel_id="default", chat_id="steer-session")
+    helpdesk_metadata = {
+        "chat_type": "group", "helpdesk_id": "desk_1", "helpdesk_ticket_id": "ticket_1"
+    }
 
     run_task = asyncio.create_task(loop.run())
     try:
         await bus.publish_inbound(
-            InboundMessage(session_key=session_key, sender_id="user-1", content="first request")
+            InboundMessage(
+                session_key=session_key,
+                sender_id="user-1",
+                content="first request",
+                metadata=helpdesk_metadata,
+            )
         )
         await asyncio.wait_for(tools.started.wait(), timeout=2)
         assert (
@@ -556,6 +567,16 @@ async def test_agent_loop_steers_same_session_input_into_next_tool_turn(make_loo
         )
         assert "first request" in second_call_user_text
         assert "steer update" in second_call_user_text
+        if channel_type == "feishu":
+            first_system = "\n".join(
+                m["content"] for m in provider.calls[0] if m["role"] == "system"
+            )
+            second_system = "\n".join(
+                m["content"] for m in provider.calls[1] if m["role"] == "system"
+            )
+            assert '"source": "feishu_helpdesk"' in first_system
+            assert ContextBuilder.MESSAGE_SOURCE_HEADER not in second_system
+            assert "ticket_1" not in second_system
 
         session = loop.sessions.get_or_create(session_key, skip_heartbeat=True)
         assert [message["role"] for message in session.messages] == [
@@ -576,11 +597,14 @@ async def test_agent_loop_steers_same_session_input_into_next_tool_turn(make_loo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("channel_type", ["cli", "feishu"])
 async def test_agent_loop_steers_same_session_input_before_final_response(
-    make_loop, temp_dir: Path, monkeypatch
+    make_loop, temp_dir: Path, monkeypatch, channel_type
 ):
     bus = MessageBus()
-    session_key = SessionKey(type="cli", channel_id="default", chat_id="steer-final-boundary")
+    session_key = SessionKey(
+        type=channel_type, channel_id="default", chat_id="steer-final-boundary"
+    )
     provider_calls = []
 
     class _LateSteerProvider(_FakeProvider):
@@ -593,6 +617,11 @@ async def test_agent_loop_steers_same_session_input_before_final_response(
                             session_key=session_key,
                             sender_id="user-1",
                             content="late steer",
+                            metadata={
+                                "chat_type": "group",
+                                "helpdesk_id": "desk_1",
+                                "helpdesk_ticket_id": "ticket_2",
+                            },
                         )
                     )
                     is True
@@ -655,6 +684,16 @@ async def test_agent_loop_steers_same_session_input_before_final_response(
         )
         assert "first request" in final_call_user_text
         assert "late steer" in final_call_user_text
+        if channel_type == "feishu":
+            first_system = "\n".join(
+                m["content"] for m in provider_calls[0] if m["role"] == "system"
+            )
+            final_system = "\n".join(
+                m["content"] for m in provider_calls[1] if m["role"] == "system"
+            )
+            assert ContextBuilder.MESSAGE_SOURCE_HEADER not in first_system
+            assert '"source": "feishu_helpdesk"' in final_system
+            assert '"helpdesk_ticket_id": "ticket_2"' in final_system
 
         session = loop.sessions.get_or_create(session_key, skip_heartbeat=True)
         assert [message["content"] for message in session.messages] == [

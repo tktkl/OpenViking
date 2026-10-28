@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -10,6 +11,7 @@ import pytest
 from lark_oapi.api.helpdesk.v1 import P2HelpdeskTicketCreatedV1, P2HelpdeskTicketUpdatedV1
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from pydantic import ValidationError
+from vikingbot.agent.context import ContextBuilder
 from vikingbot.bus.events import OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.feishu import FeishuChannel
@@ -179,6 +181,7 @@ async def test_scheduled_ticket_recovers_without_another_event(channel, monkeypa
     monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.asyncio.sleep", backoff)
     channel._helpdesk_api.ensure_in_chat.side_effect = [failure, True]
     channel._running = True
+    channel._helpdesk_ready = True
     channel._schedule_ticket(ticket_event())
     await asyncio.wait_for(asyncio.gather(*tuple(channel._helpdesk_tasks)), timeout=1)
     assert channel._helpdesk_api.ensure_in_chat.await_count == 2
@@ -305,6 +308,41 @@ async def test_closed_ticket_cancels_inflight_admission(channel):
 
 
 @pytest.mark.asyncio
+async def test_closure_after_membership_check_cannot_restore_ticket_binding(channel, monkeypatch):
+    real_shield = asyncio.shield
+
+    async def close_before_admission_resumes(task):
+        result = await real_shield(task)
+        # Membership succeeded, but the outer ticket handler has not resumed yet.
+        await channel._on_ticket(ticket_event(updated=True, status=51))
+        return result
+
+    monkeypatch.setattr(
+        "vikingbot.extensions.feishu_helpdesk.channel.asyncio.shield",
+        close_before_admission_resumes,
+    )
+    await channel._on_ticket(ticket_event())
+    assert not channel._ticket_chats
+    assert not channel._join_tasks
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_ticket_binding_before_late_im_is_received(channel):
+    await channel._on_ticket(ticket_event())
+    assert channel._ticket_chats["oc_ticket"] == "ticket_1"
+    await channel.stop()
+    await channel._handle_message(
+        sender_id="ou_user",
+        chat_id="oc_ticket",
+        content="late IM event",
+        metadata={"chat_type": "group", "reply_to": "oc_ticket"},
+    )
+    incoming = channel.bus.inbound.get_nowait()
+    assert "helpdesk_id" not in incoming.metadata
+    assert "helpdesk_ticket_id" not in incoming.metadata
+
+
+@pytest.mark.asyncio
 async def test_websocket_thread_dispatch_and_shutdown_cancel_background_work(channel):
     started = asyncio.Event()
 
@@ -315,6 +353,7 @@ async def test_websocket_thread_dispatch_and_shutdown_cancel_background_work(cha
     channel._helpdesk_api.ensure_in_chat.side_effect = ensure
     channel._loop = asyncio.get_running_loop()
     channel._running = True
+    channel._helpdesk_ready = True
     channel._on_ticket_sync(ticket_event())
     await asyncio.wait_for(started.wait(), timeout=1)
     await channel.stop()
@@ -361,14 +400,113 @@ async def test_native_sdk_dispatcher_delivers_created_updated_and_im(channel):
 
 
 @pytest.mark.asyncio
-async def test_subscription_failure_prevents_starting_a_partial_connection(channel, monkeypatch):
-    upstream_start = AsyncMock()
-    monkeypatch.setattr(FeishuChannel, "start", upstream_start)
+@pytest.mark.parametrize("operation", ["bot_open_id", "subscribe"])
+@pytest.mark.parametrize(
+    "failure", [HelpdeskAPIError("initialize", 99991679, 403), httpx.ReadTimeout("timeout")]
+)
+async def test_helpdesk_initialization_failure_keeps_native_im_active(
+    channel, monkeypatch, operation, failure
+):
+    native_started, failed = asyncio.Event(), asyncio.Event()
+    del channel.bot_open_id
+    channel.config.bot_name = "Bot"
+
+    async def native_start(_):
+        channel._running = True
+        native_started.set()
+        await asyncio.Future()
+
+    async def fail():
+        failed.set()
+        raise failure
+
+    monkeypatch.setattr(FeishuChannel, "start", native_start)
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.load_config", lambda: SimpleNamespace(mode=BotMode.NORMAL)
+    )
     channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
-    channel._helpdesk_api.subscribe = AsyncMock(side_effect=RuntimeError("subscription denied"))
-    with pytest.raises(RuntimeError, match="subscription denied"):
-        await channel.start()
-    upstream_start.assert_not_awaited()
+    channel._helpdesk_api.subscribe = AsyncMock()
+    channel._helpdesk_api.start = Mock()
+    setattr(channel._helpdesk_api, operation, fail)
+    task = asyncio.create_task(channel.start())
+    try:
+        await asyncio.wait_for(native_started.wait(), timeout=1)
+        await asyncio.wait_for(failed.wait(), timeout=1)
+        assert channel._running is True
+        assert not task.done()
+        assert channel._helpdesk_ready is False
+        channel._helpdesk_api.start.assert_not_called()
+        channel._schedule_ticket(ticket_event())
+        channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+
+        channel._add_reaction = AsyncMock()
+        message = im_event(mentioned=False)
+        message.event.message.chat_type = "p2p"
+        await channel._on_message(message)
+        assert channel.bus.inbound.get_nowait().need_reply is True
+        channel._get_user_name = AsyncMock(return_value="Alice")
+        channel._get_chat_mode = AsyncMock(return_value="group")
+        group_message = im_event()
+        group_message.event.message.message_id = "om_group_after_failure"
+        await channel._on_message(group_message)
+        incoming = channel.bus.inbound.get_nowait()
+        assert incoming.need_reply is True
+        assert "helpdesk_ticket_id" not in incoming.metadata
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert channel._helpdesk_api.http.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["bot_open_id", "subscribe"])
+async def test_native_im_does_not_wait_for_helpdesk_and_stop_cancels_initialization(
+    channel, monkeypatch, operation
+):
+    native_started, initializing, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    del channel.bot_open_id
+    channel.config.bot_name = "Bot"
+
+    async def native_start(_):
+        channel._running = True
+        native_started.set()
+        await asyncio.Future()
+
+    async def slow_initialization():
+        initializing.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(FeishuChannel, "start", native_start)
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.load_config", lambda: SimpleNamespace(mode=BotMode.NORMAL)
+    )
+    channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
+    channel._helpdesk_api.subscribe = AsyncMock()
+    setattr(channel._helpdesk_api, operation, slow_initialization)
+    task = asyncio.create_task(channel.start())
+    try:
+        await asyncio.wait_for(native_started.wait(), timeout=1)
+        await asyncio.wait_for(initializing.wait(), timeout=1)
+        assert not task.done()
+        assert channel._helpdesk_ready is False
+        assert channel._helpdesk_api.cli._keepalive_task is None
+        channel._schedule_ticket(ticket_event())
+        channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+        channel._add_reaction = AsyncMock()
+        channel._get_user_name = AsyncMock(return_value="Alice")
+        channel._get_chat_mode = AsyncMock(return_value="group")
+        await channel._on_message(im_event())
+        incoming = channel.bus.inbound.get_nowait()
+        assert incoming.need_reply is True
+        assert "helpdesk_ticket_id" not in incoming.metadata
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert cancelled.is_set()
+    assert not channel._helpdesk_tasks
     assert channel._helpdesk_api.http.is_closed
 
 
@@ -383,30 +521,40 @@ async def test_skipped_unauthorized_invitation_is_not_recorded_as_admitted(chann
 @pytest.mark.asyncio
 async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(channel, monkeypatch):
     cli = channel._helpdesk_api.cli
-    cli.keepalive_once = AsyncMock()
+    keepalive_started = asyncio.Event()
+    cli.keepalive_once = AsyncMock(side_effect=keepalive_started.set)
     channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
     channel._helpdesk_api.subscribe = AsyncMock()
     native_started = asyncio.Event()
 
     async def native_start():
-        assert cli._keepalive_task is not None
+        assert cli._keepalive_task is None
+        channel._running = True
         native_started.set()
         await asyncio.Future()
 
     monkeypatch.setattr(FeishuChannel, "start", lambda _: native_start())
     task = asyncio.create_task(channel.start())
-    await asyncio.wait_for(native_started.wait(), timeout=1)
-    await channel.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    try:
+        await asyncio.wait_for(native_started.wait(), timeout=1)
+        await asyncio.wait_for(keepalive_started.wait(), timeout=1)
+        assert channel._helpdesk_ready is True
+        channel._schedule_ticket(ticket_event())
+        await asyncio.wait_for(asyncio.gather(*tuple(channel._helpdesk_tasks)), timeout=1)
+        assert channel._ticket_chats["oc_ticket"] == "ticket_1"
+        await channel.stop()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     assert cli._keepalive_task is None
+    assert channel._helpdesk_ready is False
     assert channel._helpdesk_api.http.is_closed
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message_type", ["text", "image", "post", "interactive", "file"])
 async def test_helpdesk_im_keeps_media_mentions_topics_and_reply_anchor(
-    channel, monkeypatch, message_type
+    channel, monkeypatch, message_type, tmp_path
 ):
     monkeypatch.setattr(
         "vikingbot.channels.feishu.load_config", lambda: SimpleNamespace(mode=BotMode.NORMAL)
@@ -426,9 +574,36 @@ async def test_helpdesk_im_keeps_media_mentions_topics_and_reply_anchor(
     assert incoming.metadata["message_id"] == "om_user"
     assert incoming.metadata["reply_to"] == "oc_ticket"
     assert incoming.metadata["helpdesk_ticket_id"] == "ticket_1"
+    assert incoming.metadata["helpdesk_id"] == "desk_1"
     assert incoming.media == (["/tmp/received.png"] if message_type in ("image", "post") else [])
     assert "@_user_1" not in incoming.content
     channel._add_reaction.assert_awaited_once_with("om_user", "MeMeMe")
+
+    prompt = await ContextBuilder(tmp_path, eval=True).build_messages(
+        history=[],
+        current_message=incoming.content,
+        session_key=incoming.session_key,
+        channel_metadata=incoming.metadata,
+        ov_tools_enable=False,
+    )
+    source_block = next(
+        m["content"]
+        for m in prompt
+        if m["role"] == "system"
+        and m["content"].startswith(ContextBuilder.MESSAGE_SOURCE_HEADER)
+    )
+    assert json.loads(source_block.split("\n\n")[-1]) == {
+        "source": "feishu_helpdesk",
+        "channel": "feishu",
+        "channel_id": incoming.session_key.channel_id,
+        "session_chat_id": "oc_ticket#om_topic",
+        "chat_type": "group",
+        "helpdesk_id": "desk_1",
+        "helpdesk_ticket_id": "ticket_1",
+        "message_id": "om_user",
+        "reply_to": "oc_ticket",
+        "root_id": "om_topic",
+    }
 
     message_client = SimpleNamespace(reply=Mock(return_value=SimpleNamespace(success=lambda: True)))
     channel._client = SimpleNamespace(
@@ -467,6 +642,81 @@ async def test_no_mention_and_sender_allowlist_keep_upstream_behavior(channel, m
     channel.config.allow_from = ["ou_other"]
     await channel._on_message(im_event())
     assert channel.bus.inbound.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["text", "image", "post", "interactive", "file"])
+@pytest.mark.parametrize(
+    ("chat_type", "chat_mode", "mentioned", "root_id"),
+    [
+        ("p2p", "group", False, None),
+        ("group", "group", True, None),
+        ("group", "group", False, None),
+        ("group", "thread", True, "om_topic"),
+        ("group", "thread", True, None),
+    ],
+)
+async def test_ordinary_im_matches_native_channel_with_helpdesk_enabled(
+    channel, tmp_path, monkeypatch, message_type, chat_type, chat_mode, mentioned, root_id
+):
+    """Unbound IM must retain native parsing, mentions, topics, dedup and replies."""
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.load_config", lambda: SimpleNamespace(mode=BotMode.NORMAL)
+    )
+    native = FeishuChannel(
+        FeishuChannelConfig(app_id="cli_bot", app_secret="app_secret"),
+        MessageBus(),
+        bot_config=SimpleNamespace(bot_data_path=tmp_path),
+    )
+    incoming_results, reply_results = [], []
+    try:
+        for current in (native, channel):
+            current.bot_open_id = "ou_bot"
+            current._get_user_name = AsyncMock(return_value="Alice")
+            current._get_chat_mode = AsyncMock(return_value=chat_mode)
+            current._add_reaction = AsyncMock()
+            current._download_and_save_image = AsyncMock(return_value="/tmp/received.png")
+            event = im_event(message_type=message_type, mentioned=mentioned)
+            event.event.message.chat_type = chat_type
+            event.event.message.root_id = root_id
+            await current._on_message(event)
+            incoming = current.bus.inbound.get_nowait()
+            snapshot = asdict(incoming)
+            snapshot.pop("timestamp")
+            incoming_results.append(snapshot)
+            assert "helpdesk_id" not in incoming.metadata
+            assert "helpdesk_ticket_id" not in incoming.metadata
+            assert incoming.need_reply is (chat_type == "p2p" or mentioned)
+            assert current._add_reaction.await_count == int(incoming.need_reply)
+
+            await current._on_message(event)
+            assert current.bus.inbound.empty()
+
+            message_client = SimpleNamespace(
+                reply=Mock(return_value=SimpleNamespace(success=lambda: True))
+            )
+            current._client = SimpleNamespace(
+                im=SimpleNamespace(v1=SimpleNamespace(message=message_client))
+            )
+            current._extract_and_upload_images = AsyncMock(return_value=("处理结果", []))
+            assert await current.send(
+                OutboundMessage(
+                    session_key=incoming.session_key, content="结果", metadata=incoming.metadata
+                )
+            )
+            request = message_client.reply.call_args.args[0]
+            reply_results.append(
+                (
+                    request.message_id,
+                    request.request_body.reply_in_thread,
+                    request.request_body.msg_type,
+                    json.loads(request.request_body.content),
+                )
+            )
+        assert incoming_results[0] == incoming_results[1]
+        assert reply_results[0] == reply_results[1]
+    finally:
+        await native.stop()
 
 
 @pytest.mark.asyncio

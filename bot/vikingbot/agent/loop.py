@@ -1852,6 +1852,7 @@ class AgentLoop:
                 active_turn.accepting_steer = False
             accepted_steers = await self._take_accepted_steers(active_turn)
             for steer in accepted_steers:
+                self.context.set_message_source(messages, steer.msg.session_key, steer.msg.metadata)
                 messages.extend(steer.prompt_messages)
             if accepted_steers:
                 active_turn.history_items.extend(accepted_steers)
@@ -2311,6 +2312,9 @@ class AgentLoop:
                     )
                     active_turn.history_items.extend(final_steers)
                     for steer in final_steers:
+                        self.context.set_message_source(
+                            messages, steer.msg.session_key, steer.msg.metadata
+                        )
                         messages.extend(steer.prompt_messages)
                     steer_memory_events.extend(final_steers)
                     continue
@@ -2741,6 +2745,7 @@ class AgentLoop:
                 memory_peer_ids=memory_peer_ids,
                 memory_owner_user_ids=memory_owner_user_ids,
                 exp_exclude_uris=exp_exclude_uris,
+                channel_metadata=msg.metadata,
             )
             relevant_memories = message_context.latest_relevant_memories
             auto_memory_tool = None
