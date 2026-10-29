@@ -588,8 +588,6 @@ const workspace = {
       connector_import: 'Connector import',
       admin_reindex: 'Reindex',
       snapshot_restore_reindex: 'Snapshot reindex',
-      legacy_migration: 'Legacy migration',
-      legacy_cleanup: 'Legacy cleanup',
     },
   },
   watchesPage: {

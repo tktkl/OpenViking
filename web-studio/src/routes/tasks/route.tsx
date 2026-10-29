@@ -76,8 +76,6 @@ const TASK_TYPE_OPTIONS: Exclude<TaskTypeFilter, 'all'>[] = [
   'connector_import',
   'admin_reindex',
   'snapshot_restore_reindex',
-  'legacy_migration',
-  'legacy_cleanup',
 ]
 const TASK_STATUS_OPTIONS: Exclude<TaskStatusFilter, 'all'>[] = [
   'pending',
@@ -510,8 +508,6 @@ function TasksRoute() {
       'snapshot_restore_reindex',
       'add_skill',
       'connector_import',
-      'legacy_migration',
-      'legacy_cleanup',
     ]
 
     const typeCounts: Record<string, number> = {}

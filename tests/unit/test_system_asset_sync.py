@@ -11,6 +11,7 @@ from openviking.core.namespace_policy import (
 from openviking.server.identity import RequestContext, Role
 from openviking.system_assets.sync import SystemAssetSynchronizer
 from openviking_cli.session.user_id import UserIdentifier
+from scripts.build_support.system_assets_manifest import write_system_assets_manifest
 
 
 class _FakeVikingFS:
@@ -58,6 +59,7 @@ async def test_system_asset_sync_converges_managed_roots_without_touching_custom
     compile_source.write_bytes(b"same skill")
     reference_source.write_bytes(b"\x00guide")
     memory_source.write_bytes(b"new profile")
+    write_system_assets_manifest(tmp_path)
 
     compile_target = f"{SYSTEM_EXAMPLE_SKILLS_ROOT}/demo/SKILL.md"
     reference_target = f"{SYSTEM_EXAMPLE_SKILLS_ROOT}/demo/references/guide.bin"
@@ -105,6 +107,16 @@ async def test_system_asset_sync_converges_managed_roots_without_touching_custom
     coordinator.calls.clear()
     assert await synchronizer.sync(ctx) == 0
     assert coordinator.calls == []
+
+    previous_digest = synchronizer.manifest_digest
+    compile_source.write_bytes(b"updated skill")
+    write_system_assets_manifest(tmp_path)
+    updated = SystemAssetSynchronizer(viking_fs=viking_fs, assets_dir=tmp_path)
+
+    assert updated.manifest_digest != previous_digest
+    assert await updated.sync(ctx) == 1
+    assert viking_fs.files[compile_target] == b"updated skill"
+    assert viking_fs.files[custom_target] == b"custom"
 
 
 @pytest.mark.asyncio

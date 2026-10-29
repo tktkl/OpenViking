@@ -10,8 +10,6 @@ export type TaskTypeFilter =
   | 'add_skill'
   | 'admin_reindex'
   | 'connector_import'
-  | 'legacy_cleanup'
-  | 'legacy_migration'
   | 'session_commit'
   | 'snapshot_restore_reindex'
   | 'all'

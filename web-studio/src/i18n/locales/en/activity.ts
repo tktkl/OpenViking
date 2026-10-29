@@ -5,10 +5,13 @@ const activity = {
     },
     threadList: {
       title: 'Sessions',
+      backToList: 'Back to sessions',
       newSession: 'New Session',
       count: '{{count}} session',
       count_other: '{{count}} sessions',
       loading: 'Loading sessions...',
+      loadFailed: 'Could not load sessions',
+      retry: 'Retry',
       emptyTitle: 'No sessions yet',
       emptyDescription: 'Select the plus button to start a new conversation.',
       deleteSession: 'Delete “{{title}}”',
@@ -176,6 +179,7 @@ const activity = {
         agent: 'Agent capabilities, tools, and experience',
         user: 'Personalized user memories',
         resources: 'External resources the Agent can reference',
+        system: 'Built-in system resources',
       },
     },
     agent: {

@@ -568,8 +568,6 @@ const workspace = {
       connector_import: '连接器导入',
       admin_reindex: '重建索引',
       snapshot_restore_reindex: '快照恢复索引',
-      legacy_migration: '旧数据迁移',
-      legacy_cleanup: '旧数据清理',
     },
   },
   watchesPage: {

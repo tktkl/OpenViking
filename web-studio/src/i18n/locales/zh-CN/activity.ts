@@ -5,10 +5,13 @@ const activity = {
     },
     threadList: {
       title: '会话',
+      backToList: '返回会话列表',
       newSession: '新建会话',
       count: '{{count}} 个会话',
       count_other: '{{count}} 个会话',
       loading: '正在加载会话...',
+      loadFailed: '会话加载失败',
+      retry: '重试',
       emptyTitle: '还没有会话',
       emptyDescription: '点击右上角的加号开始一段新对话。',
       deleteSession: '删除“{{title}}”',
@@ -168,6 +171,7 @@ const activity = {
         agent: 'Agent 的能力、工具和经验',
         user: '用户个性化记忆',
         resources: 'Agent 可引用的外部资源',
+        system: '系统内置资源',
       },
     },
     agent: {

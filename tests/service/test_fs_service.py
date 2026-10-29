@@ -4,6 +4,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.fs_service import FSService, ListingPage
 from openviking.service.task_work_index import bind_task_context
 from openviking.storage.abstract_overview import body_for_preview
+from openviking.storage.acl import AclAction
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError
@@ -34,6 +36,8 @@ def run_fs_operations_inline(monkeypatch):
 
 class _FakeVikingFS:
     def __init__(self, *, rm_error=None, events=None, parent_exists=True):
+        self._ensure_access = AsyncMock()
+        self._ensure_destination_access = AsyncMock()
         self.rm_calls = []
         self.mv_calls = []
         self.cp_calls = []
@@ -54,6 +58,7 @@ class _FakeVikingFS:
         self.mv_calls.append({"from_uri": from_uri, "to_uri": to_uri, "ctx": ctx})
         if self.events is not None:
             self.events.append(("mv", from_uri, to_uri))
+        return {"source_acl": {}}
 
     async def cp(self, from_uri, to_uri, recursive=False, ctx=None):
         self.cp_calls.append(
@@ -907,7 +912,10 @@ async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_cont
         wait=True,
     )
 
-    assert viking_fs.rm_calls == [{"uri": uri, "recursive": True, "ctx": request_context}]
+    viking_fs._ensure_access.assert_awaited_once_with(uri, request_context, action=AclAction.MANAGE)
+    assert viking_fs.rm_calls == [
+        {"uri": uri, "recursive": True, "ctx": replace(request_context, bypass_acl=True)}
+    ]
     assert len(queue_manager.messages) == 1
     msg = queue_manager.messages[0]
     assert msg.uri == "viking://resources/images/2026/06/10"
@@ -956,7 +964,9 @@ async def test_resource_rm_skips_parent_refresh_when_parent_is_gone(request_cont
     uri = "viking://resources/deleted/sub/a.md"
     result = await service.rm(uri, ctx=request_context, wait=True)
 
-    assert viking_fs.rm_calls == [{"uri": uri, "recursive": False, "ctx": request_context}]
+    assert viking_fs.rm_calls == [
+        {"uri": uri, "recursive": False, "ctx": replace(request_context, bypass_acl=True)}
+    ]
     service._enqueue_delete_refresh.assert_not_awaited()
     assert "semantic_root_uri" not in result
 
@@ -1067,7 +1077,7 @@ async def test_resource_mv_validates_then_moves_then_rewrites_watch_tasks(
         {
             "from_uri": "viking://resources/codeask/wiki",
             "to_uri": "viking://resources/codeask/wiki-renamed",
-            "ctx": request_context,
+            "ctx": replace(request_context, bypass_acl=True),
         }
     ]
     assert [event[0] for event in events] == ["validate", "mv", "rewrite", "refresh"]
@@ -1149,7 +1159,7 @@ async def test_resource_mv_without_watch_scheduler_moves_resource_directly(reque
         {
             "from_uri": "viking://resources/codeask/wiki",
             "to_uri": "viking://resources/archive/wiki",
-            "ctx": request_context,
+            "ctx": replace(request_context, bypass_acl=True),
         }
     ]
     assert refresh_calls == [
@@ -1572,6 +1582,7 @@ async def test_system_mkdir_skips_semantic_sidecar_and_vectorization(request_con
 async def test_system_rm_skips_vector_and_semantic_work(request_context):
     uri = "viking://system/memory/memory_templates/custom/demo.md"
     viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(),
         rm=AsyncMock(return_value={"estimated_deleted_count": 0}),
     )
     service = FSService(viking_fs=viking_fs)
@@ -1581,7 +1592,7 @@ async def test_system_rm_skips_vector_and_semantic_work(request_context):
     viking_fs.rm.assert_awaited_once_with(
         uri,
         recursive=False,
-        ctx=request_context,
+        ctx=replace(request_context, bypass_acl=True),
         no_vector=True,
     )
     assert result["semantic_status"] == "skipped"
@@ -1693,13 +1704,21 @@ async def test_indexed_copy_preserves_native_vectors_and_content_copy_refresh(re
 async def test_indexed_move_preserves_native_vector_transfer(request_context):
     source = "viking://resources/source/demo.md"
     target = "viking://resources/target/demo.md"
-    viking_fs = SimpleNamespace(mv=AsyncMock())
+    viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(), _ensure_destination_access=AsyncMock(), mv=AsyncMock()
+    )
     service = FSService(viking_fs=viking_fs)
     service._refresh_move_parents = AsyncMock()
 
     await service.mv(source, target, ctx=request_context)
 
-    viking_fs.mv.assert_awaited_once_with(source, target, ctx=request_context)
+    viking_fs._ensure_access.assert_awaited_once_with(
+        source, request_context, action=AclAction.MANAGE
+    )
+    viking_fs._ensure_destination_access.assert_awaited_once_with(target, request_context)
+    viking_fs.mv.assert_awaited_once_with(
+        source, target, ctx=replace(request_context, bypass_acl=True)
+    )
     service._refresh_move_parents.assert_awaited_once_with(
         from_uri=source,
         to_uri=target,
@@ -1731,7 +1750,9 @@ async def test_move_to_system_deletes_source_vectors_without_target_index(
 ):
     source = "viking://resources/project/demo.md"
     target = "viking://system/memory/memory_templates/custom/demo.md"
-    viking_fs = SimpleNamespace(mv=AsyncMock())
+    viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(), _ensure_destination_access=AsyncMock(), mv=AsyncMock()
+    )
     service = FSService(viking_fs=viking_fs)
     refresh = AsyncMock()
     monkeypatch.setattr(service, "_refresh_move_parents", refresh)
@@ -1741,7 +1762,7 @@ async def test_move_to_system_deletes_source_vectors_without_target_index(
     viking_fs.mv.assert_awaited_once_with(
         source,
         target,
-        ctx=request_context,
+        ctx=replace(request_context, bypass_acl=True),
         vector_mode="delete_source",
         copy_semantic_sidecars=False,
     )
@@ -1840,6 +1861,8 @@ async def test_move_from_system_rebuilds_target_index(request_context):
     source = "viking://system/memory/memory_templates/custom/demo.md"
     target = "viking://resources/project/demo.md"
     viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(),
+        _ensure_destination_access=AsyncMock(),
         mv=AsyncMock(),
         stat=AsyncMock(return_value={"isDir": False}),
     )
@@ -1852,7 +1875,7 @@ async def test_move_from_system_rebuilds_target_index(request_context):
     viking_fs.mv.assert_awaited_once_with(
         source,
         target,
-        ctx=request_context,
+        ctx=replace(request_context, bypass_acl=True),
         vector_mode="none",
         copy_semantic_sidecars=False,
     )
@@ -1876,6 +1899,8 @@ async def test_move_target_refresh_failure_does_not_roll_back_physical_move(requ
     source = "viking://system/memory/memory_templates/custom/demo.md"
     target = "viking://resources/project/demo.md"
     viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(),
+        _ensure_destination_access=AsyncMock(),
         mv=AsyncMock(),
         stat=AsyncMock(return_value={"isDir": False}),
     )
@@ -1893,6 +1918,8 @@ async def test_recursive_move_from_system_rebuilds_target_subtree(request_contex
     source = "viking://system/compile/example-skills/demo"
     target = "viking://resources/project/demo"
     viking_fs = SimpleNamespace(
+        _ensure_access=AsyncMock(),
+        _ensure_destination_access=AsyncMock(),
         mv=AsyncMock(),
         stat=AsyncMock(return_value={"isDir": True}),
     )
