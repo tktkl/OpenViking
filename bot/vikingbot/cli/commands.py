@@ -393,6 +393,9 @@ def _make_provider(config, langfuse_client: Any = None):
     extra_headers = p.extra_headers if p else {}
     timeout = p.timeout if p else None
     max_tokens = getattr(p, "max_tokens", None) if p else None
+    supports_tool_result_media = (
+        getattr(p, "supports_tool_result_media", None) if p else None
+    )
     credentials = list(getattr(p, "credentials", None) or [])
 
     if not model and not credentials:
@@ -428,6 +431,7 @@ def _make_provider(config, langfuse_client: Any = None):
             vlm_instance=effective_vlm.get_vlm_instance(),
             default_model=effective_vlm.model or model,
             langfuse_client=langfuse_client,
+            supports_tool_result_media=supports_tool_result_media,
         )
 
     if credentials:
@@ -475,6 +479,7 @@ def _make_provider(config, langfuse_client: Any = None):
             vlm_instance=effective_vlm.get_vlm_instance(),
             default_model=effective_vlm.model or credentials[0].model or "",
             langfuse_client=langfuse_client,
+            supports_tool_result_media=supports_tool_result_media,
         )
 
     # When provider is explicitly set, use VLMFactory to get the correct
@@ -507,6 +512,7 @@ def _make_provider(config, langfuse_client: Any = None):
             vlm_instance=vlm_instance,
             default_model=model,
             langfuse_client=langfuse_client,
+            supports_tool_result_media=supports_tool_result_media,
         )
 
     raise RuntimeError(

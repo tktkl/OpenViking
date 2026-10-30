@@ -496,6 +496,13 @@ class AgentsConfig(BaseModel):
             "selected provider protocol supports an explicit thinking parameter."
         ),
     )
+    supports_tool_result_media: bool | None = Field(
+        default=None,
+        description=(
+            "Explicitly override whether the configured model provider can preserve "
+            "media in tool results. None keeps provider capability detection."
+        ),
+    )
     timeout: Optional[float] = Field(
         default=None,
         gt=0.0,

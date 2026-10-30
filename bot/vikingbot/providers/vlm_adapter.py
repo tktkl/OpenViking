@@ -245,11 +245,13 @@ class VLMProviderAdapter(LLMProvider):
         vlm_instance,  # VLMBase
         default_model: str,
         langfuse_client: LangfuseClient | None = None,
+        supports_tool_result_media: bool | None = None,
     ):
         super().__init__(api_key=None, api_base=None)
         self._vlm = vlm_instance
         self._default_model = default_model
         self._langfuse = langfuse_client or LangfuseClient.get_instance()
+        self._supports_tool_result_media_override = supports_tool_result_media
 
     async def chat(
         self,
@@ -695,6 +697,8 @@ class VLMProviderAdapter(LLMProvider):
 
     def supports_tool_result_media(self, model: str | None = None) -> bool:
         """Return true only for backends with native rich tool-result support."""
+        if self._supports_tool_result_media_override is not None:
+            return self._supports_tool_result_media_override
         return self._backend_supports_tool_result_media(self._vlm)
 
     @classmethod

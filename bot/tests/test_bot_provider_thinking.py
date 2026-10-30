@@ -61,6 +61,25 @@ def test_vlm_adapter_uses_litellm_resolved_provider_for_tool_result_media():
     assert provider.supports_tool_result_media() is True
 
 
+def test_vlm_adapter_honors_explicit_tool_result_media_override():
+    langfuse = SimpleNamespace()
+    openai = VLMProviderAdapter(
+        SimpleNamespace(provider="openai"),
+        default_model="deepseek-flash",
+        langfuse_client=langfuse,
+        supports_tool_result_media=True,
+    )
+    anthropic = VLMProviderAdapter(
+        SimpleNamespace(provider="anthropic"),
+        default_model="claude-sonnet",
+        langfuse_client=langfuse,
+        supports_tool_result_media=False,
+    )
+
+    assert openai.supports_tool_result_media() is True
+    assert anthropic.supports_tool_result_media() is False
+
+
 def test_make_provider_passes_default_thinking_to_vlm_adapter(monkeypatch):
     from vikingbot.cli.commands import _make_provider
 
@@ -87,12 +106,14 @@ def test_make_provider_passes_default_thinking_to_vlm_adapter(monkeypatch):
                 provider="volcengine",
                 extra_headers={},
                 timeout=None,
+                supports_tool_result_media=True,
             )
         )
     )
 
     assert captured["thinking"] is True
     assert provider._vlm.thinking is True
+    assert provider.supports_tool_result_media() is True
 
 
 @pytest.mark.asyncio
