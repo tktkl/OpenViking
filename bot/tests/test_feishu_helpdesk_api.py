@@ -68,7 +68,8 @@ async def test_already_joined_chat_does_not_require_cli_login():
 
 
 @pytest.mark.asyncio
-async def test_invitation_delegates_to_cli_and_verifies_the_bot_identity():
+@pytest.mark.parametrize("absent_as_error", [False, True])
+async def test_invitation_delegates_to_cli_and_verifies_the_bot_identity(absent_as_error):
     requests = []
     joined = False
 
@@ -77,6 +78,8 @@ async def test_invitation_delegates_to_cli_and_verifies_the_bot_identity():
         assert request.method == "GET"
         assert "X-Lark-Helpdesk-Authorization" not in request.headers
         assert request.headers["Authorization"] == "Bearer tenant_token"
+        if not joined and absent_as_error:
+            return httpx.Response(400, json={"code": 232006, "msg": "bot not in chat"})
         return httpx.Response(200, json={"code": 0, "data": {"is_in_chat": joined}})
 
     async def invite(chat_id):
@@ -107,12 +110,15 @@ async def test_signed_out_cli_skips_invitation_without_false_membership():
 
 
 @pytest.mark.asyncio
-async def test_zero_cli_success_is_not_proof_of_membership(monkeypatch):
+@pytest.mark.parametrize("absent_as_error", [False, True])
+async def test_zero_cli_success_is_not_proof_of_membership(monkeypatch, absent_as_error):
     monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.api.asyncio.sleep", AsyncMock())
     requests = []
 
     def handler(request):
         requests.append(request)
+        if absent_as_error:
+            return httpx.Response(400, json={"code": 232006})
         return httpx.Response(200, json={"code": 0, "data": {"is_in_chat": False}})
 
     api = make_api(handler)
@@ -121,6 +127,46 @@ async def test_zero_cli_success_is_not_proof_of_membership(monkeypatch):
             await api.ensure_in_chat("oc_ticket")
         api.cli.invite_bot.assert_awaited_once()
         assert len(requests) == 4
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_http_400_232006_means_not_in_chat():
+    api = make_api(lambda request: httpx.Response(400, json={"code": 232006}))
+    try:
+        assert await api.is_in_chat("oc_ticket") is False
+        api.cli.invite_bot.assert_not_awaited()
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(400, 232011), (401, 232006), (403, 232006), (500, 232006), (200, 232006)],
+)
+async def test_other_membership_errors_keep_their_code_and_http_status(status, code):
+    api = make_api(lambda request: httpx.Response(status, json={"code": code}))
+    try:
+        with pytest.raises(HelpdeskAPIError) as failure:
+            await api.is_in_chat("oc_ticket")
+        assert failure.value.code == code
+        assert failure.value.status == status
+        api.cli.invite_bot.assert_not_awaited()
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["subscribe", "bot_open_id"])
+async def test_232006_is_not_suppressed_for_other_operations(operation):
+    api = make_api(lambda request: httpx.Response(400, json={"code": 232006}))
+    try:
+        with pytest.raises(HelpdeskAPIError) as failure:
+            await getattr(api, operation)()
+        assert failure.value.code == 232006
+        assert failure.value.status == 400
     finally:
         await api.close()
 

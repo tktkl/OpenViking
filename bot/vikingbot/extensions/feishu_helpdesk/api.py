@@ -22,6 +22,7 @@ class HelpdeskAPIError(RuntimeError):
     def __init__(self, operation: str, code: object, status: int = 0):
         super().__init__(f"Feishu Helpdesk {operation} failed (code={code}, HTTP={status})")
         self.code = code
+        self.status = status
         self.retryable = status not in (401, 403) and (
             status in (408, 429) or 500 <= status < 600 or code == 99991400
         )
@@ -96,11 +97,17 @@ class HelpdeskAPI:
         return open_id
 
     async def is_in_chat(self, chat_id: str) -> bool:
-        result = await self._bot_request(
-            "GET",
-            f"/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members/is_in_chat",
-            operation="verify bot membership",
-        )
+        try:
+            result = await self._bot_request(
+                "GET",
+                f"/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members/is_in_chat",
+                operation="verify bot membership",
+            )
+        except HelpdeskAPIError as error:
+            # Feishu can report an absent bot as HTTP 400 instead of is_in_chat=false.
+            if error.status == 400 and error.code == 232006:
+                return False
+            raise
         member = result.get("data", {}).get("is_in_chat")
         if not isinstance(member, bool):
             raise HelpdeskAPIError("verify bot membership", "invalid_response")

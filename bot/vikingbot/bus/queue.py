@@ -35,7 +35,10 @@ class MessageBus:
 
     def count_pending_inbound_session(self, session_key) -> int:
         """Return the number of inbound messages waiting for the session."""
-        return sum(1 for msg in list(self.inbound._queue) if msg.session_key == session_key)
+        return sum(
+            1 for msg in list(self.inbound._queue)
+            if msg.session_key == session_key and msg.internal_handler is None and not msg.internal
+        )
 
     @property
     def inbound_size(self) -> int:

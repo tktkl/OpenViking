@@ -10,6 +10,7 @@ import httpx
 import pytest
 from lark_oapi.api.helpdesk.v1 import P2HelpdeskTicketCreatedV1, P2HelpdeskTicketUpdatedV1
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from loguru import logger
 from pydantic import ValidationError
 from vikingbot.agent.context import ContextBuilder
 from vikingbot.bus.events import OutboundMessage
@@ -169,6 +170,7 @@ async def test_failed_admission_does_not_claim_success_and_later_event_can_retry
         HelpdeskAPIError("verify membership", 99991400, 400),
         HelpdeskAPIError("verify membership", "rate_limited", 429),
         LarkCLIError("timed out", retryable=True),
+        LarkCLIError("command failed", code=232011),
         httpx.HTTPStatusError(
             "service unavailable",
             request=httpx.Request("POST", "https://example.test/token"),
@@ -191,16 +193,26 @@ async def test_scheduled_ticket_recovers_without_another_event(channel, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_admission_retries_are_bounded_and_do_not_claim_membership(channel, monkeypatch):
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("temporary failure"), LarkCLIError("command failed", code=232011)],
+)
+async def test_admission_retries_are_bounded_and_later_event_can_recover(
+    channel, monkeypatch, failure
+):
     backoff = AsyncMock()
     monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.asyncio.sleep", backoff)
-    channel._helpdesk_api.ensure_in_chat.side_effect = httpx.ReadTimeout("temporary failure")
-    with pytest.raises(httpx.ReadTimeout):
+    channel._helpdesk_api.ensure_in_chat.side_effect = failure
+    with pytest.raises(type(failure)):
         await channel._on_ticket(ticket_event())
-    assert channel._helpdesk_api.ensure_in_chat.await_count == 4
-    assert [call.args[0] for call in backoff.await_args_list] == [2, 5, 10]
+    assert channel._helpdesk_api.ensure_in_chat.await_count == 6
+    assert [call.args[0] for call in backoff.await_args_list] == [2, 5, 10, 30, 60]
     assert not channel._ticket_chats
     assert not channel._join_tasks
+    channel._helpdesk_api.ensure_in_chat.side_effect = None
+    await channel._on_ticket(ticket_event(updated=True))
+    assert channel._helpdesk_api.ensure_in_chat.await_count == 7
+    assert channel._ticket_chats["oc_ticket"] == "ticket_1"
 
 
 @pytest.mark.asyncio
@@ -208,8 +220,10 @@ async def test_admission_retries_are_bounded_and_do_not_claim_membership(channel
     "failure",
     [
         HelpdeskAPIError("verify membership", 99991679, 403),
+        HelpdeskAPIError("verify membership", 232011, 403),
         HelpdeskAPIError("invite bot", "pending_approval_id_list"),
-        LarkCLIError("command failed", code=232011),
+        LarkCLIError("command failed", code=232017),
+        LarkCLIError("command failed", code=232011, authentication=True),
         LarkCLIError("command failed", code=20037, authentication=True, retryable=True),
     ],
 )
@@ -228,7 +242,13 @@ async def test_admission_does_not_retry_permission_or_authorization_errors(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_ticket", [True, False])
-async def test_closure_and_shutdown_cancel_pending_retry(channel, monkeypatch, close_ticket):
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("temporary failure"), LarkCLIError("command failed", code=232011)],
+)
+async def test_closure_and_shutdown_cancel_pending_retry(
+    channel, monkeypatch, close_ticket, failure
+):
     waiting = asyncio.Event()
 
     async def backoff(delay):
@@ -236,7 +256,7 @@ async def test_closure_and_shutdown_cancel_pending_retry(channel, monkeypatch, c
         await asyncio.Future()
 
     monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.asyncio.sleep", backoff)
-    channel._helpdesk_api.ensure_in_chat.side_effect = httpx.ReadTimeout("temporary failure")
+    channel._helpdesk_api.ensure_in_chat.side_effect = failure
     pending = asyncio.create_task(channel._on_ticket(ticket_event()))
     await asyncio.wait_for(waiting.wait(), timeout=1)
     if close_ticket:
@@ -251,7 +271,11 @@ async def test_closure_and_shutdown_cancel_pending_retry(channel, monkeypatch, c
 
 
 @pytest.mark.asyncio
-async def test_concurrent_events_share_retries_and_record_success(channel, monkeypatch):
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("temporary failure"), LarkCLIError("command failed", code=232011)],
+)
+async def test_concurrent_events_share_retries_and_record_success(channel, monkeypatch, failure):
     waiting, resume = asyncio.Event(), asyncio.Event()
     real_sleep = asyncio.sleep
 
@@ -261,7 +285,7 @@ async def test_concurrent_events_share_retries_and_record_success(channel, monke
 
     monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.asyncio.sleep", backoff)
     channel._helpdesk_api.ensure_in_chat.side_effect = [
-        httpx.ReadTimeout("temporary failure"),
+        failure,
         True,
     ]
     first = asyncio.create_task(channel._on_ticket(ticket_event()))
@@ -274,6 +298,63 @@ async def test_concurrent_events_share_retries_and_record_success(channel, monke
     await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
     assert channel._helpdesk_api.ensure_in_chat.await_count == 2
     assert channel._ticket_chats["oc_ticket"] == "ticket_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updated", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "code", "status"),
+    [
+        (LarkCLIError("access_secret", code=232011), 232011, 0),
+        (HelpdeskAPIError("access_secret", 99991400, 400), 99991400, 400),
+        (
+            httpx.HTTPStatusError(
+                "access_secret",
+                request=httpx.Request("GET", "https://example.test?token=access_secret"),
+                response=httpx.Response(503),
+            ),
+            None,
+            503,
+        ),
+    ],
+)
+async def test_admission_logs_context_and_safe_error_details(
+    channel, monkeypatch, updated, failure, code, status
+):
+    monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.asyncio.sleep", AsyncMock())
+    channel._helpdesk_api.ensure_in_chat.side_effect = failure
+    channel._running = True
+    channel._helpdesk_ready = True
+    records = []
+    sink = logger.add(lambda message: records.append(message.record))
+    try:
+        channel._schedule_ticket(ticket_event(updated=updated))
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(channel._helpdesk_tasks), return_exceptions=True), timeout=1
+        )
+    finally:
+        logger.remove(sink)
+
+    warnings = [r["message"] for r in records if r["level"].name == "WARNING"]
+    errors = [r["message"] for r in records if r["level"].name == "ERROR"]
+    assert len(warnings) == 5
+    assert len(errors) == 1
+    for message in [*warnings, *errors]:
+        assert "ticket_id=ticket_1" in message
+        assert "chat_id=oc_ticket" in message
+        assert f"error={type(failure).__name__}" in message
+        assert f"code={code}" in message
+        assert f"HTTP={status}" in message
+        assert "secret" not in message
+        assert "example.test" not in message
+    for attempt, (message, delay) in enumerate(
+        zip(warnings, (2, 5, 10, 30, 60), strict=True), start=2
+    ):
+        assert f"attempt={attempt}" in message
+        assert f"delay={delay}s" in message
+    assert not channel._helpdesk_tasks
+    assert not channel._join_tasks
+    assert not channel._ticket_chats
 
 
 @pytest.mark.asyncio
@@ -642,6 +723,32 @@ async def test_no_mention_and_sender_allowlist_keep_upstream_behavior(channel, m
     channel.config.allow_from = ["ou_other"]
     await channel._on_message(im_event())
     assert channel.bus.inbound.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_ticket", [False, True])
+@pytest.mark.parametrize(
+    ("allow_from", "allowed"), [([], True), (["ou_user"], True), (["ou_other"], False)]
+)
+async def test_sender_allowlist_applies_to_ordinary_and_ticket_chats(
+    channel, monkeypatch, bound_ticket, allow_from, allowed
+):
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.load_config", lambda: SimpleNamespace(mode=BotMode.NORMAL)
+    )
+    channel._get_user_name = AsyncMock(return_value="Alice")
+    channel._get_chat_mode = AsyncMock(return_value="group")
+    channel._add_reaction = AsyncMock()
+    channel.config.allow_from = allow_from
+    if bound_ticket:
+        await channel._on_ticket(ticket_event())
+    await channel._on_message(im_event())
+    assert channel.bus.inbound.empty() == (not allowed)
+    if allowed:
+        incoming = channel.bus.inbound.get_nowait()
+        assert incoming.need_reply is True
+        assert incoming.sender_id == "ou_user"
+        assert ("helpdesk_ticket_id" in incoming.metadata) is bound_ticket
 
 
 @pytest.mark.asyncio

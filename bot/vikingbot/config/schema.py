@@ -9,6 +9,7 @@ from pydantic.json_schema import SkipJsonSchema
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from openviking_cli.utils.config.vlm_config import VLMCredential
+
 # 服务台扩展接入：专属配置独立存放，减少后续合并官方 schema 时的冲突。
 from vikingbot.extensions.feishu_helpdesk.config import FeishuHelpdeskConfig
 
@@ -902,6 +903,13 @@ class RemoteSkillsConfig(BaseModel):
     cache_max_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
 
 
+class RuntimeExtensionConfig(BaseModel):
+    """Optional host-side extension factory; disabled unless explicitly listed."""
+
+    factory: str  # importable.module:create_extension
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class Config(BaseSettings):
     """Root configuration for vikingbot."""
 
@@ -919,6 +927,7 @@ class Config(BaseSettings):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
     hooks: list[str] = Field(["vikingbot.hooks.builtins.openviking_hooks.hooks"])
+    runtime_extensions: list[RuntimeExtensionConfig] = Field(default_factory=list)
     skills: list[str] = Field(
         default_factory=lambda: [
             "github-proxy",

@@ -203,12 +203,13 @@ class ChannelManager:
         while True:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
+                delivered = False
 
                 # Try exact match first
                 channel = self.channels.get(msg.session_key.channel_key())
                 if channel:
                     try:
-                        await channel.send(msg)
+                        delivered = await channel.send(msg) is True
                     except Exception as e:
                         logger.exception(f"Error sending to {msg.session_key}: {e}")
                 elif msg.session_key.type == "bot_api":
@@ -220,7 +221,7 @@ class ChannelManager:
                         # OpenAPIChannel identifies itself with name "openapi" and handles bot_api
                         if hasattr(ch, "name") and ch.name == "openapi":
                             try:
-                                await ch.send(msg)
+                                delivered = await ch.send(msg) is True
                                 handled = True
                                 break
                             except Exception as e:
@@ -235,6 +236,14 @@ class ChannelManager:
                     logger.warning(
                         f"Unknown channel: {msg.session_key}. Available: {list(self.channels.keys())}"
                     )
+
+                # Receipt failures must not terminate the shared dispatcher. An
+                # unacknowledged outbox entry can then be retried after restart.
+                if msg.on_delivery is not None:
+                    try:
+                        await msg.on_delivery(delivered)
+                    except Exception:
+                        logger.exception("Outbound delivery receipt failed")
 
             except asyncio.TimeoutError:
                 continue

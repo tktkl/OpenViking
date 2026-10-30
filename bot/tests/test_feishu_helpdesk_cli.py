@@ -311,7 +311,9 @@ async def test_cli_error_parser_accepts_stderr_preamble_and_redacts_output(monke
         ({"type": "network"}, True),
         ({"type": "api", "code": 99991400}, True),
         ({"type": "api", "retryable": True}, True),
+        ({"type": "permission", "code": 232011}, False),
         ({"type": "permission", "code": 232017}, False),
+        ({"type": "authentication", "code": 232011, "retryable": True}, False),
         ({"type": "authentication", "code": 20037, "retryable": True}, False),
     ],
 )

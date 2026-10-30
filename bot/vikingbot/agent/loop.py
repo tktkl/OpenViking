@@ -28,6 +28,7 @@ from vikingbot.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from vikingbot.bus.events import InboundMessage, OutboundEventType, OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.config.schema import BotMode, Config, SessionKey
+from vikingbot.extensions.runtime import RuntimeContext, RuntimeExtensions
 from vikingbot.heartbeat.service import HEARTBEAT_METADATA_KEY, is_heartbeat_noop_response
 from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
@@ -453,6 +454,9 @@ class AgentLoop:
         self._active_turn: _ActiveTurn | None = None
         self._queued_interrupt_counts: dict[SessionKey, int] = {}
         self._register_default_tools()
+        self.runtime_extensions = RuntimeExtensions(
+            RuntimeContext(config, workspace, bus, self.tools, self.sessions, sandbox_manager)
+        )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy, retryable on failure).
@@ -482,6 +486,9 @@ class AgentLoop:
 
     async def close_mcp(self) -> None:
         """Close MCP server connections. Ported from HKUDS/nanobot v0.1.5."""
+        # All gateway/CLI shutdown paths already call this before sandbox cleanup.
+        # close() is idempotent, including after run()'s finally block.
+        await self.runtime_extensions.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -1220,6 +1227,14 @@ class AgentLoop:
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
+        try:
+            await self.runtime_extensions.start()
+            await self._run_messages()
+        finally:
+            await self.runtime_extensions.close()
+
+    async def _run_messages(self) -> None:
+        """Consume user turns and serialized in-process extension events."""
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
@@ -1231,8 +1246,11 @@ class AgentLoop:
 
                 # Process it
                 try:
+                    if msg.internal_handler is not None:
+                        await msg.internal_handler()
+                        continue
                     queued_interrupts = self._queued_interrupt_counts.get(msg.session_key, 0)
-                    if queued_interrupts > 0:
+                    if queued_interrupts > 0 and not msg.internal:
                         if queued_interrupts == 1:
                             self._queued_interrupt_counts.pop(msg.session_key, None)
                         else:
@@ -1284,6 +1302,8 @@ class AgentLoop:
         active = self._active_turn
         if (
             active is None
+            or msg.internal_handler is not None
+            or msg.internal
             or active.session_key != msg.session_key
             or not active.accepting_steer
             or active.interrupted
@@ -1301,6 +1321,8 @@ class AgentLoop:
         return True
 
     async def _process_message_as_active_turn(self, msg: InboundMessage) -> OutboundMessage | None:
+        if msg.before_process is not None and not await msg.before_process():
+            return None
         active: _ActiveTurn
 
         async def run_active_message() -> OutboundMessage | None:
@@ -1309,6 +1331,7 @@ class AgentLoop:
         task = asyncio.create_task(run_active_message())
         is_agent_turn = bool(
             msg.need_reply
+            and not msg.internal
             and msg.session_key.type != "system"
             and self.config.mode != BotMode.DEBUG
             and not msg.content.strip().startswith("/")

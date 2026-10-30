@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import OrderedDict
+from functools import partial
 
 import httpx
 from loguru import logger
@@ -12,7 +13,17 @@ from vikingbot.extensions.feishu_helpdesk.api import HelpdeskAPI, HelpdeskAPIErr
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
 
 CLOSED_STATUSES = {50, 51, 52}
-ADMISSION_RETRY_DELAYS = (2, 5, 10)
+ADMISSION_RETRY_DELAYS = (2, 5, 10, 30, 60)
+
+
+def _error_details(error: Exception) -> str:
+    # Never render arbitrary exception messages, request URLs or response bodies.
+    status = (
+        error.response.status_code
+        if isinstance(error, httpx.HTTPStatusError)
+        else getattr(error, "status", 0)
+    )
+    return f"error={type(error).__name__}, code={getattr(error, 'code', None)}, HTTP={status}"
 
 
 class FeishuHelpdeskChannel(FeishuChannel):
@@ -94,15 +105,21 @@ class FeishuHelpdeskChannel(FeishuChannel):
             return
         task = asyncio.create_task(self._on_ticket(data))
         self._helpdesk_tasks.add(task)
-        task.add_done_callback(self._ticket_done)
+        task.add_done_callback(partial(self._ticket_done, data=data))
 
-    def _ticket_done(self, task):
+    def _ticket_done(self, task, *, data=None):
         self._helpdesk_tasks.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
-            # API errors contain only operation, status and error code, never credentials.
-            logger.error("Feishu Helpdesk event failed: {}", error)
+            event = getattr(data, "event", None)
+            ticket = getattr(event, "object", event)
+            logger.error(
+                "Feishu Helpdesk event failed: ticket_id={}, chat_id={}, {}",
+                getattr(ticket, "ticket_id", None),
+                getattr(ticket, "chat_id", None),
+                _error_details(error),
+            )
 
-    async def _ensure_in_chat_with_retry(self, chat_id: str) -> bool:
+    async def _ensure_in_chat_with_retry(self, chat_id: str, *, ticket_id: str) -> bool:
         # SDK callbacks acknowledge events before admission finishes. Keep transient
         # failures in the same shared task so retries do not depend on another event.
         for attempt in range(len(ADMISSION_RETRY_DELAYS) + 1):
@@ -117,7 +134,13 @@ class FeishuHelpdeskChannel(FeishuChannel):
                 HelpdeskAPIError,
                 LarkCLIError,
             ) as error:
-                if isinstance(error, (HelpdeskAPIError, LarkCLIError)):
+                if isinstance(error, LarkCLIError):
+                    # A newly created ticket chat may not contain the inviting user yet.
+                    # Keep this exception local to admission, not CLI auth or keepalive.
+                    retryable = not error.authentication and (
+                        error.retryable or error.code == 232011
+                    )
+                elif isinstance(error, HelpdeskAPIError):
                     retryable = error.retryable
                 elif isinstance(error, httpx.HTTPStatusError):
                     status = error.response.status_code
@@ -128,11 +151,13 @@ class FeishuHelpdeskChannel(FeishuChannel):
                     raise
                 delay = ADMISSION_RETRY_DELAYS[attempt]
                 logger.warning(
-                    "Feishu Helpdesk admission retry: chat_id={}, attempt={}, delay={}s, error={}",
+                    "Feishu Helpdesk admission retry: ticket_id={}, chat_id={}, "
+                    "attempt={}, delay={}s, {}",
+                    ticket_id,
                     chat_id,
                     attempt + 2,
                     delay,
-                    type(error).__name__,
+                    _error_details(error),
                 )
                 # Cancellation from ticket closure or shutdown must interrupt the backoff.
                 await asyncio.sleep(delay)
@@ -164,7 +189,9 @@ class FeishuHelpdeskChannel(FeishuChannel):
             return
         task = self._join_tasks.get(chat_id)
         if task is None:
-            task = asyncio.create_task(self._ensure_in_chat_with_retry(chat_id))
+            task = asyncio.create_task(
+                self._ensure_in_chat_with_retry(chat_id, ticket_id=ticket_id)
+            )
             self._join_tasks[chat_id] = task
         try:
             if not await asyncio.shield(task):

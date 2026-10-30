@@ -1,5 +1,6 @@
 """Event types for the message bus."""
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -41,6 +42,15 @@ class InboundMessage:
     media: list[str | dict[str, Any]] = field(default_factory=list)  # Paths or image_url parts
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     openviking_connection: dict[str, Any] | None = None  # Internal OpenViking identity
+    # In-process runtime event, never reconstructed from channel metadata or user text.
+    # Running it on the main queue serializes history updates with agent turns.
+    internal_handler: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
+    # Follow-up events may deliberately need an agent turn, but still must not
+    # steer/cancel a live user turn. This flag is set only by host extensions.
+    internal: bool = False
+    # Host-only guard for queued extension work. Channel/user metadata cannot
+    # construct this callable; the extension revalidates it at execution time.
+    before_process: Callable[[], Awaitable[bool]] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -58,6 +68,9 @@ class OutboundMessage:
     time_cost: float = field(default_factory=float)
     iteration: int = field(default_factory=int)
     tools_used_names: list[str] = field(default_factory=list)
+    # Optional receipt for durable extension outboxes. True means the channel
+    # explicitly confirmed delivery; exceptions/False/legacy None are unconfirmed.
+    on_delivery: Callable[[bool], Awaitable[None]] | None = field(default=None, repr=False)
 
     @property
     def channel(self) -> str:
