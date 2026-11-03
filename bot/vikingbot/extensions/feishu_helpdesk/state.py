@@ -138,7 +138,9 @@ class HelpdeskState:
             values.update(
                 reopened_at=now,
                 reopen_waiting_for_human=True,
-                reopen_human_after=old["last_human"] or old["created"],
+                # Backfilled messages from before the last closed state must
+                # not unlock a reopened ticket's old resolution.
+                reopen_human_after=max(old["last_human"] or old["created"], old["updated"]),
                 close_cycle=old.get("close_cycle", 0) + 1,
                 count=0,
                 last_send=None,
@@ -239,7 +241,7 @@ class HelpdeskState:
                 "scenario": "unknown",
                 "retry_at": 0,
             }
-            if merged["time"] >= item.get("reopen_human_after", 0):
+            if merged["time"] > item.get("reopen_human_after", 0):
                 candidate["reopen_waiting_for_human"] = False
         elif (
             merged.get("human") is not False

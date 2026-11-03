@@ -424,3 +424,52 @@ async def test_human_message_before_reopen_scan_counts_as_new_communication(desk
     assert not service.store.tickets["t1"]["reopen_waiting_for_human"]
     service.judge.judge.assert_awaited_once()
     assert len(api.cli.closes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("close_delay", [0, 60])
+async def test_preclose_history_cannot_unlock_reopened_ticket(desk, tmp_path, restart, close_delay):
+    service, api, clock = await initialized(desk)
+    clock.advance(60)
+    api.messages["t1"] = [
+        {
+            "id": "tm_before_close",
+            "message_id": "om_before_close",
+            "created_at": int(clock() * 1000),
+            "content": "问题已经解决，可以关闭",
+            "user_id": "ou_guest",
+            "message_type": "text",
+        }
+    ]
+    clock.advance(close_delay)
+    api.tickets["t1"].update(status=51, updated_at=int(clock() * 1000))
+    # The close event won the race with polling; its earlier human message
+    # must not later masquerade as communication after reopening.
+    service.register(copy.deepcopy(api.tickets["t1"]))
+    assert not service.store.messages("t1")
+    if restart:
+        await service.close()
+        service, _, _ = await desk(path=tmp_path, clock=clock, api=api)
+    clock.advance(60)
+    api.tickets["t1"].update(status=2, updated_at=int(clock() * 1000))
+    api.cli.message.side_effect = None
+    api.cli.message.return_value = {
+        "chat_id": "oc_ticket",
+        "sender": {"sender_type": "user", "id": "ou_guest"},
+    }
+    service.judge.judge.reset_mock()
+    service.judge.judge.return_value = Decision("resolved", reason="旧对话已解决")
+    await service.reconcile()
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["status"] == 2 and item["reopen_waiting_for_human"]
+    assert not api.cli.closes and len(api.cli.sends) == 1
+    service.judge.judge.assert_not_awaited()
+    clock.advance(1)
+    human(service, clock, "om_after_reopen", text="又遇到了新的问题")
+    service.judge.judge.return_value = Decision("awaiting_handler", "请处理方跟进新问题。")
+    await drain(service)
+    assert not service.store.tickets["t1"]["reopen_waiting_for_human"]
+    service.judge.judge.assert_awaited_once()
+    assert not api.cli.closes
