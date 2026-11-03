@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import json
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -261,6 +263,122 @@ async def test_failure_does_not_count_or_start_close_wait(desk):
     await drain(service)
     assert service.store.tickets["t1"]["count"] == 1
     assert service.store.tickets["t1"]["last_send"] == clock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_round", [False, True])
+async def test_explicit_send_refusal_recovers_after_restart_and_permission_fix(
+    desk, tmp_path, monkeypatch, new_round
+):
+    from test_feishu_helpdesk_cli import authorization, success
+    from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
+    from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
+
+    service, api, clock = await initialized(desk)
+    adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    adapter._authorization = AsyncMock(return_value=authorization()["identities"]["user"])
+    api.cli = adapter
+    permitted = False
+
+    async def spawn(*args, **kwargs):
+        response = (
+            success(
+                {"message_id": "om_after_permission_fix", "create_time": str(int(clock() * 1000))}
+            )
+            if permitted
+            else {"ok": False, "error": {"type": "api", "code": 230035}}
+        )
+        raw = json.dumps(response).encode()
+        return SimpleNamespace(
+            returncode=0 if permitted else 1,
+            communicate=AsyncMock(return_value=(raw, b"") if permitted else (b"", raw)),
+        )
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn))
+    clock.advance(300)
+    await drain(service)
+    assert not service.store.pending_sends("t1")
+    assert service.store.tickets["t1"]["count"] == 0
+    if new_round:
+        human(service, clock, "om_human_after_refusal")
+        await drain(service)
+    assert not service.store.tickets["t1"]["paused"]
+    await service.close()
+    permitted = True
+    restarted, _, _ = await desk(path=tmp_path, clock=clock, api=api)
+    await restarted.reconcile()
+    clock.advance(300 if new_round else 60)
+    await drain(restarted)
+    item = restarted.store.tickets["t1"]
+    assert not item["paused"] and item["count"] == 1
+    assert item["last_send"] == clock() and not restarted.store.pending_sends("t1")
+
+
+@pytest.mark.asyncio
+async def test_refusal_on_retry_does_not_disprove_an_earlier_uncertain_send(desk):
+    service, api, clock = await initialized(desk)
+    clock.advance(300)
+    api.cli.fail_send = True
+    await drain(service)
+    pending = service.store.pending_sends("t1")[0]
+
+    async def rejected(*args, **kwargs):
+        await kwargs["before_call"]("ou_operator")
+        raise LarkCLIError("command failed", code=230035, rejected=True)
+
+    api.cli.send_text = rejected
+    clock.advance(60)
+    await drain(service)
+    assert service.store.pending_sends("t1")[0]["attempted_at"] == pending["attempted_at"]
+    human(service, clock, "om_new_round")
+    await drain(service)
+    assert service.store.tickets["t1"]["pause_reason"] == "receipt_from_older_round"
+
+
+@pytest.mark.asyncio
+async def test_remaining_uuid_budget_stops_and_reaps_slow_cli(desk, monkeypatch):
+    from test_feishu_helpdesk_cli import authorization, success
+    from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
+    from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
+
+    service, api, clock = await initialized(desk)
+    clock.advance(300)
+    api.cli.fail_send = True
+    await drain(service)
+    pending = service.store.pending_sends("t1")[0]
+    clock.advance(3499.8)
+    adapter = LarkCLIAdapter(
+        LarkCLIConfig(executable=sys.executable, timeout_seconds=180), "cli_bot"
+    )
+    adapter._authorization = AsyncMock(return_value=authorization()["identities"]["user"])
+    api.cli = adapter
+    original_spawn, processes = asyncio.create_subprocess_exec, []
+    late_receipt = success({"message_id": "om_too_late", "create_time": str(int(clock() * 1000))})
+
+    async def spawn(*args, **kwargs):
+        process = await original_spawn(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.5); print(" + repr(json.dumps(late_receipt)) + ")",
+            **kwargs,
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(LarkCLIError, match="request budget exhausted"):
+        await asyncio.wait_for(
+            service._send(service.store.tickets["t1"], pending["kind"], pending["text"]), 2
+        )
+    assert len(processes) == 1 and processes[0].returncode is not None
+    if os.name == "posix":
+        assert processes[0].returncode < 0
+    assert service.store.tickets["t1"]["count"] == 0
+    assert service.store.pending_sends("t1")[0]["uuid"] == pending["uuid"]
+    clock.advance(1)
+    await drain(service)
+    assert service.store.tickets["t1"]["pause_reason"] == "receipt_expired"
+    assert len(processes) == 1
 
 
 @pytest.mark.asyncio

@@ -29,8 +29,15 @@ class HelpdeskDelivery:
             return True
         if not mid.startswith("om_"):
             return False
+        chat = self.store.tickets[ticket_id]["chat_id"]
+        matches = []
         for key, out in self.store.outboxes():
-            if out["ticket"] != ticket_id or out.get("message_id"):
+            target = out.get("chat_id") or self.store.tickets[out["ticket"]]["chat_id"]
+            if out.get("message_id") or (
+                out["ticket"] != ticket_id and (not chat or target != chat)
+            ):
+                continue
+            if chat and target and chat != target:
                 continue
             attempted = out.get("attempted_at")
             if (
@@ -40,9 +47,13 @@ class HelpdeskDelivery:
                 and message.get("text") == out["text"]
                 and attempted - 2 <= message.get("time", 0) <= attempted + 3500
             ):
-                self.confirm(key, out, mid, message["time"])
-                return True
-        return False
+                matches.append((key, out))
+        if len(matches) == 1:
+            key, out = matches[0]
+            self.confirm(key, out, mid, message["time"])
+        # An echo shared by several uncertain sends is still automatic, but
+        # must not arbitrarily settle one ticket's reminder count or notice.
+        return bool(matches)
 
     def confirm(self, key, out, message_id, sent_at):
         current = self.store.outbox(key) or out
@@ -124,7 +135,7 @@ class HelpdeskDelivery:
 
     async def _find(self, key, out):
         item = self.store.tickets[out["ticket"]]
-        chat = item["chat_id"]
+        chat = out.get("chat_id") or item["chat_id"]
         if not chat:
             return
         token, seen = "", set()

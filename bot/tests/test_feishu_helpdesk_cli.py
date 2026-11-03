@@ -54,7 +54,7 @@ async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, c
         if args[0] == "auth"
         else success({"message_id": "om_sent", "create_time": created})
     )
-    before = AsyncMock()
+    before = AsyncMock(return_value=None)
     receipt = await cli.send_text("oc_ticket", "提醒", "stable-uuid", before_call=before)
     before.assert_awaited_once_with("ou_agent")
     assert receipt["message_id"] == "om_sent"
@@ -428,6 +428,36 @@ async def test_cli_failure_metadata_controls_admission_retry(monkeypatch, error,
     with pytest.raises(LarkCLIError) as failure:
         await cli._command("im", "chat.members", "create")
     assert failure.value.retryable is retryable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,rejected",
+    [
+        ({"type": "api", "code": 230035}, True),
+        ({"type": "api", "code": 99991400, "retryable": True}, True),
+        ({"type": "authorization", "code": 230027}, True),
+        ({"type": "authentication", "code": 20037}, True),
+        ({"type": "validation"}, True),
+        ({"type": "network", "retryable": True}, False),
+        ({"type": "policy"}, False),  # CLI output policy can run after the API succeeds.
+        ({"type": "api", "code": 500}, False),
+        ({"type": "internal"}, False),
+        ({}, False),
+    ],
+)
+async def test_only_known_cli_refusals_disprove_a_send(monkeypatch, error, rejected):
+    process = SimpleNamespace(
+        returncode=1,
+        communicate=AsyncMock(
+            return_value=(b"", json.dumps({"ok": False, "error": error}).encode())
+        ),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    cli = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    with pytest.raises(LarkCLIError) as failure:
+        await cli._command("api", "POST", "/open-apis/im/v1/messages")
+    assert failure.value.rejected is rejected
 
 
 @pytest.mark.asyncio

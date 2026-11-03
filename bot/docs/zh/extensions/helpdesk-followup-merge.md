@@ -16,7 +16,7 @@
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
 | `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，默认 5；`messages` 统一标识和文案，时间模板校验 |
-| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；用户操作仍显式 CLI `--as user`；请求头 stdin、进程取消和脱敏 |
+| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；用户操作仍显式 CLI `--as user`；请求头 stdin、进程取消和脱敏；发送前置回调可返回剩余执行秒数，覆盖 CLI 内部刷新和网络等待 |
 
 本次没有修改 `bus/events.py`、`bus/queue.py`、原生 `channels/feishu.py` 或 `channels/openapi.py`。内部事件继续使用并发分支已有的 `before_process` / `internal_handler`。不增加发送 API 并发，不改变共享文件、工具、MCP 或沙箱权限。
 
@@ -62,3 +62,13 @@
 本轮新增 **15 个回归用例**，服务台发送、回执及并发定向测试 **117 passed**。完整 Bot 回归 **856 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **285 passed**。额外的图片、模型重试、中断和 Token 预算回归 **44 passed、1 项既有失败**：仓库根目录的 `test_dequeued_message_is_active_before_interrupt_runs` 手工构造旧版 AgentLoop，缺少 `runtime_extensions`，已在修复前的 HEAD 源码快照复现。该旧测试夹具不属于本轮四项修复。
 
 修改文件的 Ruff、格式及差异空白检查通过；CLI `cmd/api`、`internal/client` 的 race 测试通过。未发送真实飞书消息、关单或修改授权，原 `bot-main` 工作区保持原状。
+
+## 发送恢复与跨工单回流修复
+
+本轮补齐三处边界：
+
+- 首次发送明确被拒绝时清除待对账状态，修复权限后可恢复，人工消息及重启不会将其永久暂停。未知失败仍保留回执；此前有不确定发送时，后续一次拒绝不会清除原记录。
+- 在锁和授权等待结束后，将剩余幂等时间作为 CLI 请求预算，覆盖进程启动、内部凭据刷新和 HTTP 调用。即使配置 `timeout_seconds=180`，接近过期时也会提前取消并回收子进程，后续仅做只读对账。
+- outbox 持久化目标群，自动消息匹配覆盖同一可信聊天内的旧工单，兼容无目标群字段的旧记录。不同群不能互相匹配；多个候选发送都符合时过滤自动回流，但不任意结算一个工单的回执。
+
+新增 **19 个回归用例**，覆盖明确拒绝分类、权限修复及重启、新人工轮次、先不确定后被拒绝、剩余预算取消真实本地子进程、新旧发送记录和同群/跨群隔离，以及多个候选回执。完整 Bot 回归 **875 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **304 passed**。Ruff、格式及差异空白检查通过，未调用真实飞书发送、关单或授权接口。

@@ -172,6 +172,76 @@ async def test_closed_notice_echo_is_filtered_before_and_after_receipt(desk, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("same_chat", [False, True])
+async def test_late_old_ticket_notice_uses_its_chat_before_observing_new_ticket(
+    desk, monkeypatch, legacy, same_chat
+):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    send = api.cli.send_text
+
+    async def lost_notice(*args, **kwargs):
+        await send(*args, **kwargs)
+        raise LarkCLIError("response lost", retryable=True)
+
+    api.cli.send_text = lost_notice
+    human(service, clock)
+    await drain(service)
+    out = service.store.pending_sends("t1")[0]
+    assert out["kind"] == "notice" and service.store.tickets["t1"]["status"] == 51
+    sent = api.cli.receipts[out["uuid"]]
+    if legacy:
+        del out["chat_id"]
+        service.store.save_outbox("t1:notice", out)
+    clock.advance(1)
+    item = add_ticket(service, api, clock, "t2", chat="oc_ticket" if same_chat else "oc_other")
+    service.store.save(item, count=1, last_send=clock())
+    channel = FeishuHelpdeskChannel(service.config, service.bus)
+    channel._followup = service
+    forwarded = AsyncMock()
+    monkeypatch.setattr(FeishuChannel, "_on_message", forwarded)
+    event = native(clock, sent["message_id"], out["text"])
+    event.event.message.chat_id = service.store.tickets["t2"]["chat_id"]
+    event.event.message.create_time = str(sent["create_time"])
+    try:
+        await channel._on_message(event)
+        current = service.store.tickets["t2"]
+        if same_chat:
+            forwarded.assert_not_awaited()
+            assert current["generation"] == item["generation"] and current["count"] == 1
+            assert not current["last_human"]
+            assert not service.store.pending_sends("t1")
+            assert not service.store.tickets["t1"]["notice_pending"]
+            assert service.store.outbox("t1:notice")["message_id"] == sent["message_id"]
+            manual = native(clock, "om_new_ticket_manual", "我在跟进新问题")
+            await channel._on_message(manual)
+            forwarded.assert_awaited_once_with(manual)
+            assert service.store.tickets["t2"]["generation"] == item["generation"] + 1
+        else:
+            forwarded.assert_awaited_once_with(event)
+            assert current["generation"] == item["generation"] + 1
+            assert service.store.pending_sends("t1")
+    finally:
+        await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_identical_pending_sends_in_one_chat_do_not_settle_the_wrong_ticket(desk):
+    service, api, clock, out = await paused(desk)
+    clock.advance(1)
+    item = add_ticket(service, api, clock, "t2", chat="oc_ticket")
+    second = {**out, "ticket": "t2", "generation": item["generation"], "uuid": "second-send"}
+    key = f"t2:{out['kind']}"
+    service.store.save_outbox(key, second)
+    event = native(clock, "om_ambiguous_echo", out["text"])
+    assert service.native(event) == "drop"
+    assert service.store.tickets["t2"]["generation"] == item["generation"]
+    assert service.store.pending_sends("t1") and service.store.pending_sends("t2")
+    assert service.store.tickets["t2"]["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_prefix_or_another_sender_cannot_impersonate_automatic_messages(desk):
     service, api, clock, out = await paused(desk)
     assert service.native(native(clock, "om_prefixed", "【服务台自动消息】\n我手动补充")) == "pass"

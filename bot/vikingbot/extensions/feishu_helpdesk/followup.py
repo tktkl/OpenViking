@@ -431,6 +431,7 @@ class HelpdeskFollowup:
         if out is None:
             out = {
                 "ticket": item["id"],
+                "chat_id": item["chat_id"],
                 "uuid": str(uuid.uuid4()),
                 "text": self.config.helpdesk.messages.render(text),
                 "kind": kind,
@@ -440,6 +441,8 @@ class HelpdeskFollowup:
                 "cycle": item.get("close_cycle", 0),
             }
             self.store.save_outbox(key, out)
+
+        uncertain_before = out["attempted_at"] is not None
 
         def check_expiry():
             if out["attempted_at"] is not None and self.clock() - out["attempted_at"] >= 3500:
@@ -466,6 +469,7 @@ class HelpdeskFollowup:
             out.update(actor=actor, attempted_at=out["attempted_at"] or self.clock())
             self.store.save_outbox(key, out)
             self._sending[item["id"]] = actor
+            return out["attempted_at"] + 3500 - self.clock()
 
         try:
             receipt = await self.api.cli.send_text(
@@ -480,12 +484,16 @@ class HelpdeskFollowup:
                 receipt["message_id"],
                 sent_at,
             )
-        except (LarkCLIError, StaleAction):
+        except (LarkCLIError, StaleAction) as error:
             # A trusted IM echo can confirm the send before the subprocess
             # loses its response. Preserve that receipt rather than retrying.
             confirmed = self.store.outbox(key)
             if confirmed and confirmed.get("message_id"):
                 return confirmed
+            if isinstance(error, LarkCLIError) and error.rejected and not uncertain_before:
+                # A first, explicitly refused attempt has nothing to reconcile.
+                # A refusal on a retry cannot disprove an earlier uncertain send.
+                self.store.save_outbox(key, {**out, "attempted_at": None, "actor": None})
             raise
         finally:
             self._sending.pop(item["id"], None)

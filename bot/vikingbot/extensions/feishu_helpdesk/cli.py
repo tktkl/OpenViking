@@ -15,10 +15,14 @@ from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 class LarkCLIError(RuntimeError):
     """Never include CLI stdout, stderr, request data or credentials in diagnostics."""
 
-    def __init__(self, reason: str, *, code=None, authentication=False, retryable=False):
+    def __init__(
+        self, reason: str, *, code=None, authentication=False, retryable=False, rejected=False
+    ):
         self.code = code if isinstance(code, int) else None
         self.authentication = authentication
         self.retryable = retryable and not authentication
+        # This describes only the current attempt, never any earlier retry.
+        self.rejected = rejected
         super().__init__(f"Feishu Helpdesk lark-cli {reason} (code={self.code})")
 
 
@@ -78,9 +82,9 @@ class LarkCLIAdapter:
                 start_new_session=os.name == "posix",
             )
         except FileNotFoundError:
-            raise LarkCLIError("not installed") from None
+            raise LarkCLIError("not installed", rejected=True) from None
         except OSError:
-            raise LarkCLIError("could not start") from None
+            raise LarkCLIError("could not start", rejected=True) from None
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(input_bytes)
@@ -113,6 +117,17 @@ class LarkCLIAdapter:
                 retryable=error.get("retryable") is True
                 or error.get("type") == "network"
                 or error.get("code") == 99991400,
+                # Only known refusals prove that this attempt did not send.
+                # Unknown API/server/transport failures keep an uncertain receipt.
+                rejected=error.get("type")
+                in (
+                    "authentication",
+                    "authorization",
+                    "permission",
+                    "validation",
+                    "config",
+                )
+                or error.get("code") in (230001, 230020, 230027, 230035, 232009, 99991400),
             )
         if not result:
             raise LarkCLIError("returned invalid JSON")
@@ -164,10 +179,19 @@ class LarkCLIAdapter:
             user = await self._authorization()
             if user is None:
                 raise LarkCLIError("no usable user authorization", authentication=True)
+            timeout = None
             if before_call is not None:
-                await before_call(user["openId"])
+                # Send guards may return a shorter request budget after lock/auth waits.
+                timeout = await before_call(user["openId"])
             try:
-                return await self._user_call(*args, input_bytes=input_bytes)
+                request = self._user_call(*args, input_bytes=input_bytes)
+                if timeout is None:
+                    return await request
+                # Include CLI startup, its credential refresh and the HTTP call.
+                # Cancellation reaps the private process group in _command().
+                return await asyncio.wait_for(request, timeout)
+            except asyncio.TimeoutError:
+                raise LarkCLIError("request budget exhausted", retryable=True) from None
             except LarkCLIError as error:
                 if error.authentication:
                     self._authorization_failed(user)
