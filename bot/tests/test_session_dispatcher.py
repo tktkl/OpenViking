@@ -189,3 +189,47 @@ async def test_close_awaits_cleanup_and_discards_waiting_work():
     assert completed == []
     await dispatcher.close()
     await dispatcher.join()
+
+
+@pytest.mark.asyncio
+async def test_close_finishes_when_handler_suppresses_cancellation():
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleaned = asyncio.Event()
+    executed = []
+
+    async def handle(msg):
+        executed.append(msg.content)
+        if msg.content != "active":
+            return
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release_cleanup.wait()
+            cleaned.set()
+
+    dispatcher = SessionDispatcher(1, handle)
+    dispatcher.start()
+    dispatcher.submit(message("A", "active"))
+    await asyncio.wait_for(started.wait(), 2)
+    dispatcher.submit(message("A", "same-session"))
+    dispatcher.submit(message("B", "other-session"))
+    closing = asyncio.create_task(dispatcher.close())
+    try:
+        await asyncio.wait_for(cleaning.wait(), 2)
+        assert not closing.done()
+        release_cleanup.set()
+        await asyncio.wait_for(closing, 2)
+        await asyncio.wait_for(dispatcher.join(), 2)
+        assert cleaned.is_set()
+        assert executed == ["active"]
+        assert not dispatcher._workers
+        assert not dispatcher._pending
+    finally:
+        release_cleanup.set()
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await dispatcher.close()

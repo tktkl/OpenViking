@@ -421,6 +421,109 @@ async def test_cancelled_internal_item_does_not_lose_execution_capacity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 4])
+async def test_interrupt_persists_input_then_processes_next_turn(make_concurrent_loop, limit):
+    loop, provider = make_concurrent_loop(limit)
+    provider.block("active")
+    async with running(loop):
+        await loop.bus.publish_inbound(inbound("active"))
+        await asyncio.wait_for(provider.started["active"].wait(), 2)
+        assert await loop.interrupt(inbound("").session_key)
+        interrupted = (await results(loop.bus, 1))[0]
+        assert interrupted.event_type == OutboundEventType.INTERRUPT
+        assert history(loop) == ["active"]
+        await loop.bus.publish_inbound(inbound("after"))
+        assert (await results(loop.bus, 1))[0].content == "answer:after"
+        assert history(loop) == ["active", "after", "answer:after"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 4])
+@pytest.mark.parametrize("cancel_run", [False, True])
+async def test_shutdown_awaits_callback_that_suppresses_cancellation(
+    make_concurrent_loop, limit, cancel_run
+):
+    loop, provider = make_concurrent_loop(limit)
+    entered = asyncio.Event()
+    cleaning = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleaned = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def callback():
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release_cleanup.wait()
+            cleaned.set()
+
+    class Extension:
+        async def start(self):
+            pass
+
+        async def close(self):
+            assert cleaned.is_set()
+            closed.set()
+
+    loop.runtime_extensions.extensions.append(Extension())
+    task = asyncio.create_task(loop.run())
+    try:
+        await loop.bus.publish_inbound(inbound("callback", internal_handler=callback))
+        await asyncio.wait_for(entered.wait(), 2)
+        await loop.bus.publish_inbound(inbound("queued"))
+        if cancel_run:
+            task.cancel()
+        else:
+            loop.stop()
+        await asyncio.wait_for(cleaning.wait(), 2)
+        assert not task.done()
+        assert not closed.is_set()
+        release_cleanup.set()
+        if cancel_run:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            await asyncio.wait_for(task, 2)
+        assert closed.is_set()
+        assert not provider.calls
+        assert loop._session_dispatcher is None
+        assert loop._message_consumer_task is None
+        assert not loop._active_turns
+    finally:
+        release_cleanup.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 4])
+@pytest.mark.parametrize("stop_first", [False, True])
+async def test_run_cancellation_after_user_interrupt_still_propagates(
+    make_concurrent_loop, limit, stop_first
+):
+    loop, provider = make_concurrent_loop(limit)
+    provider.block("active")
+    task = asyncio.create_task(loop.run())
+    try:
+        await loop.bus.publish_inbound(inbound("active"))
+        await asyncio.wait_for(provider.started["active"].wait(), 2)
+        assert await loop.interrupt(inbound("").session_key)
+        if stop_first:
+            loop.stop()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        assert provider.active == 0
+        assert not loop._active_turns
+        assert loop._session_dispatcher is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 4])
 @pytest.mark.parametrize("cancel_run", [False, True])
 async def test_shutdown_awaits_active_and_steer_cleanup_before_closing_extensions(
     make_concurrent_loop, monkeypatch, limit, cancel_run

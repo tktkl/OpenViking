@@ -76,3 +76,11 @@ PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
 - 唯一失败为 `test_bot_model_timeout.py::test_configured_timeout_reaches_chat_request[default]`：实际默认超时 `600.0`，旧断言预期 `60.0`。在独立临时工作树的原始 `fe3dc33a5cdfdc3309af61912f02077668bc03e5` 上运行该文件，同样得到 **1 失败、2 通过**。该既有差异未随并发功能修改。
 - 临时工作树叠加 `agent_bridge` 的总线/OpenAPI 补丁和扩展文件，运行桥接契约（包含实际 requirement-agent 源码的跨仓库协议测试）、并发、调度器、OpenAPI 和后台任务组合回归：**160 通过**。补丁未进入并发分支提交，临时工作树验证后移除。
 - 修改的 Python 文件通过 Ruff 检查，分支差异通过 `git diff --check`。原 `bot-main` 的 HEAD、工作区状态及六个未提交文件的 SHA-256 与开发前快照一致。
+
+### 2026-11-03 Review 修复验证
+
+- worker 每轮调度前检查关闭状态；即使回调捕获取消异常并正常返回，也会在完成清理后退出，不会重新等待空队列或执行其他排队消息。
+- 主循环先标记停止，再取消并等待入站任务。活动轮次用 `gather(return_exceptions=True)` 区分用户中断与所属任务的取消，移除本功能新增的 `Task.cancelling()` 调用，保留 Python 3.10 支持。
+- 新增 11 个回归用例，覆盖吞掉取消异常的回调、关闭前等待异步清理、中断后的历史保存与继续处理，以及中断和运行任务取消同时发生；均验证串行与并发路径。
+- 在实际 **Python 3.10.20** 和 **Python 3.12.13** 环境分别运行调度器、会话并发及 AgentLoop 核心回归：各 **81 通过**。上述核心回归应在最低支持版本与开发环境版本各运行一次。
+- Python 3.12 完整 Bot 回归：**766 通过、4 跳过、1 项既有默认超时基线失败**，失败和跳过原因与上次验证相同。

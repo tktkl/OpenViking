@@ -15,9 +15,9 @@ from vikingbot.config.schema import SessionKey
 class SessionDispatcher:
     """Run one item per ready session before offering that session again.
 
-    Only workers are tasks. Pending messages stay in deques, and a busy session
-    never occupies another worker waiting for a lock. The handler owns execution,
-    persistence and result publication before the session can be scheduled again.
+    A fixed set of workers drains the queues. Pending messages stay in deques,
+    and a busy session never occupies another worker waiting for a lock. The handler
+    owns execution, persistence and publication before the session is scheduled again.
     """
 
     def __init__(
@@ -66,14 +66,16 @@ class SessionDispatcher:
         await self._ready.join()
 
     async def _work(self) -> None:
-        while True:
+        # A handler may consume cancellation while finishing its cleanup. In that
+        # case close() must still stop this worker before another queue wait.
+        while not self._closed:
             session_key = await self._ready.get()
             pending = self._pending[session_key]
             msg = pending.popleft()
             try:
                 await self._handler(msg)
             except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
+                if self._closed:
                     raise
                 logger.warning("Session item cancelled for {}", session_key)
             except Exception:

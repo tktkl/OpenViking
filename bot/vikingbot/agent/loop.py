@@ -1249,14 +1249,18 @@ class AgentLoop:
             self._message_consumer_task = asyncio.create_task(
                 self._consume_messages(), name="agent-inbound"
             )
-            try:
-                await self._message_consumer_task
-            except asyncio.CancelledError:
-                if self._running or asyncio.current_task().cancelling():
-                    raise
+            # wait() leaves cancellation of ingress to this owner's finally block,
+            # after _running is cleared. No Task.cancelling() (Python 3.11) is needed.
+            await asyncio.wait((self._message_consumer_task,))
+            if self._message_consumer_task.cancelled() and not self._running:
                 # stop() cancels ingress to wake an idle bus consumer.
+                return
+            self._message_consumer_task.result()
         finally:
             self._running = False
+            if self._message_consumer_task is not None:
+                self._message_consumer_task.cancel()
+                await asyncio.gather(self._message_consumer_task, return_exceptions=True)
             self._message_consumer_task = None
             if self._session_dispatcher is not None:
                 await self._session_dispatcher.close()
@@ -1300,7 +1304,9 @@ class AgentLoop:
             if response:
                 await self.bus.publish_outbound(response)
         except (Exception, asyncio.CancelledError) as e:
-            if isinstance(e, asyncio.CancelledError) and asyncio.current_task().cancelling():
+            # Only shutdown cancels ingress/workers, after their owner clears
+            # _running. An independently cancelled callback is an item failure.
+            if isinstance(e, asyncio.CancelledError) and not self._running:
                 raise
             logger.exception(f"Error processing message: {e}")
             await self.bus.publish_outbound(
@@ -1382,16 +1388,18 @@ class AgentLoop:
         )
         self._active_turns[msg.session_key] = active
         try:
-            response = await task
-            if active.accepted_steers:
-                raise RuntimeError("Active turn completed with unconsumed steer input")
-            return response
-        except asyncio.CancelledError:
-            if active.interrupted and not asyncio.current_task().cancelling():
+            # A child cancellation becomes a result; cancellation of this owner
+            # still raises, even when a user interrupt happened at the same time.
+            (result,) = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(result, asyncio.CancelledError) and active.interrupted:
                 active.interruptible = active.accepting_steer = False
                 logger.info(f"Interrupted message from {msg.session_key}")
                 return await self._complete_interrupted_message(msg)
-            raise
+            if isinstance(result, BaseException):
+                raise result
+            if active.accepted_steers:
+                raise RuntimeError("Active turn completed with unconsumed steer input")
+            return result
         except Exception:
             if self._active_turns.get(msg.session_key) is active and (
                 active.history_items or active.accepted_steers
