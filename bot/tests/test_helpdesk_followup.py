@@ -264,6 +264,150 @@ async def test_failure_does_not_count_or_start_close_wait(desk):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["lock", "authorization"])
+async def test_uuid_expiry_is_rechecked_after_cli_wait(desk, phase):
+    from test_feishu_helpdesk_cli import authorization, success
+    from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
+    from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
+
+    service, api, clock = await initialized(desk)
+    clock.advance(300)
+    api.cli.fail_send = True
+    await drain(service)
+    pending = service.store.pending_sends("t1")[0]
+    clock.advance(3490)
+    adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    api.cli = adapter
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def command(*args, **kwargs):
+        if args[0] == "auth":
+            entered.set()
+            if phase == "authorization":
+                await release.wait()
+            return authorization()
+        return success({"message_id": "om_expired", "create_time": int(clock() * 1000)})
+
+    adapter._command = AsyncMock(side_effect=command)
+    lock_held = phase == "lock"
+    if lock_held:
+        await adapter._lock.acquire()
+    sending = asyncio.create_task(
+        service._send(service.store.tickets["t1"], pending["kind"], pending["text"])
+    )
+    try:
+        if phase == "authorization":
+            await asyncio.wait_for(entered.wait(), 2)
+        else:
+            await asyncio.sleep(0)
+            assert not adapter._command.called and not sending.done()
+        clock.advance(120)  # The original request is now older than one hour.
+        if lock_held:
+            adapter._lock.release()
+            lock_held = False
+        release.set()
+        with pytest.raises(LarkCLIError, match="exceeds idempotency window"):
+            await asyncio.wait_for(sending, 2)
+        assert adapter._command.await_count == 1
+        assert adapter._command.call_args.args[0] == "auth"  # No expired send.
+        item = service.store.tickets["t1"]
+        assert item["paused"] and item["pause_reason"] == "receipt_expired"
+        assert item["count"] == 0 and item["last_send"] is None
+        assert service.store.pending_sends("t1")[0]["uuid"] == pending["uuid"]
+    finally:
+        if lock_held:
+            adapter._lock.release()
+        release.set()
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_raw_cli_retry_keeps_original_send_time_for_next_reminder(desk):
+    from test_feishu_helpdesk_cli import authorization, success
+    from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
+    from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
+
+    service, api, clock = await initialized(desk)
+    adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    api.cli = adapter
+    receipts, requests = {}, []
+    lose_response = True
+
+    async def command(*args, **kwargs):
+        nonlocal lose_response
+        if args[0] == "auth":
+            return authorization()
+        assert args[:4] == ("api", "POST", "/open-apis/im/v1/messages", "--params")
+        body = json.loads(args[6])
+        requests.append(body)
+        if body["uuid"] not in receipts:
+            receipts[body["uuid"]] = {
+                "message_id": f"om_sent{len(receipts) + 1}",
+                "create_time": str(int(clock() * 1000)),
+            }
+        if lose_response:
+            lose_response = False
+            raise LarkCLIError("response lost", retryable=True)
+        return success(receipts[body["uuid"]])
+
+    adapter._command = AsyncMock(side_effect=command)
+    clock.advance(300)
+    original_send = clock()
+    await drain(service)
+    assert service.store.tickets["t1"]["count"] == 0
+    clock.advance(60)
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["count"] == 1 and item["last_send"] == original_send
+    assert requests[0] == requests[1]  # Retry preserves the UUID and exact content.
+    clock.advance(240)
+    await drain(service)
+    assert service.store.tickets["t1"]["count"] == 2
+    assert len(receipts) == 2
+    assert "5分钟后将自动关闭" in json.loads(requests[-1]["content"])["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_time", [None, "invalid", "2027-01-15 16:05:00"])
+async def test_invalid_send_time_waits_for_raw_receipt_reconciliation(desk, invalid_time):
+    service, api, clock = await initialized(desk)
+    original_send = api.cli.send_text
+
+    async def incomplete(*args, **kwargs):
+        result = await original_send(*args, **kwargs)
+        return {**result, "create_time": invalid_time}
+
+    api.cli.send_text = incomplete
+    clock.advance(300)
+    actual_send = clock()
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["count"] == 0 and item["last_send"] is None
+    pending = service.store.pending_sends("t1")[0]
+    receipt = api.cli.receipts[pending["uuid"]]
+    api.cli.chat_messages.return_value = {
+        "items": [
+            {
+                "message_id": receipt["message_id"],
+                "chat_id": "oc_ticket",
+                "msg_type": "text",
+                "create_time": receipt["create_time"],
+                "sender": {"sender_type": "user", "id": pending["actor"]},
+                "body": {"content": json.dumps({"text": pending["text"]})},
+            }
+        ],
+        "has_more": False,
+    }
+    clock.advance(60)
+    await service.delivery.reconcile()
+    item = service.store.tickets["t1"]
+    assert item["count"] == 1 and item["last_send"] == actual_send
+    assert not service.store.pending_sends("t1")
+    assert len(api.cli.sends) == 2  # Welcome and the original reminder only.
+
+
+@pytest.mark.asyncio
 async def test_human_resets_immediately_even_for_media_and_older_delivery(desk):
     service, api, clock = await initialized(desk)
     clock.advance(300)

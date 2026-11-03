@@ -208,7 +208,8 @@ async def test_bad_receipt_page_leaves_pause_and_does_not_count_or_send(desk):
 
 
 @pytest.mark.asyncio
-async def test_receipt_found_during_cli_lock_wait_is_not_overwritten_or_resent(desk):
+@pytest.mark.parametrize("elapsed,wait", [(60, 0), (3490, 120)])
+async def test_receipt_found_during_cli_lock_wait_is_not_overwritten_or_resent(desk, elapsed, wait):
     service, api, clock = await initialized(desk)
     clock.advance(300)
     api.cli.fail_send = True
@@ -218,14 +219,20 @@ async def test_receipt_found_during_cli_lock_wait_is_not_overwritten_or_resent(d
     api.cli.chat_messages.return_value = {"items": [receipt(out)], "has_more": False}
 
     async def recover():
+        clock.advance(wait)
         await service.delivery.reconcile()
 
     api.cli.before_send = recover
-    clock.advance(60)
-    await drain(service)
+    clock.advance(elapsed)
+    # Execute only the waiting retry; an overdue next reminder is separate work.
+    await service.tick()
+    msg = service.bus.inbound.get_nowait()
+    assert await msg.before_process()
+    await msg.internal_handler()
     assert len(api.cli.sends) == 1
     assert service.store.outbox(f"t1:{out['kind']}")["message_id"] == "om_recovered"
     assert service.store.tickets["t1"]["count"] == 1
+    assert not service.store.tickets["t1"]["paused"]
 
 
 @pytest.mark.asyncio

@@ -457,6 +457,7 @@ class AgentLoop:
         self._ov_clients: dict[str, Any] = {}
         self._active_turns: dict[SessionKey, _ActiveTurn] = {}
         self._dispatching_sessions: dict[SessionKey, asyncio.Task] = {}
+        self._direct_sessions: dict[SessionKey, set[object]] = {}
         self._session_dispatcher: SessionDispatcher | None = None
         self._message_consumer_task: asyncio.Task[None] | None = None
         self._queued_interrupt_counts: dict[SessionKey, int] = {}
@@ -1307,6 +1308,8 @@ class AgentLoop:
 
         owner = _DISPATCH_OWNER.get()
         if any(matches(k) and task is not owner for k, task in self._dispatching_sessions.items()):
+            return True
+        if any(matches(k) for k in self._direct_sessions):
             return True
         if any(matches(msg.session_key) for msg in list(self.bus.inbound._queue)):
             return True
@@ -3484,13 +3487,22 @@ Respond with ONLY valid JSON, no markdown fences."""
         Returns:
             The agent's response.
         """
-        await self._connect_mcp()
         msg = InboundMessage(
             session_key=session_key,
             sender_id="user",
             content=content,
             metadata=metadata or {},
         )
-
-        response = await self._process_message(msg)
-        return response.content if response else ""
+        # Cron/heartbeat callers bypass the dispatcher. Keep every overlapping
+        # invocation visible to ticket closure until its final saving finishes.
+        owner = object()
+        active = self._direct_sessions.setdefault(session_key, set())
+        active.add(owner)
+        try:
+            await self._connect_mcp()
+            response = await self._process_message(msg)
+            return response.content if response else ""
+        finally:
+            active.discard(owner)
+            if not active and self._direct_sessions.get(session_key) is active:
+                del self._direct_sessions[session_key]

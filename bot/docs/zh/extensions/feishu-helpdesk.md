@@ -103,7 +103,7 @@ CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的�
 2. 开通服务台读取/事件订阅权限 `helpdesk:all:readonly`；启动时通过服务台专用接口订阅工单创建、更新和 `helpdesk.ticket_message.created_v1`。
 3. 机器人需要成员查询权限，例如 `im:chat.members:read`；邀请用户需要 `im:chat.members:write_only`。应用权限和用户授权均须生效。
 4. 沿用已有飞书 IM 的消息读取、发消息、图片、资源和表情等权限，不因开启扩展扩大工具或发送者权限。
-5. 当前用户的自动发送和关单另需 `im:message:send_as_user`、`helpdesk:all` 及工单访问权限；恢复群消息还受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
+5. 当前用户的自动发送和关单另需 `im:message.send_as_user`、`im:message`、`helpdesk:all` 及工单访问权限；恢复群消息还受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
 
 ## 复用范围与验证
 

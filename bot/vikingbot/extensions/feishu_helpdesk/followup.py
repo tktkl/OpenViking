@@ -440,14 +440,18 @@ class HelpdeskFollowup:
                 "cycle": item.get("close_cycle", 0),
             }
             self.store.save_outbox(key, out)
-        if out["attempted_at"] is not None and self.clock() - out["attempted_at"] >= 3500:
-            self.store.save(
-                self.store.tickets[item["id"]], paused=True, pause_reason="receipt_expired"
-            )
-            logger.warning(
-                "Helpdesk automation paused: ticket={}, reason=receipt_expired", item["id"]
-            )
-            raise LarkCLIError("uncertain receipt exceeds idempotency window")
+
+        def check_expiry():
+            if out["attempted_at"] is not None and self.clock() - out["attempted_at"] >= 3500:
+                self.store.save(
+                    self.store.tickets[item["id"]], paused=True, pause_reason="receipt_expired"
+                )
+                logger.warning(
+                    "Helpdesk automation paused: ticket={}, reason=receipt_expired", item["id"]
+                )
+                raise LarkCLIError("uncertain receipt exceeds idempotency window")
+
+        check_expiry()
 
         async def before(actor):
             confirmed = self.store.outbox(key)
@@ -456,6 +460,9 @@ class HelpdeskFollowup:
                 # the shared CLI lock. Do not overwrite or resend its receipt.
                 raise StaleAction()
             self._check(item["id"], item["generation"], closed=kind.startswith("notice"))
+            # Waiting for the CLI lock and authorization may exhaust the UUID
+            # window. An expired attempt must go through read-only recovery.
+            check_expiry()
             out.update(actor=actor, attempted_at=out["attempted_at"] or self.clock())
             self.store.save_outbox(key, out)
             self._sending[item["id"]] = actor
@@ -464,11 +471,14 @@ class HelpdeskFollowup:
             receipt = await self.api.cli.send_text(
                 item["chat_id"], out["text"], out["uuid"], before_call=before
             )
+            sent_at = timestamp(receipt.get("create_time"))
+            if sent_at is None:
+                raise LarkCLIError("send returned no valid creation time", retryable=True)
             return self.delivery.confirm(
                 key,
                 out,
                 receipt["message_id"],
-                timestamp(receipt.get("create_time")) or self.clock(),
+                sent_at,
             )
         except (LarkCLIError, StaleAction):
             # A trusted IM echo can confirm the send before the subprocess

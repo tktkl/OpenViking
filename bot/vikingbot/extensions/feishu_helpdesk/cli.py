@@ -174,15 +174,24 @@ class LarkCLIAdapter:
                 raise
 
     async def send_text(self, chat_id, text, idempotency_key, *, before_call=None):
+        # Raw API output preserves Feishu's millisecond create_time. The send
+        # shortcut formats it as local wall time and loses the original epoch.
         result = await self._operate(
-            "im",
-            "+messages-send",
-            "--chat-id",
-            chat_id,
-            "--text",
-            text,
-            "--idempotency-key",
-            idempotency_key,
+            "api",
+            "POST",
+            "/open-apis/im/v1/messages",
+            "--params",
+            json.dumps({"receive_id_type": "chat_id"}),
+            "--data",
+            json.dumps(
+                {
+                    "receive_id": chat_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                    "uuid": idempotency_key,
+                },
+                ensure_ascii=False,
+            ),
             before_call=before_call,
         )
         if not isinstance(result.get("message_id"), str) or not result["message_id"].startswith(

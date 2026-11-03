@@ -12,7 +12,7 @@
 | `extensions/feishu_helpdesk/followup.py` | 仅通过主会话队列执行；版本检查、成功发送计时、跨重启幂等及关闭等待 |
 | `extensions/feishu_helpdesk/delivery.py` | 独立后台只读对账，暂停后继续运行；人工消息立即交付，关闭后仍过滤自动回流；回执结算可重入 |
 | `extensions/feishu_helpdesk/channel.py` | 复用飞书长连接；在原生媒体解析/steer 等待前观察人工活动；补漏恢复入群不阻塞扫描 |
-| `agent/loop.py` | 只增加物理群忙碌查询，涵盖话题、总线/调度器排队、执行及最终保存；ContextVar 排除回调自身 |
+| `agent/loop.py` | 物理群忙碌查询涵盖话题、总线/调度器排队、执行及最终保存，以及 `process_direct()` 的初始化、处理和清理；ContextVar 只排除调度回调自身 |
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
 | `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，默认 5；`messages` 统一标识和文案，时间模板校验 |
@@ -49,3 +49,16 @@
 人工消息不再等待 CLI 自动发送回执。后台只读对账与业务调度分开，暂停后仍可恢复回执，关闭说明在工单关闭后仍经过自动消息过滤。欢迎、跟进和关闭说明使用统一可配置格式，既有 outbox 继续使用原文案对账。正常再次提问按新工单接管；同 ID 重新打开作为兼容分支，使用持久化核对标记和独立关闭轮次，避免漏恢复、重复欢迎或按旧对话立即关单。
 
 本轮新增 19 个回归用例，覆盖暂停且后台查询阻塞时人工消息交付、旧轮回执只读恢复、重启及配置变化、关闭说明早到/晚到回流、分页与来源隔离、CLI 锁等待时回执竞争，以及新工单和异常重新打开的兼容。完整 Bot 回归 **841 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **270 passed**。Ruff 与差异空白检查通过，未调用真实用户发送或关单接口。
+
+## 追加审查修复
+
+修复以下四项问题：
+
+- `process_direct()` 使用独立调用标记登记忙碌状态，覆盖 MCP 初始化、消息处理、最终保存和清理。同会话重叠调用分别回收，取消或异常也会清理；同物理群的直接调用未完成时推迟关单。
+- 在等待 CLI 锁及授权后重新检查 UUID 有效期，超期请求只进入后台只读对账。锁等待期间已确认回执的请求优先采用回执，不暂停或重发原消息。
+- 自动发送改用 CLI 原生消息 API，保留飞书原始毫秒时间。同 UUID 重试使用原消息时间；无有效时间的回执不推进次数或期限，等待后台对账。
+- 部署文档将用户发送权限修正为 `im:message.send_as_user`，并补充 `im:message`。
+
+本轮新增 **15 个回归用例**，服务台发送、回执及并发定向测试 **117 passed**。完整 Bot 回归 **856 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **285 passed**。额外的图片、模型重试、中断和 Token 预算回归 **44 passed、1 项既有失败**：仓库根目录的 `test_dequeued_message_is_active_before_interrupt_runs` 手工构造旧版 AgentLoop，缺少 `runtime_extensions`，已在修复前的 HEAD 源码快照复现。该旧测试夹具不属于本轮四项修复。
+
+修改文件的 Ruff、格式及差异空白检查通过；CLI `cmd/api`、`internal/client` 的 race 测试通过。未发送真实飞书消息、关单或修改授权，原 `bot-main` 工作区保持原状。

@@ -47,28 +47,30 @@ def cli():
 
 
 @pytest.mark.asyncio
-async def test_followup_send_is_user_owned_and_carries_idempotency_key(cli):
+@pytest.mark.parametrize("created", ["1800000000123", 1800000000123])
+async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, created):
     cli._command.side_effect = lambda *args: (
-        authorization() if args[0] == "auth" else success({"message_id": "om_sent"})
+        authorization()
+        if args[0] == "auth"
+        else success({"message_id": "om_sent", "create_time": created})
     )
     before = AsyncMock()
     receipt = await cli.send_text("oc_ticket", "提醒", "stable-uuid", before_call=before)
     before.assert_awaited_once_with("ou_agent")
     assert receipt["message_id"] == "om_sent"
-    assert cli._command.call_args.args == (
-        "im",
-        "+messages-send",
-        "--chat-id",
-        "oc_ticket",
-        "--text",
-        "提醒",
-        "--idempotency-key",
-        "stable-uuid",
-        "--as",
-        "user",
-        "--format",
-        "json",
-    )
+    assert receipt["create_time"] == created
+    args = cli._command.call_args.args
+    assert args[:4] == ("api", "POST", "/open-apis/im/v1/messages", "--params")
+    assert json.loads(args[4]) == {"receive_id_type": "chat_id"}
+    assert args[5] == "--data"
+    body = json.loads(args[6])
+    assert body == {
+        "receive_id": "oc_ticket",
+        "msg_type": "text",
+        "content": json.dumps({"text": "提醒"}, ensure_ascii=False),
+        "uuid": "stable-uuid",
+    }
+    assert args[-4:] == ("--as", "user", "--format", "json")
 
 
 @pytest.mark.asyncio
