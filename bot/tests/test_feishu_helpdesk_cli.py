@@ -74,18 +74,16 @@ async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, c
 
 
 @pytest.mark.asyncio
-async def test_close_passes_desk_header_on_stdin_and_keeps_uat_inside_cli(cli):
-    cli._command.side_effect = lambda *args, **kwargs: (
-        authorization() if args[0] == "auth" else success()
-    )
+async def test_close_delegates_to_python_and_keeps_official_cli_for_auth(cli):
+    cli._close_helper = AsyncMock(return_value={})
     await cli.close_ticket("t1", "private-desk-header", {"status": 51, "solved": 1})
-    args, kwargs = cli._command.call_args
-    assert args[:4] == ("api", "PUT", "/open-apis/helpdesk/v1/tickets/t1", "--headers")
-    assert "private-desk-header" not in args
-    assert args[-4:] == ("--as", "user", "--format", "json")
-    assert json.loads(kwargs["input_bytes"]) == {
-        "X-Lark-Helpdesk-Authorization": "private-desk-header"
-    }
+    cli._command.assert_awaited_once_with("auth", "status", "--json")
+    assert cli._close_helper.await_args.args[:4] == (
+        "t1",
+        "private-desk-header",
+        {"status": 51, "solved": 1},
+        "ou_agent",
+    )
 
 
 @pytest.mark.asyncio

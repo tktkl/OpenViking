@@ -16,15 +16,21 @@
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
 | `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，默认 5；`messages` 统一标识和文案，时间模板校验 |
-| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；用户操作仍显式 CLI `--as user`；请求头 stdin、进程取消和脱敏；发送前置回调可返回剩余执行秒数，覆盖 CLI 内部刷新和网络等待 |
+| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；普通用户操作显式 CLI `--as user`；关单启动当前 Python，准备后再做最终回调；共享锁、总预算、stdin、进程组取消和脱敏 |
+| `extensions/feishu_helpdesk/close_helper.py` | 固定关单 API，版本 1 的 ready/commit/abort 协议；CLI 策略与身份检查、续期先于刷新锁；一次 PUT、不重放不确定提交 |
+| `extensions/feishu_helpdesk/cli_credentials.py` | 集中适配 CLI 目录、工作区、profile、AES-GCM 和刷新锁；只读解密 access token，不创建密钥、不使用 refresh token |
 
 本次没有修改 `bus/events.py`、`bus/queue.py`、原生 `channels/feishu.py` 或 `channels/openapi.py`。内部事件继续使用并发分支已有的 `before_process` / `internal_handler`。不增加发送 API 并发，不改变共享文件、工具、MCP 或沙箱权限。
 
 上游若替换调度入口，必须让回调在现有 worker 内被完整 await，包括 CLI、持久化和清理。不能将回调 fire-and-forget，否则会绕过 `max_concurrent_sessions`。若替换会话队列，忙碌查询必须覆盖新的排队结构和保存阶段；它只排除当前执行 owner，不能排除同物理群其他话题。
 
-## CLI 补丁独立维护
+## Python 关单与 CLI 兼容边界
 
-`bot/compat/lark-cli/0001-api-request-headers.patch` 固定在 CLI 提交 `4e2cbea94e33913378ce515f0fccfb9b1f2f2bb9`，只修改原生 `api` 命令及新增测试。`build.sh` 在临时克隆中构建私有副本，使用 `helpdesk.cli.executable` 指向它，不修改全局 CLI 或原 CLI 源仓库。上游支持等价参数后，可通过契约测试再移除补丁。用户 Token 的存储和刷新不得搬到 VikingBot。
+关单现已改为独立 Python 子进程，删除旧 CLI 补丁和构建脚本，`helpdesk.cli.executable` 使用官方 `lark-cli`。无需 Go、私有 CLI 或独立工具路径。适配契约以 CLI 提交 `4e2cbea94e33913378ce515f0fccfb9b1f2f2bb9` 为参考，按字段和加密布局判断兼容性；未来格式变化仅需修改凭据适配模块。原有 SQLite 无须迁移。
+
+上游合并须保留准备和提交之间的最终检查：`ready` 之后由 Bot 读取最新状态和消息，在当前轮次、关闭轮次、同群忙碌检查通过后持久化待确认操作，再立即 `commit`。刷新锁内不能调用 CLI；最新消息检查使用应用接口并跳过 CLI 来源核实。超时从共享 CLI 锁等待开始计算，取消回收脚本整个进程组。CLI 继续独占 OAuth 刷新和凭据写入；仅 Python 子进程只读解密 access token，不导出、不另存、不自建续期链路。
+
+`commit` 后结果不确定时保留 `close_pending`；远端仍开放也不重放旧 PUT，通过状态及备注确认后才补发关闭说明。凭据不兼容只影响关单，不暂停人工消息和回执对账。平台、目录和升级说明见 [CLI 凭据兼容](../../../compat/lark-cli/README.md)。
 
 ## 持久化与回退
 
@@ -85,3 +91,15 @@
 整体复核补充发现：关闭事件先于消息同步到达时，关闭前的人工消息可能在重新打开后才补齐，旧解决结论因此错误触发再次关单。现在以最后已知关闭状态的时间和已知人工消息时间共同约束新的人工沟通，关闭时刻及之前的补漏消息不解除等待；同毫秒记录也按旧消息处理。
 
 新增 **4 个回归用例**，覆盖普通运行及重启恢复、旧消息与关闭同毫秒及早于关闭的情况，并验证真正的新人工消息仍能恢复判断。本轮修复共新增 **13 个用例**。完整 Bot 回归 **888 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **317 passed**。Ruff、格式及差异空白检查通过，未调用真实飞书发送、关单或授权接口。
+
+## Python 独立关单（2026-11-03）
+
+以随包安装的 Python 子进程替代补丁 CLI，移除旧补丁和构建脚本。官方 CLI 继续负责消息、查询和 OAuth 续期；凭据适配模块只读支持 Linux/macOS 的现有加密布局、profile/工作区和刷新锁，不创建密钥、不自建续期链路。关单采用准备、最终检查、持久化待确认操作、提交的两阶段协议；一次 PUT，提交后结果不确定只查询确认，不能重放旧请求。准备失败和明确拒绝可安全恢复，凭据不兼容只影响关单。
+
+新增 **97 个回归用例**，涵盖真实 AES-GCM 布局、macOS Keychain 失败、身份与品牌不匹配、未知 provider/格式、锁等待及释放、CLI 与原生 API 信封、两类关闭参数、最终检查与自然时间回拨、拒绝/不确定结果、重启恢复以及真实子进程管道和取消清理。正常退出先确认主进程状态，再清理进程组，避免遗留后代持有输出管道时等待 EOF。原 `bot-main` 的 HEAD、暂存区、未暂存补丁及未跟踪文件哈希均保持不变。
+
+- Python 3.12 完整 Bot 回归：**985 passed、4 skipped、1 项既有超时失败**。唯一失败仍是默认 600 秒与断言 60 秒不一致，本次未修改相关代码。
+- Python 3.10 凭据、关单协议、CLI、跟进及共享并发定向测试：**218 passed**；进程清理修复后另行复核协议测试 **12 passed**。Python 3.10 全量尝试在既有后台任务 `slow_probe` 用例等待退出，完整回归改用 Python 3.12，该用例通过。
+- 基础 Token 预算工具：**4 passed**；修改 Python 文件的 Ruff、格式及差异空白检查通过。已通过实际模块入口和模拟 CLI/凭据验证准备与取消链路。
+
+全部验证离线进行，没有读取真实 CLI 用户凭据、发送飞书消息、关单或修改真实授权。尚需在测试服务台验证真实用户权限、Keychain 访问和远端关单。部署只需更新 VikingBot、保留官方 CLI 登录态、确认 `cli.executable` 指向官方 CLI 后重启，SQLite 无须迁移。

@@ -631,6 +631,11 @@ async def test_final_check_cannot_deadlock_while_real_cli_and_sync_locks_are_hel
     adapter._command = AsyncMock(
         side_effect=lambda *args, **kwargs: authorization() if args[0] == "auth" else success()
     )
+
+    async def prepared_helper(ticket, authorization, body, user, before, deadline, submission):
+        await before(user)
+
+    adapter._close_helper = prepared_helper
     api.cli = adapter
     api.messages["t1"] = [
         {
@@ -1111,6 +1116,121 @@ async def test_close_and_notice_recover_after_lost_response(desk, tmp_path):
     assert api.cli.sends[-1][1] == service.config.helpdesk.messages.render(
         "问题已解决，工单已关闭。"
     )
+
+
+@pytest.mark.asyncio
+async def test_close_preparation_failure_never_persists_a_pending_put(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+
+    async def unavailable(*args, **kwargs):
+        assert service.store.tickets["t1"]["close_pending"] is None
+        raise LarkCLIError("credential format unsupported", rejected=True)
+
+    api.cli.close_ticket = unavailable
+    await drain(service)
+    assert service.store.tickets["t1"]["close_pending"] is None
+    assert api.tickets["t1"]["status"] == 2 and len(api.cli.sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_close_refusal_clears_only_this_pending_attempt_and_can_retry(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+    original = api.cli.close_ticket
+
+    async def refused(*args, before_call, **kwargs):
+        assert service.store.tickets["t1"]["close_pending"] is None
+        await before_call("ou_operator")
+        assert service.store.tickets["t1"]["close_pending"]
+        raise LarkCLIError("permission refused", code=154003, rejected=True)
+
+    api.cli.close_ticket = refused
+    await drain(service)
+    assert service.store.tickets["t1"]["close_pending"] is None
+    api.cli.close_ticket = original
+    clock.advance(60)
+    await drain(service)
+    assert len(api.cli.closes) == 1 and api.tickets["t1"]["status"] == 51
+
+
+@pytest.mark.asyncio
+async def test_uncertain_open_close_is_reconciled_without_replaying_put(desk, tmp_path):
+    service, api, clock = await initialized(desk, path=tmp_path)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+    attempts = []
+
+    async def uncertain(ticket, authorization, body, *, before_call):
+        await before_call("ou_operator")
+        attempts.append(copy.deepcopy(body))
+        raise LarkCLIError("response lost", retryable=True)
+
+    api.cli.close_ticket = uncertain
+    await drain(service)
+    assert service.store.tickets["t1"]["close_pending"]
+    for _ in range(3):
+        clock.advance(60)
+        await service.reconcile()
+        await drain(service)
+    assert len(attempts) == 1 and len(api.cli.sends) == 1
+    # The submission fence survives restart, including while details say OPEN.
+    await service.close()
+    service, _, _ = await desk(path=tmp_path, api=api, clock=clock)
+    clock.advance(60)
+    await service.reconcile()
+    await drain(service)
+    assert len(attempts) == 1
+    # Delayed completion may be observed after several OPEN detail responses.
+    api.tickets["t1"].update(
+        status=51,
+        solve=2,
+        comments={"content": attempts[0]["comment"]},
+        updated_at=int(clock() * 1000),
+    )
+    clock.advance(60)
+    await service.reconcile()
+    await drain(service)
+    assert len(attempts) == 1 and len(api.cli.sends) == 2
+    assert service.store.tickets["t1"]["close_pending"] is None
+    await drain(service)
+    assert len(api.cli.sends) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_guard", [False, True])
+async def test_close_cancellation_only_keeps_pending_after_final_guard(desk, after_guard):
+    service, api, clock = await initialized(desk)
+
+    async def cancelled(*args, before_call, **kwargs):
+        if after_guard:
+            await before_call("ou_operator")
+        raise asyncio.CancelledError()
+
+    api.cli.close_ticket = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        await service._close(service.store.tickets["t1"], solved=2, reason="业务确认恢复")
+    assert bool(service.store.tickets["t1"]["close_pending"]) is after_guard
+
+
+@pytest.mark.asyncio
+async def test_timeout_close_rechecks_wall_clock_after_authorization_preparation(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("awaiting_details", "请补充问题。")
+    for _ in range(2):
+        clock.advance(300)
+        await drain(service)
+    clock.advance(300)
+
+    async def clock_changed():
+        clock.advance(-60)
+
+    api.cli.before_close = clock_changed
+    await drain(service)
+    assert not api.cli.closes
+    assert service.store.tickets["t1"]["close_pending"] is None
 
 
 @pytest.mark.asyncio

@@ -320,7 +320,7 @@ class HelpdeskFollowup:
                     logger.warning(
                         "Helpdesk action failed: ticket={}, error={}",
                         ticket_id,
-                        type(result).__name__,
+                        str(result) if isinstance(result, LarkCLIError) else type(result).__name__,
                     )
             finally:
                 task.cancel()
@@ -356,6 +356,12 @@ class HelpdeskFollowup:
         item = self._check(ticket_id, generation)
         if item["close_pending"] is not None and item["close_pending"]["generation"] != generation:
             item = self.store.save(item, close_pending=None)
+        elif item["close_pending"] is not None:
+            # An earlier PUT may have reached Feishu even though its response
+            # was lost. Synchronization/recovery confirms closure; never replay
+            # that old request merely because a subsequent read is still OPEN.
+            self.store.save(item, retry_at=self.clock() + 60)
+            return
         for pending in self.store.pending_sends(ticket_id):
             if pending["generation"] != generation:
                 if pending["kind"] == "welcome":
@@ -507,31 +513,58 @@ class HelpdeskFollowup:
 
     async def _close(self, item, *, solved, reason):
         ticket_id, generation = item["id"], item["generation"]
+
+        def check_timeout(current):
+            if solved == 1 and (
+                current["count"] != 2
+                or current["scenario"] not in BUSINESS_WAIT
+                or current["last_send"] is None
+                or self.clock() < current["last_send"] + self.interval
+            ):
+                raise StaleAction()
+
         await self.sync.ticket(ticket_id)
         current = self._check(ticket_id, generation)
         if self.session_busy(self._key(current)):
             self.store.save(current, retry_at=self.clock() + 10)
             return
-        if solved == 1 and (
-            current["count"] != 2
-            or current["scenario"] not in BUSINESS_WAIT
-            or self.clock() < current["last_send"] + self.interval
-        ):
-            raise StaleAction()
+        check_timeout(current)
         body = {"status": 51, "solved": solved, "comment": reason}
         pending = {"body": body, "generation": generation}
-        current = self.store.save(current, close_pending=pending)
+        prepared = False
 
         async def before(_actor):
+            nonlocal current, prepared
             # CLI authorization/its shared send lock can wait. Re-read after that
             # wait, immediately before the destructive request is issued.
             await self.sync.latest(ticket_id)
             latest = self._check(ticket_id, generation)
+            check_timeout(latest)
             if self.session_busy(self._key(latest)):
                 self.store.save(latest, retry_at=self.clock() + 10)
                 raise StaleAction()
+            current = self.store.save(latest, close_pending=pending)
+            prepared = True
 
-        await self.api.cli.close_ticket(ticket_id, self.api.authorization, body, before_call=before)
+        try:
+            await self.api.cli.close_ticket(
+                ticket_id, self.api.authorization, body, before_call=before
+            )
+        except (LarkCLIError, asyncio.CancelledError) as error:
+            # Cancellation before the guard persists nothing. After the guard
+            # returns, the adapter writes commit without an intervening await;
+            # retain pending conservatively if that operation is cancelled.
+            rejected = isinstance(error, LarkCLIError) and error.rejected
+            latest = self.store.tickets[ticket_id]
+            if (
+                rejected
+                and prepared
+                and latest["generation"] == generation
+                and latest.get("close_cycle", 0) == current.get("close_cycle", 0)
+                and latest["close_pending"] == pending
+            ):
+                self.store.save(latest, close_pending=None)
+            raise
         remote = await self.api.ticket(ticket_id)
         current = self._confirm_close_state(current, remote)
         current = self.store.save(

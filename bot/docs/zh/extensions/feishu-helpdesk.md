@@ -2,7 +2,7 @@
 
 本扩展让配置式飞书渠道自动加入服务台工单绑定群。入群后，用户在群内 `@Bot`，由原有 `FeishuChannel` 解析消息、调用 Agent 并回复。普通单聊、群聊继续使用同一个渠道，不需要另开一条长连接。
 
-启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。欢迎、两次跟进和符合条件的关单由当前 Lark CLI 用户执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
+启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。欢迎、两次跟进和关闭说明通过官方 Lark CLI 当前用户发送；关单通过独立 Python 子进程使用同一用户凭据执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
 
 更新官方代码前，按 [bot-main 上游合并影响](upstream-merge-impact.md) 核对核心接入点、扩展依赖及合并后回归。
 
@@ -61,14 +61,14 @@
 - `allow_from` 是该飞书渠道的发送者白名单，单聊、普通群和工单群均遵守。上例的 `[]` 表示允许所有用户提问；配置非空列表时，仅列表中的 open_id 可以使用 Bot，其他用户即使在工单群内 `@Bot` 也会被拒绝并记录 `Access denied`。如需开放渠道，在实际生效的 `ov.conf` 中将目标渠道的 `allow_from` 设为 `[]`；本扩展不会自动清空已有名单，也不为工单群绕过名单。命令权限仍按原有 `allow_cmd_from` 和运行模式判断，是否需要 `@Bot` 仍由 `thread_require_mention` 控制。
 - `helpdesk_id`、`helpdesk_token` 来自目标服务台，用于读取、订阅及关单的服务台请求头。
 - `followup_interval_minutes` 默认 `5`，严格正整数，重启生效。提醒次数固定两次；见主动跟进文档。
-- `cli.executable` 默认 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。自动关单需使用 [请求头兼容补丁](../../../compat/lark-cli/README.md) 构建的私有 CLI。
+- `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。Python 关单模块随 VikingBot 安装，自动使用当前 Python 解释器，不增加脚本路径配置。
 - `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile，并先通过 CLI 完成该 profile 的应用配置。扩展会校验其 App ID 与飞书渠道一致，不匹配就跳过用户操作。
 - 授权的客服用户必须已在目标工单群内，且群设置允许其添加机器人。服务台 Token 和机器人自己的 `tenant_access_token` 不能替代这项用户授权。
-- 用户 OAuth 应授权 `im:chat.members:write_only` 和 `offline_access`。本实现按 lark-cli 1.0.66 的命令和 JSON 契约验证；该版本登录时会自动请求 `offline_access`，实际是否获得权限仍取决于应用配置和用户授权。
+- 用户 OAuth 应授权 `im:chat.members:write_only` 和 `offline_access`；完整跟进/关单权限见主动跟进文档。凭据适配按 lark-cli 1.0.66 的命令、JSON、AES-GCM 存储及刷新锁契约验证，后续版本按格式兼容性判断，不因版本号不同就拦截。未知格式仅拒绝关单，人工消息和回执对账继续运行。
 - 扩展不再使用早期版本的 `user_access_token`、`user_refresh_token`、`oauth_token_url` 配置或 `oauth.json` 缓存；改由 CLI 登录，不复制旧 refresh token，避免两个程序轮换同一凭据。
 - 一组应用凭据启动一个配置式飞书渠道实例。不要同时在 Studio 新建同一应用的另一条长连接；Studio 的应用接入向导目前不配置本扩展。
 
-修改后按现有方式重启 `vikingbot gateway` 或 `openviking-server --with-bot`。扩展仅通过 CLI 命令使用授权，不自行读取或解密 CLI 的凭据文件，也不读取 Hermes 登录缓存。
+修改后按现有方式重启 `vikingbot gateway` 或 `openviking-server --with-bot`。常规用户操作和续期继续交给官方 CLI；只有独立 Python 关单子进程只读解密 CLI 当前本地 profile 的 access token，凭据仅在内存中使用，不读取 Hermes 登录缓存，不自行续期或另存 Token。支持 Linux 文件主密钥和 macOS 既有文件主密钥/只读 Keychain；环境 Token、自定义 provider 和未知格式暂不支持关单。部署需保留同一系统账号的 CLI 配置及凭据目录，详情见 [兼容说明](../../../compat/lark-cli/README.md)。
 
 ## CLI 授权和后台保活
 

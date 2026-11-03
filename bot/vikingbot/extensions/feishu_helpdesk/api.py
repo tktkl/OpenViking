@@ -46,7 +46,7 @@ class HelpdeskAPI:
         self.domain = domain.rstrip("/")
         self.tenant_token = tenant_token
         self.http = http_client or httpx.AsyncClient(timeout=15.0)
-        self.cli = cli or LarkCLIAdapter(settings.cli, app_id)
+        self.cli = cli or LarkCLIAdapter(settings.cli, app_id, domain=self.domain)
         self._read_lock = asyncio.Lock()
         self._last_read = 0.0
 

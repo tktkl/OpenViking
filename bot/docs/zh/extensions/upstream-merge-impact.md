@@ -6,7 +6,7 @@
 
 ## 核对基线与范围
 
-**2026-11-03 服务台跟进补充**：`codex/vikingbot-helpdesk-followup` 在并发分支基础上增加事件、60 秒主动补漏、SQLite 期限及用户 CLI 跟进/关单。生产逻辑集中在服务台扩展；核心仅注入模型与忙碌查询、暴露队列只读视图。当前接入点、测试限制和独立 CLI 补丁见 [主动跟进合并说明](helpdesk-followup-merge.md)，业务与部署见 [服务台主动跟进](feishu-helpdesk-followup.md)。
+**2026-11-03 服务台跟进补充**：`codex/vikingbot-helpdesk-followup` 在并发分支基础上增加事件、60 秒主动补漏、SQLite 期限、官方用户 CLI 跟进及独立 Python 关单。生产逻辑集中在服务台扩展；核心仅注入模型与忙碌查询、暴露队列只读视图。当前接入点、测试限制和凭据兼容边界见 [主动跟进合并说明](helpdesk-followup-merge.md)，业务与部署见 [服务台主动跟进](feishu-helpdesk-followup.md)。
 
 **2026-11-03 会话并发补充**：独立分支 `codex/vikingbot-session-concurrency` 从 `fe3dc33a5cdfdc3309af61912f02077668bc03e5` 派生；其生产改动限定在新增 `agent/session_dispatcher.py`、接入 `agent/loop.py` 和 `config/schema.py`。新增 `bot.agents.max_concurrent_sessions` 默认 `1`，大于 `1` 时不同会话并发、同会话 FIFO。原工作区尚未提交的 `agent_bridge`、总线及 OpenAPI 补丁不进入该功能提交。以下 10 月记录仍是当时快照，不能作为此分支的当前 Git 状态。实现、配置和回退见[会话并发](../concepts/07-session-concurrency.md)。
 

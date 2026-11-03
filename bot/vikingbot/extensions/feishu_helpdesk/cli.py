@@ -1,15 +1,36 @@
-"""User operations and idle-time renewal, with lark-cli owning all user credentials."""
+"""Official CLI user operations and a two-phase Python Helpdesk closer."""
 
 import asyncio
 import json
 import os
 import signal
+import sys
 import time
 from urllib.parse import quote
+from uuid import uuid4
 
 from loguru import logger
 
 from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
+
+CLOSE_CREDENTIAL_DIAGNOSTICS = frozenset(
+    {
+        "unsupported credential provider; use a local CLI profile",
+        "CLI profile or user does not match this close operation",
+        "unsupported CLI profile diagnostics",
+        "local CLI credential reading requires macOS or Linux",
+        "unsupported CLI credential size",
+        "CLI credential storage is unavailable",
+        "CLI profile changed or has an unsupported format",
+        "CLI Keychain master key is unavailable",
+        "CLI user has not authorized helpdesk:all",
+        "CLI user token needs renewal",
+        "unsupported or invalid CLI credential format",
+        "CLI refresh lock is not a regular file",
+        "CLI refresh lock timed out",
+        "CLI refresh lock is unavailable",
+    }
+)
 
 
 class LarkCLIError(RuntimeError):
@@ -43,9 +64,13 @@ def _json_output(raw: bytes) -> dict:
 
 
 class LarkCLIAdapter:
-    def __init__(self, settings: LarkCLIConfig, app_id: str):
+    def __init__(self, settings: LarkCLIConfig, app_id: str, *, domain="https://open.feishu.cn"):
         self.settings = settings
         self.app_id = app_id
+        self.brand = {
+            "https://open.feishu.cn": "feishu",
+            "https://open.larksuite.com": "lark",
+        }.get(domain.rstrip("/"))
         self._lock = asyncio.Lock()
         self._keepalive_task: asyncio.Task | None = None
         self._blocked_authorization: tuple | None = None
@@ -251,19 +276,177 @@ class LarkCLIAdapter:
         )
 
     async def close_ticket(self, ticket_id, authorization, body, *, before_call=None):
-        # --headers is supplied by the separately shipped CLI compatibility patch.
-        # The user token never leaves the CLI, including during token renewal.
-        return await self._operate(
-            "api",
-            "PUT",
-            f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}",
-            "--headers",
-            "-",
-            "--data",
-            json.dumps(body, ensure_ascii=False),
-            input_bytes=json.dumps({"X-Lark-Helpdesk-Authorization": authorization}).encode(),
-            before_call=before_call,
-        )
+        if self.brand is None:
+            raise LarkCLIError(
+                "Python close requires an official Feishu/Lark domain", rejected=True
+            )
+        deadline = time.monotonic() + self.settings.timeout_seconds
+        submission = {"committed": False}
+
+        async def close():
+            # Include lock/auth waits in the total operation budget. The helper
+            # then completes renewal before asking for the final business guard.
+            async with self._lock:
+                user = await self._authorization()
+                if user is None:
+                    raise LarkCLIError(
+                        "no usable user authorization", authentication=True, rejected=True
+                    )
+                try:
+                    return await self._close_helper(
+                        ticket_id,
+                        authorization,
+                        body,
+                        user["openId"],
+                        before_call,
+                        deadline,
+                        submission,
+                    )
+                except LarkCLIError as error:
+                    if error.authentication:
+                        self._authorization_failed(user)
+                    raise
+
+        try:
+            return await asyncio.wait_for(close(), self.settings.timeout_seconds)
+        except asyncio.TimeoutError:
+            raise LarkCLIError(
+                "Python close timed out", retryable=True, rejected=not submission["committed"]
+            ) from None
+
+    async def _close_helper(
+        self, ticket_id, authorization, body, user_id, before_call, deadline, submission
+    ):
+        request_id = str(uuid4())
+        request = {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "app_id": self.app_id,
+            "brand": self.brand,
+            "user_id": user_id,
+            "ticket_id": ticket_id,
+            "executable": self.settings.executable,
+            "profile": self.settings.profile,
+            "authorization": authorization,
+            "body": body,
+            "timeout_seconds": max(0.001, deadline - time.monotonic()),
+        }
+        process, stderr_task, committed = None, None, False
+
+        async def discard(stream):
+            while await stream.read(8192):
+                pass
+
+        async def receive():
+            try:
+                value = json.loads(await process.stdout.readline())
+                if (
+                    not isinstance(value, dict)
+                    or type(value.get("protocol_version")) is not int
+                    or value["protocol_version"] != 1
+                    or value.get("request_id") != request_id
+                ):
+                    raise ValueError()
+                return value
+            except (ValueError, UnicodeError):
+                raise LarkCLIError(
+                    "invalid Python close helper response", rejected=not committed
+                ) from None
+
+        def check_result(value):
+            if value.get("phase") != "result":
+                raise LarkCLIError("invalid Python close helper phase", rejected=not committed)
+            outcome = value.get("outcome")
+            if outcome == "accepted" and committed:
+                return {}
+            error = value.get("error", {})
+            if not isinstance(error, dict):
+                error = {}
+            # Never display arbitrary helper/CLI output. These fixed adapter
+            # diagnostics make storage incompatibility actionable without
+            # exposing decrypted data, paths or captured process output.
+            reason = "Python close helper failed"
+            if error.get("kind") == "credentials":
+                detail = error.get("reason")
+                reason = "Python close cannot read compatible local CLI credentials"
+                if isinstance(detail, str) and detail in CLOSE_CREDENTIAL_DIAGNOSTICS:
+                    reason += f": {detail}"
+            raise LarkCLIError(
+                reason,
+                code=error.get("code"),
+                authentication=error.get("authentication") is True,
+                retryable=error.get("retryable") is True,
+                rejected=not committed or outcome in ("rejected", "cancelled"),
+            )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "vikingbot.extensions.feishu_helpdesk.close_helper",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+            stderr_task = asyncio.create_task(discard(process.stderr))
+            process.stdin.write(json.dumps(request, ensure_ascii=False).encode() + b"\n")
+            await process.stdin.drain()
+            ready = await receive()
+            if ready.get("phase") != "ready":
+                return check_result(ready)
+            if ready.get("app_id") != self.app_id or ready.get("user_id") != user_id:
+                raise LarkCLIError("Python close helper identity mismatch", rejected=True)
+            if before_call is not None:
+                await before_call(user_id)
+            # Persisting close_pending happens in before_call, immediately
+            # before this commit. No await separates the guard from the write.
+            committed = True
+            submission["committed"] = True
+            process.stdin.write(
+                json.dumps(
+                    {"protocol_version": 1, "request_id": request_id, "action": "commit"}
+                ).encode()
+                + b"\n"
+            )
+            await process.stdin.drain()
+            result = check_result(await receive())
+            # Process.wait() can also wait for inherited pipe EOF when a CLI
+            # descendant outlives the leader. Observe the leader's exit first;
+            # finally then kills the group and drains every remaining pipe.
+            while process.returncode is None:
+                await asyncio.sleep(0.01)
+            if process.returncode != 0:
+                raise LarkCLIError("Python close helper exited unexpectedly")
+            return result
+        except OSError:
+            raise LarkCLIError(
+                "Python close helper communication failed", rejected=not committed
+            ) from None
+        finally:
+            if process is not None:
+                if not committed and process.stdin is not None:
+                    try:
+                        process.stdin.write(
+                            json.dumps(
+                                {"protocol_version": 1, "request_id": request_id, "action": "abort"}
+                            ).encode()
+                            + b"\n"
+                        )
+                    except (OSError, RuntimeError):
+                        pass
+                # Reap the complete group even when the helper already exited:
+                # a timed-out npm launcher may have left a CLI binary behind.
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    elif process.returncode is None:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+                stdout_task = asyncio.create_task(discard(process.stdout))
+                await process.wait()
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
     def _authorization_failed(self, user: dict):
         self._blocked_authorization = self._signature(user)
