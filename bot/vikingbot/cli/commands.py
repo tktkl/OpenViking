@@ -812,7 +812,12 @@ def prepare_channel(
         openapi_port: Port for OpenAPI channel (default: 18790)
     """
     channels = ChannelManager(bus)
-    channels.load_channels_from_config(config)
+    channels.load_channels_from_config(
+        config,
+        helpdesk_provider=getattr(agent_loop, "provider", None),
+        helpdesk_model=getattr(agent_loop, "model", None),
+        helpdesk_session_busy=getattr(agent_loop, "has_chat_work", None),
+    )
 
     # Enable OpenAPI channel for gateway mode if requested
     if enable_openapi and fastapi_app is not None:

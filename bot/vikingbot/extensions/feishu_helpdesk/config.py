@@ -15,6 +15,7 @@ class FeishuHelpdeskConfig(BaseModel):
     enabled: bool = False
     helpdesk_id: str = ""
     helpdesk_token: str = Field(default="", repr=False)
+    followup_interval_minutes: int = Field(default=5, gt=0, strict=True)
     cli: LarkCLIConfig = Field(default_factory=LarkCLIConfig)
 
     @model_validator(mode="after")

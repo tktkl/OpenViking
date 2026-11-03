@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import time
+from urllib.parse import quote
 
 from loguru import logger
 
@@ -54,7 +55,7 @@ class LarkCLIAdapter:
             logger.log("WARNING" if warning else "INFO", "Feishu Helpdesk CLI: {}", message)
             self._notice = state
 
-    async def _command(self, *args: str) -> dict:
+    async def _command(self, *args: str, input_bytes: bytes | None = None) -> dict:
         argv = [self.settings.executable]
         if self.settings.profile:
             argv.extend(["--profile", self.settings.profile])
@@ -67,7 +68,9 @@ class LarkCLIAdapter:
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE
+                if input_bytes is not None
+                else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -80,7 +83,10 @@ class LarkCLIAdapter:
             raise LarkCLIError("could not start") from None
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.settings.timeout_seconds
+                process.communicate(input_bytes)
+                if input_bytes is not None
+                else process.communicate(),
+                timeout=self.settings.timeout_seconds,
             )
         except (asyncio.TimeoutError, asyncio.CancelledError) as error:
             try:
@@ -143,14 +149,73 @@ class LarkCLIAdapter:
             return None
         return user
 
-    async def _user_call(self, *args: str) -> dict:
-        result = await self._command(*args, "--as", "user", "--format", "json")
+    async def _user_call(self, *args: str, input_bytes: bytes | None = None) -> dict:
+        kwargs = {"input_bytes": input_bytes} if input_bytes is not None else {}
+        result = await self._command(*args, "--as", "user", "--format", "json", **kwargs)
         if result.get("ok") is not True or result.get("identity") != "user":
             raise LarkCLIError("returned invalid user response")
         data = result.get("data")
         if not isinstance(data, dict):
             raise LarkCLIError("returned invalid user data")
         return data
+
+    async def _operate(self, *args, input_bytes=None, before_call=None):
+        async with self._lock:
+            user = await self._authorization()
+            if user is None:
+                raise LarkCLIError("no usable user authorization", authentication=True)
+            if before_call is not None:
+                await before_call(user["openId"])
+            try:
+                return await self._user_call(*args, input_bytes=input_bytes)
+            except LarkCLIError as error:
+                if error.authentication:
+                    self._authorization_failed(user)
+                raise
+
+    async def send_text(self, chat_id, text, idempotency_key, *, before_call=None):
+        result = await self._operate(
+            "im",
+            "+messages-send",
+            "--chat-id",
+            chat_id,
+            "--text",
+            text,
+            "--idempotency-key",
+            idempotency_key,
+            before_call=before_call,
+        )
+        if not isinstance(result.get("message_id"), str) or not result["message_id"].startswith(
+            "om_"
+        ):
+            raise LarkCLIError("send returned no message receipt", retryable=True)
+        return result
+
+    async def message(self, message_id):
+        if not message_id.startswith("om_"):
+            raise LarkCLIError("invalid IM message identity")
+        data = await self._operate(
+            "api", "GET", f"/open-apis/im/v1/messages/{quote(message_id, safe='')}"
+        )
+        for item in data.get("items", []):
+            if isinstance(item, dict) and item.get("message_id") == message_id:
+                return item
+        raise LarkCLIError("message detail missing")
+
+    async def close_ticket(self, ticket_id, authorization, body, *, before_call=None):
+        # --headers is supplied by the separately shipped CLI compatibility patch.
+        # The user token never leaves the CLI, including during token renewal.
+        return await self._operate(
+            "api",
+            "PUT",
+            f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}",
+            "--headers",
+            "-",
+            "--data",
+            json.dumps(body, ensure_ascii=False),
+            input_bytes=json.dumps({"X-Lark-Helpdesk-Authorization": authorization}).encode(),
+            before_call=before_call,
+        )
 
     def _authorization_failed(self, user: dict):
         self._blocked_authorization = self._signature(user)

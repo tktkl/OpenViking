@@ -69,16 +69,23 @@ class ChannelManager:
                 from vikingbot.channels.feishu import FeishuChannel
 
                 # 服务台扩展接入：仅显式启用时使用子类，消息收发继续继承原有 FeishuChannel。
+                helpdesk_deps = {}
                 if channel_config.helpdesk.enabled:
                     from vikingbot.extensions.feishu_helpdesk.channel import FeishuHelpdeskChannel
 
                     FeishuChannel = FeishuHelpdeskChannel
+                    helpdesk_deps = {
+                        "provider": additional_deps.get("helpdesk_provider"),
+                        "model": additional_deps.get("helpdesk_model"),
+                        "session_busy": additional_deps.get("helpdesk_session_busy"),
+                    }
 
                 channel = FeishuChannel(
                     channel_config,
                     self.bus,
                     workspace_path=workspace_path,
                     bot_config=additional_deps.get("bot_config"),
+                    **helpdesk_deps,
                 )
 
             elif channel_config.type == ChannelType.DISCORD:
@@ -158,6 +165,7 @@ class ChannelManager:
     def load_channels_from_config(
         self,
         config: Config,
+        **additional_deps,
     ) -> None:
         """Load all enabled channels from a Config object."""
         channels_config = config.channels_config
@@ -169,6 +177,7 @@ class ChannelManager:
                 channel_config,
                 workspace_path=workspace_path,
                 bot_config=config,
+                **additional_deps,
             )
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:

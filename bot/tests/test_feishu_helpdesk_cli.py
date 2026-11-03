@@ -47,6 +47,83 @@ def cli():
 
 
 @pytest.mark.asyncio
+async def test_followup_send_is_user_owned_and_carries_idempotency_key(cli):
+    cli._command.side_effect = lambda *args: (
+        authorization() if args[0] == "auth" else success({"message_id": "om_sent"})
+    )
+    before = AsyncMock()
+    receipt = await cli.send_text("oc_ticket", "提醒", "stable-uuid", before_call=before)
+    before.assert_awaited_once_with("ou_agent")
+    assert receipt["message_id"] == "om_sent"
+    assert cli._command.call_args.args == (
+        "im",
+        "+messages-send",
+        "--chat-id",
+        "oc_ticket",
+        "--text",
+        "提醒",
+        "--idempotency-key",
+        "stable-uuid",
+        "--as",
+        "user",
+        "--format",
+        "json",
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_passes_desk_header_on_stdin_and_keeps_uat_inside_cli(cli):
+    cli._command.side_effect = lambda *args, **kwargs: (
+        authorization() if args[0] == "auth" else success()
+    )
+    await cli.close_ticket("t1", "private-desk-header", {"status": 51, "solved": 1})
+    args, kwargs = cli._command.call_args
+    assert args[:4] == ("api", "PUT", "/open-apis/helpdesk/v1/tickets/t1", "--headers")
+    assert "private-desk-header" not in args
+    assert args[-4:] == ("--as", "user", "--format", "json")
+    assert json.loads(kwargs["input_bytes"]) == {
+        "X-Lark-Helpdesk-Authorization": "private-desk-header"
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_guard_runs_after_cli_lock_and_auth(cli):
+    lock_entered, release = asyncio.Event(), asyncio.Event()
+
+    async def holder():
+        async with cli._lock:
+            lock_entered.set()
+            await release.wait()
+
+    holding = asyncio.create_task(holder())
+    await lock_entered.wait()
+    before = AsyncMock(side_effect=RuntimeError("stale"))
+    sending = asyncio.create_task(cli.send_text("oc_ticket", "旧提醒", "key", before_call=before))
+    await asyncio.sleep(0)
+    assert not before.called and not cli._command.called
+    release.set()
+    await holding
+    with pytest.raises(RuntimeError, match="stale"):
+        await sending
+    assert cli._command.await_count == 1  # auth only, no stale external send
+
+
+@pytest.mark.asyncio
+async def test_im_detail_requires_exact_native_message_id(cli):
+    cli._command.side_effect = lambda *args: (
+        authorization()
+        if args[0] == "auth"
+        else success(
+            {
+                "items": [{"message_id": "om_other", "chat_id": "oc_other"}],
+            }
+        )
+    )
+    with pytest.raises(LarkCLIError):
+        await cli.message("om_expected")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fields",
     [

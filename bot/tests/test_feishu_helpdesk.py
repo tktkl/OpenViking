@@ -601,6 +601,7 @@ async def test_skipped_unauthorized_invitation_is_not_recorded_as_admitted(chann
 
 @pytest.mark.asyncio
 async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(channel, monkeypatch):
+    channel._helpdesk_api.tickets_page = AsyncMock(return_value={"tickets": [], "total": 0})
     cli = channel._helpdesk_api.cli
     keepalive_started = asyncio.Event()
     cli.keepalive_once = AsyncMock(side_effect=keepalive_started.set)
@@ -630,6 +631,50 @@ async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(chann
     assert cli._keepalive_task is None
     assert channel._helpdesk_ready is False
     assert channel._helpdesk_api.http.is_closed
+
+
+@pytest.mark.asyncio
+async def test_recovery_admission_does_not_block_scan_or_session_worker(channel):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(chat_id):
+        entered.set()
+        await release.wait()
+        return True
+
+    channel._running = True
+    channel._helpdesk_api.ensure_in_chat.side_effect = delayed
+    await asyncio.wait_for(
+        channel._restore_ticket({"id": "ticket_1", "chat_id": "oc_ticket", "status": 2}), 1
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    assert "oc_ticket" not in channel._ticket_chats
+    release.set()
+    await asyncio.gather(*tuple(channel._helpdesk_tasks))
+    assert channel._ticket_chats["oc_ticket"] == "ticket_1"
+
+
+@pytest.mark.asyncio
+async def test_initial_activation_is_persisted_even_when_subscription_fails(
+    channel, tmp_path, monkeypatch
+):
+    import sqlite3
+
+    monkeypatch.setattr(
+        "vikingbot.extensions.feishu_helpdesk.channel.time.time", lambda: 1800000000.0
+    )
+    channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
+    channel._helpdesk_api.subscribe = AsyncMock(
+        side_effect=HelpdeskAPIError("subscribe", 154001, 401)
+    )
+    await channel._initialize_helpdesk()
+    assert not channel._helpdesk_ready
+    (path,) = tmp_path.glob("helpdesk/*/state.sqlite3")
+    with sqlite3.connect(path) as db:
+        assert (
+            json.loads(db.execute("SELECT value FROM meta WHERE key='activated_at'").fetchone()[0])
+            == 1800000000.0
+        )
 
 
 @pytest.mark.asyncio
@@ -670,8 +715,7 @@ async def test_helpdesk_im_keeps_media_mentions_topics_and_reply_anchor(
     source_block = next(
         m["content"]
         for m in prompt
-        if m["role"] == "system"
-        and m["content"].startswith(ContextBuilder.MESSAGE_SOURCE_HEADER)
+        if m["role"] == "system" and m["content"].startswith(ContextBuilder.MESSAGE_SOURCE_HEADER)
     )
     assert json.loads(source_block.split("\n\n")[-1]) == {
         "source": "feishu_helpdesk",

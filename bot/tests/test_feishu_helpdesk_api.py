@@ -25,7 +25,7 @@ def make_api(handler):
 
 
 @pytest.mark.asyncio
-async def test_subscribes_both_lifecycle_events_with_helpdesk_and_tenant_auth():
+async def test_subscribes_lifecycle_and_message_events_with_helpdesk_and_tenant_auth():
     requests = []
 
     def handler(request):
@@ -46,8 +46,54 @@ async def test_subscribes_both_lifecycle_events_with_helpdesk_and_tenant_auth():
             "events": [
                 {"type": "helpdesk.ticket", "subtype": "ticket.created_v1"},
                 {"type": "helpdesk.ticket", "subtype": "ticket.updated_v1"},
+                {"type": "helpdesk.ticket_message", "subtype": "ticket_message.created_v1"},
             ]
         }
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+async def test_read_time_filters_use_milliseconds_for_tickets_and_seconds_for_messages(monkeypatch):
+    api = make_api(lambda request: httpx.Response(500))
+    api._read = AsyncMock(return_value={"tickets": [], "messages": [], "total": 0})
+    try:
+        await api.tickets_page("update", 1800000000.123, 1800000060.456, 3)
+        args = api._read.call_args.kwargs["params"]
+        assert args == {
+            "update_time_start": 1800000000123,
+            "update_time_end": 1800000060456,
+            "page": 3,
+            "page_size": 200,
+        }
+        await api.messages_page("ticket1", 1800000000.123, 1800000060.456, 2)
+        args = api._read.call_args.kwargs["params"]
+        assert args == {
+            "time_start": 1800000000,
+            "time_end": 1800000060,
+            "page": 2,
+            "page_size": 200,
+        }
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_detail_must_match_requested_identity():
+    api = make_api(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "ticket": {"ticket_id": "other"},
+                },
+            },
+        )
+    )
+    try:
+        with pytest.raises(HelpdeskAPIError):
+            await api.ticket("expected")
     finally:
         await api.close()
 

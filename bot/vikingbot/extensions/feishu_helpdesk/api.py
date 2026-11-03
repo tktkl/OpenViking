@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import time
 from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 
@@ -13,6 +14,7 @@ from vikingbot.extensions.feishu_helpdesk.config import FeishuHelpdeskConfig
 TICKET_EVENTS = (
     {"type": "helpdesk.ticket", "subtype": "ticket.created_v1"},
     {"type": "helpdesk.ticket", "subtype": "ticket.updated_v1"},
+    {"type": "helpdesk.ticket_message", "subtype": "ticket_message.created_v1"},
 )
 
 
@@ -45,6 +47,67 @@ class HelpdeskAPI:
         self.tenant_token = tenant_token
         self.http = http_client or httpx.AsyncClient(timeout=15.0)
         self.cli = cli or LarkCLIAdapter(settings.cli, app_id)
+        self._read_lock = asyncio.Lock()
+        self._last_read = 0.0
+
+    @property
+    def authorization(self):
+        return base64.b64encode(
+            f"{self.settings.helpdesk_id}:{self.settings.helpdesk_token}".encode()
+        ).decode("ascii")
+
+    async def _read(self, path, *, operation, params=None):
+        # The detail endpoint permits 10/s. Share a conservative budget across
+        # reconciliation and execution-time checks without holding a session worker.
+        async with self._read_lock:
+            await asyncio.sleep(max(0, self._last_read + 0.2 - time.monotonic()))
+            self._last_read = time.monotonic()
+        result = await self._bot_request(
+            "GET",
+            path,
+            operation=operation,
+            headers={"X-Lark-Helpdesk-Authorization": self.authorization},
+            params=params,
+        )
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise HelpdeskAPIError(operation, "invalid_response")
+        return data
+
+    async def ticket(self, ticket_id):
+        data = await self._read(
+            f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}", operation="read ticket"
+        )
+        ticket = data.get("ticket")
+        if not isinstance(ticket, dict) or str(ticket.get("ticket_id")) != ticket_id:
+            raise HelpdeskAPIError("read ticket", "invalid_response")
+        return ticket
+
+    async def tickets_page(self, field, start, end, page):
+        if field not in ("create", "update"):
+            raise ValueError("Invalid ticket time filter")
+        return await self._read(
+            "/open-apis/helpdesk/v1/tickets",
+            operation="list tickets",
+            params={
+                f"{field}_time_start": int(start * 1000),
+                f"{field}_time_end": int(end * 1000),
+                "page": page,
+                "page_size": 200,
+            },
+        )
+
+    async def messages_page(self, ticket_id, start, end, page):
+        return await self._read(
+            f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}/messages",
+            operation="list ticket messages",
+            params={
+                "time_start": int(start),
+                "time_end": int(end),
+                "page": page,
+                "page_size": 200,
+            },
+        )
 
     def start(self):
         self.cli.start()

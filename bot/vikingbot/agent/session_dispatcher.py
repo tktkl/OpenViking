@@ -61,6 +61,10 @@ class SessionDispatcher:
             if msg.internal_handler is None and not msg.internal
         )
 
+    def queued_session_keys(self) -> tuple[SessionKey, ...]:
+        """Read-only queue visibility, including internal callbacks."""
+        return tuple(key for key, pending in self._pending.items() if pending)
+
     async def join(self) -> None:
         """Wait for all currently accepted work, including final persistence."""
         await self._ready.join()

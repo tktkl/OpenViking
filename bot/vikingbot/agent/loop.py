@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack, aclosing
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,8 @@ from vikingbot.sandbox import SandboxManager
 from vikingbot.session.manager import Session, SessionManager
 from vikingbot.utils.helpers import cal_str_tokens, ensure_non_empty_assistant_content
 from vikingbot.utils.tracing import set_response_id, trace
+
+_DISPATCH_OWNER: ContextVar[Any] = ContextVar("vikingbot_dispatch_owner", default=None)
 
 if TYPE_CHECKING:
     from vikingbot.config.schema import ExecToolConfig
@@ -453,6 +456,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._ov_clients: dict[str, Any] = {}
         self._active_turns: dict[SessionKey, _ActiveTurn] = {}
+        self._dispatching_sessions: dict[SessionKey, asyncio.Task] = {}
         self._session_dispatcher: SessionDispatcher | None = None
         self._message_consumer_task: asyncio.Task[None] | None = None
         self._queued_interrupt_counts: dict[SessionKey, int] = {}
@@ -1280,6 +1284,38 @@ class AgentLoop:
                 await self._dispatch_message(msg)
 
     async def _dispatch_message(self, msg: InboundMessage) -> None:
+        owner = asyncio.current_task()
+        token = _DISPATCH_OWNER.set(owner)
+        self._dispatching_sessions[msg.session_key] = owner
+        try:
+            await self._dispatch_message_item(msg)
+        finally:
+            if self._dispatching_sessions.get(msg.session_key) is owner:
+                del self._dispatching_sessions[msg.session_key]
+            _DISPATCH_OWNER.reset(token)
+
+    def has_chat_work(self, key: SessionKey) -> bool:
+        """Include topics, queued internal work and final saving; exclude this callback's owner."""
+        root = key.chat_id.split("#", 1)[0]
+
+        def matches(other):
+            return (
+                other.type == key.type
+                and other.channel_id == key.channel_id
+                and other.chat_id.split("#", 1)[0] == root
+            )
+
+        owner = _DISPATCH_OWNER.get()
+        if any(matches(k) and task is not owner for k, task in self._dispatching_sessions.items()):
+            return True
+        if any(matches(msg.session_key) for msg in list(self.bus.inbound._queue)):
+            return True
+        return bool(
+            self._session_dispatcher
+            and any(matches(k) for k in self._session_dispatcher.queued_session_keys())
+        )
+
+    async def _dispatch_message_item(self, msg: InboundMessage) -> None:
         """Execute one queued item, including guards, persistence and publication."""
         try:
             queued_interrupts = self._queued_interrupt_counts.get(msg.session_key, 0)
