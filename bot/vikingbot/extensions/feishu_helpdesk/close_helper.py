@@ -29,6 +29,23 @@ from vikingbot.extensions.feishu_helpdesk.cli_credentials import (
 
 PROTOCOL_VERSION = 1
 MAX_LINE = 65536
+# Helpdesk can also return the platform's generic authentication/scope errors.
+# Scope refusals do not invalidate the CLI user's otherwise usable login.
+API_AUTHENTICATION_CODES = frozenset((154001, 99991661, 99991663, 99991668, 99991671, 99991677))
+API_REJECTION_CODES = API_AUTHENTICATION_CODES | frozenset(
+    (
+        154000,
+        154003,
+        154004,
+        230027,
+        99991400,
+        99991662,
+        99991672,
+        99991673,
+        99991676,
+        99991679,
+    )
+)
 
 
 class CloseFailure(RuntimeError):
@@ -355,13 +372,11 @@ class CloseOperation:
             ):
                 return
             # Only explicit API refusals prove that this PUT did not close.
-            rejected = (
-                code in (154000, 154001, 154003, 154004, 99991400) and response.status_code < 500
-            )
+            rejected = code in API_REJECTION_CODES and response.status_code < 500
             raise CloseFailure(
                 "close API refused the request" if rejected else "close result is uncertain",
                 code=code,
-                authentication=code == 154001,
+                authentication=rejected and code in API_AUTHENTICATION_CODES,
                 retryable=code == 99991400 or response.status_code >= 500,
                 rejected=rejected,
             )

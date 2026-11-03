@@ -148,27 +148,46 @@ async def test_commit_must_match_request_and_protocol(operation, control):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status,body,outcome",
+    "status,body,outcome,authentication",
     [
-        (403, {"code": 154003}, "rejected"),
-        (401, {"code": 154001}, "rejected"),
-        (400, {"code": 154000}, "rejected"),
-        (404, {"code": 154004}, "rejected"),
-        (429, {"code": 99991400}, "rejected"),
-        (500, {"code": 155000}, "uncertain"),
-        (200, {"ok": True, "data": {}}, "uncertain"),  # CLI != native API contract.
-        (200, {"code": False, "data": {}}, "uncertain"),
-        (200, {"code": "0", "data": {}}, "uncertain"),
-        (200, ["unexpected"], "uncertain"),
-        (200, {"code": 0}, "uncertain"),
-        (302, {"code": 0, "data": {}}, "uncertain"),
+        (403, {"code": 154003}, "rejected", False),
+        (401, {"code": 154001}, "rejected", True),
+        (400, {"code": 154000}, "rejected", False),
+        (404, {"code": 154004}, "rejected", False),
+        (429, {"code": 99991400}, "rejected", False),
+        (401, {"code": 99991661}, "rejected", True),
+        (401, {"code": 99991663}, "rejected", True),
+        (400, {"code": 99991668}, "rejected", True),
+        (401, {"code": 99991671}, "rejected", True),
+        (400, {"code": 99991677}, "rejected", True),
+        (403, {"code": 230027}, "rejected", False),
+        (400, {"code": 99991662}, "rejected", False),
+        (403, {"code": 99991672}, "rejected", False),
+        (400, {"code": 99991673}, "rejected", False),
+        (403, {"code": 99991676}, "rejected", False),
+        (403, {"code": 99991679}, "rejected", False),
+        (200, {"code": 99991672}, "rejected", False),
+        (200, {"code": 99991677}, "rejected", True),
+        (500, {"code": 155000}, "uncertain", False),
+        (500, {"code": 99991668}, "uncertain", False),
+        (503, {"code": 99991672}, "uncertain", False),
+        (403, {"code": 154099}, "uncertain", False),
+        (200, {"ok": True, "data": {}}, "uncertain", False),  # CLI != native API contract.
+        (200, {"code": False, "data": {}}, "uncertain", False),
+        (200, {"code": "0", "data": {}}, "uncertain", False),
+        (200, ["unexpected"], "uncertain", False),
+        (200, {"code": 0}, "uncertain", False),
+        (302, {"code": 0, "data": {}}, "uncertain", False),
     ],
 )
-async def test_api_failure_is_classified_without_retry(operation, status, body, outcome):
+async def test_api_failure_is_classified_without_retry(
+    operation, status, body, outcome, authentication
+):
     operation.response.update(status=status, body=body)
     await operation.op.run()
     assert len(operation.calls) == 1
     assert operation.records[-1]["outcome"] == outcome
+    assert operation.records[-1]["error"]["authentication"] is authentication
 
 
 @pytest.mark.asyncio

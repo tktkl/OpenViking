@@ -1135,22 +1135,60 @@ async def test_close_preparation_failure_never_persists_a_pending_put(desk):
 
 
 @pytest.mark.asyncio
-async def test_explicit_close_refusal_clears_only_this_pending_attempt_and_can_retry(desk):
+@pytest.mark.parametrize("code", [154003, 99991668, 99991672, 99991679])
+async def test_explicit_close_refusal_clears_only_this_pending_attempt_and_can_retry(desk, code):
+    import httpx
+    from vikingbot.extensions.feishu_helpdesk.close_helper import CloseFailure, CloseOperation
+
     service, api, clock = await initialized(desk)
     service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
     human(service, clock)
+    generation = service.store.tickets["t1"]["generation"]
     original = api.cli.close_ticket
 
-    async def refused(*args, before_call, **kwargs):
+    def client_factory(**kwargs):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(403, json={"code": code})),
+            **kwargs,
+        )
+
+    async def refused(ticket, authorization, body, *, before_call):
         assert service.store.tickets["t1"]["close_pending"] is None
         await before_call("ou_operator")
         assert service.store.tickets["t1"]["close_pending"]
-        raise LarkCLIError("permission refused", code=154003, rejected=True)
+        operation = CloseOperation(
+            SimpleNamespace(
+                path=f"/open-apis/helpdesk/v1/tickets/{ticket}",
+                authorization=authorization,
+                body=body,
+                timeout_seconds=5,
+            ),
+            receive=None,
+            emit=None,
+            probe=SimpleNamespace(),
+            client_factory=client_factory,
+        )
+        try:
+            await operation.put("feishu", "fake-user-token")
+        except CloseFailure as error:
+            raise LarkCLIError(
+                error.reason,
+                code=error.code,
+                authentication=error.authentication,
+                retryable=error.retryable,
+                rejected=error.rejected,
+            ) from None
+        pytest.fail("native permission refusal was accepted")
 
     api.cli.close_ticket = refused
     await drain(service)
     assert service.store.tickets["t1"]["close_pending"] is None
-    api.cli.close_ticket = original
+
+    async def permitted(*args, **kwargs):
+        assert service.store.tickets["t1"]["generation"] == generation
+        return await original(*args, **kwargs)
+
+    api.cli.close_ticket = permitted
     clock.advance(60)
     await drain(service)
     assert len(api.cli.closes) == 1 and api.tickets["t1"]["status"] == 51
