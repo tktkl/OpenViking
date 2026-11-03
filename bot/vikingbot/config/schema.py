@@ -521,6 +521,15 @@ class AgentsConfig(BaseModel):
     )
     max_tool_iterations: int = 50
     memory_window: int = 50
+    max_concurrent_sessions: int = Field(
+        default=1,
+        ge=1,
+        strict=True,
+        description=(
+            "Maximum concurrent main-agent sessions. 1 preserves global FIFO; "
+            "higher values run different SessionKeys concurrently with per-session FIFO."
+        ),
+    )
     subagent_enabled: bool = Field(
         default=True,
         description="Enable the spawn tool so the main agent can start background subagents.",
