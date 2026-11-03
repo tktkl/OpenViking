@@ -14,12 +14,13 @@ from unittest.mock import AsyncMock
 import pytest
 from vikingbot.agent.tools.base import ToolContext
 from vikingbot.agent.tools.registry import ToolRegistry
-from vikingbot.bus.events import InboundMessage, OutboundMessage
+from vikingbot.bus.events import InboundMessage, OutboundEventType, OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.manager import ChannelManager
 from vikingbot.config.schema import Config, SessionKey
 from vikingbot.extensions.background_tasks.service import BackgroundTasks
 from vikingbot.extensions.runtime import RuntimeContext, RuntimeExtensions
+from vikingbot.providers.base import LLMProvider, LLMResponse
 from vikingbot.session.manager import SessionManager
 
 TASK = "a" * 32
@@ -637,6 +638,73 @@ async def _queued_continuation(service, context, sandbox):
     await msg.on_delivery(True)
     await service.tick(item)
     return item, await service.host.bus.consume_inbound()
+
+
+async def test_background_delivery_queues_behind_its_session_while_other_session_finishes(
+    setup, monkeypatch,
+):
+    service, context, sandbox = setup
+    service.host.config.agents.max_concurrent_sessions = 4
+    item = await watch(service, context)
+    loop = _agent_loop(service, monkeypatch)
+    # The extension retains its fake runner sandbox; chat needs no sandbox tools.
+    loop.sandbox_manager = None
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    class Provider(LLMProvider):
+        async def chat(self, messages, **kwargs):
+            text = messages[-1]["content"]
+            calls.append(text)
+            if text == "working":
+                started.set()
+                await release.wait()
+            return LLMResponse(content=f"answer:{text}")
+
+        def get_default_model(self):
+            return "fake"
+
+    loop.provider = Provider()
+
+    async def next_response():
+        while True:
+            msg = await asyncio.wait_for(service.host.bus.consume_outbound(), 2)
+            if msg.event_type == OutboundEventType.RESPONSE:
+                return msg
+
+    task = asyncio.create_task(loop.run())
+    try:
+        await service.host.bus.publish_inbound(InboundMessage(
+            sender_id="original-user", session_key=ORIGIN, content="working",
+        ))
+        await asyncio.wait_for(started.wait(), 2)
+        sandbox.state = "succeeded"
+        await service.tick(item)
+        other = SessionKey(type="feishu", channel_id="app", chat_id="other")
+        await service.host.bus.publish_inbound(InboundMessage(
+            sender_id="other-user", session_key=other, content="other",
+        ))
+        assert (await next_response()).content == "answer:other"
+        assert not item["history_recorded"]
+        release.set()
+        assert (await next_response()).content == "answer:working"
+        delivery = await next_response()
+        assert delivery.session_key == ORIGIN and delivery.on_delivery is not None
+        assert "修复完成" in delivery.content
+        await delivery.on_delivery(True)
+        assert item["delivery"] == "sent"
+        fresh = SessionManager(service.host.config.bot_data_path)
+        assert [m["content"] for m in fresh.get_or_create(ORIGIN).messages] == [
+            "working", "answer:working", delivery.content,
+        ]
+        assert [m["content"] for m in fresh.get_or_create(other).messages] == [
+            "other", "answer:other",
+        ]
+        assert calls == ["working", "other"]
+    finally:
+        loop.stop()
+        await asyncio.wait_for(task, 2)
 
 
 @pytest.mark.parametrize("stop_fails", [False, True])

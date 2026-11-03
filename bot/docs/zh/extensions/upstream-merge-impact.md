@@ -6,6 +6,10 @@
 
 ## 核对基线与范围
 
+**2026-11-03 会话并发补充**：独立分支 `codex/vikingbot-session-concurrency` 从 `fe3dc33a5cdfdc3309af61912f02077668bc03e5` 派生；其生产改动限定在新增 `agent/session_dispatcher.py`、接入 `agent/loop.py` 和 `config/schema.py`。新增 `bot.agents.max_concurrent_sessions` 默认 `1`，大于 `1` 时不同会话并发、同会话 FIFO。原工作区尚未提交的 `agent_bridge`、总线及 OpenAPI 补丁不进入该功能提交。以下 10 月记录仍是当时快照，不能作为此分支的当前 Git 状态。实现、配置和回退见[会话并发](../concepts/07-session-concurrency.md)。
+
+合并上游时，除下面既有扩展接入点外，重点检查入站调度、按 SessionKey 管理的活动轮次及关闭顺序。内部回写必须走同会话队列；最终保存前解除中断入口，但保存及清理完成后才能释放会话执行权。回退为将并发配置恢复为 `1` 后重启。
+
 最后核对日期：**2026-10-30**。
 
 | 项目 | 核对时的值 |

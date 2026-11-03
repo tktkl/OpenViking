@@ -52,6 +52,8 @@ FastAPI / Uvicorn
 
 默认监听 `127.0.0.1:18790`。当 `gateway.host` 不是 localhost 时，必须设置 `bot.gateway.token`，否则 Gateway 拒绝启动。
 
+`bot.agents.max_concurrent_sessions` 默认为 `1`，主 Agent 按全局入队顺序处理。设置为 `4` 等更大的正整数后，不同 SessionKey 可并发执行，同一会话的消息、命令和后台回写仍串行。配置、生命周期和合并检查见[会话并发](./07-session-concurrency.md)。
+
 `vikingbot status` 展示当前选择的模型配置来源（继承根级 `vlm` 或使用 `bot.agents`）、凭证配置顺序、各凭证的 Provider/模型，以及 API key 和自定义请求头是否配置。它不输出密钥或请求头内容，也不发起模型请求；未配置 API key 不代表本地模型或外部鉴权不可用。这是配置摘要，不是 Gateway 健康检查，也不代表运行中故障切换后的活跃凭证。
 
 ## Bot HTTP API

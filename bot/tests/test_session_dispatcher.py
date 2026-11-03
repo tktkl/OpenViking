@@ -1,9 +1,11 @@
 import asyncio
+import json
 
 import pytest
 from pydantic import ValidationError
 from vikingbot.agent.session_dispatcher import SessionDispatcher
 from vikingbot.bus.events import InboundMessage
+from vikingbot.config import loader
 from vikingbot.config.schema import AgentsConfig, Config, SessionKey
 
 
@@ -22,6 +24,17 @@ def test_session_concurrency_configuration():
     for invalid in (0, -1, 1.5, True, "4"):
         with pytest.raises(ValidationError):
             AgentsConfig(max_concurrent_sessions=invalid)
+
+
+@pytest.mark.parametrize(
+    "agents, expected",
+    [({}, 1), ({"max_concurrent_sessions": 1}, 1), ({"max_concurrent_sessions": 4}, 4)],
+)
+def test_session_concurrency_loads_from_ov_conf(tmp_path, monkeypatch, agents, expected):
+    path = tmp_path / "ov.conf"
+    path.write_text(json.dumps({"bot": {"agents": agents}}))
+    monkeypatch.setattr(loader, "CONFIG_PATH", path)
+    assert loader.load_config().agents.max_concurrent_sessions == expected
 
 
 @pytest.mark.asyncio
