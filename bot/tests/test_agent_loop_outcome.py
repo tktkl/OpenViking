@@ -777,7 +777,7 @@ async def test_agent_loop_does_not_share_steers_with_concurrent_internal_loop(
 
         assert await loop.process_direct("internal task", session_key=session_key) == "ok"
 
-        active = loop._active_turn
+        active = loop._active_turns.get(session_key)
         assert active is not None
         assert active.accepting_steer is True
         assert [steer.msg.content for steer in active.accepted_steers] == ["steer update"]
@@ -891,7 +891,7 @@ async def test_agent_loop_interrupt_preserves_active_steer_input(
             )
             is True
         )
-        active = loop._active_turn
+        active = loop._active_turns.get(session_key)
         assert active is not None
         steer_task = active.accepted_steers[0].task
 
@@ -939,7 +939,7 @@ async def test_agent_loop_error_preserves_accepted_steer_input(make_loop, monkey
         assert loop.steer(
             InboundMessage(session_key=session_key, sender_id="user-1", content="steer update")
         )
-        active = loop._active_turn
+        active = loop._active_turns.get(session_key)
         assert active is not None
         steer_task = active.accepted_steers[0].task
 

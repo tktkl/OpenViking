@@ -73,7 +73,9 @@ class SessionDispatcher:
             try:
                 await self._handler(msg)
             except asyncio.CancelledError:
-                raise
+                if asyncio.current_task().cancelling():
+                    raise
+                logger.warning("Session item cancelled for {}", session_key)
             except Exception:
                 # AgentLoop handles per-message errors. Also survive failures in
                 # its error publication so one broken item cannot lose a worker.

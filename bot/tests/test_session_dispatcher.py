@@ -128,12 +128,13 @@ async def test_worker_limit_and_full_session_identity():
 
 
 @pytest.mark.asyncio
-async def test_failed_item_does_not_prevent_same_session_retry():
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+async def test_failed_item_does_not_prevent_same_session_retry(error):
     completed = []
 
     async def handle(msg):
         if msg.content == "fail":
-            raise RuntimeError("broken item")
+            raise error("broken item")
         completed.append(msg.content)
 
     dispatcher = SessionDispatcher(2, handle)

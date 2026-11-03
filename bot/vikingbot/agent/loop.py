@@ -20,6 +20,7 @@ from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
 from vikingbot.agent.context import ContextBuilder
 from vikingbot.agent.memory import MemoryStore
 from vikingbot.agent.remote_skills import SkillRuntimeContext
+from vikingbot.agent.session_dispatcher import SessionDispatcher
 from vikingbot.agent.skills import SkillsLoader
 from vikingbot.agent.subagent import SubagentManager
 from vikingbot.agent.tools import register_default_tools
@@ -294,7 +295,7 @@ class _AssistantBoundary:
 
 @dataclass(slots=True)
 class _ActiveTurn:
-    """The single turn currently running in the serial AgentLoop."""
+    """The interruptible work currently owned by one session."""
 
     session_key: SessionKey
     task: asyncio.Task
@@ -451,7 +452,9 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._ov_clients: dict[str, Any] = {}
-        self._active_turn: _ActiveTurn | None = None
+        self._active_turns: dict[SessionKey, _ActiveTurn] = {}
+        self._session_dispatcher: SessionDispatcher | None = None
+        self._message_consumer_task: asyncio.Task[None] | None = None
         self._queued_interrupt_counts: dict[SessionKey, int] = {}
         self._register_default_tools()
         self.runtime_extensions = RuntimeExtensions(
@@ -1234,63 +1237,97 @@ class AgentLoop:
             await self.runtime_extensions.close()
 
     async def _run_messages(self) -> None:
-        """Consume user turns and serialized in-process extension events."""
+        """Own ingress and workers until all in-flight cleanup has finished."""
         self._running = True
-        await self._connect_mcp()
-        logger.info("Agent loop started")
+        try:
+            await self._connect_mcp()
+            limit = self.config.agents.max_concurrent_sessions
+            if limit > 1:
+                self._session_dispatcher = SessionDispatcher(limit, self._dispatch_message)
+                self._session_dispatcher.start()
+            logger.info("Agent loop started (max concurrent sessions: {})", limit)
+            self._message_consumer_task = asyncio.create_task(
+                self._consume_messages(), name="agent-inbound"
+            )
+            try:
+                await self._message_consumer_task
+            except asyncio.CancelledError:
+                if self._running or asyncio.current_task().cancelling():
+                    raise
+                # stop() cancels ingress to wake an idle bus consumer.
+        finally:
+            self._running = False
+            self._message_consumer_task = None
+            if self._session_dispatcher is not None:
+                await self._session_dispatcher.close()
+                self._session_dispatcher = None
+            self._queued_interrupt_counts.clear()
 
+    async def _consume_messages(self) -> None:
+        """Keep reading in concurrent mode; retain global FIFO with a limit of one."""
         while self._running:
             try:
-                # Wait for next message
                 msg = await self.bus.consume_inbound()
-
-                # Process it
-                try:
-                    if msg.internal_handler is not None:
-                        await msg.internal_handler()
-                        continue
-                    queued_interrupts = self._queued_interrupt_counts.get(msg.session_key, 0)
-                    if queued_interrupts > 0 and not msg.internal:
-                        if queued_interrupts == 1:
-                            self._queued_interrupt_counts.pop(msg.session_key, None)
-                        else:
-                            self._queued_interrupt_counts[msg.session_key] = queued_interrupts - 1
-                        response = await self._complete_interrupted_message(msg)
-                    else:
-                        response = await self._process_message_as_active_turn(msg)
-                    if response:
-                        await self.bus.publish_outbound(response)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.exception(f"Error processing message: {e}")
-                    # Send error response
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            session_key=msg.session_key,
-                            content=f"Sorry, I encountered an error: {str(e)}",
-                            metadata=msg.metadata,
-                        )
-                    )
             except asyncio.TimeoutError:
                 continue
+            if self._session_dispatcher is not None:
+                self._session_dispatcher.submit(msg)
+            else:
+                await self._dispatch_message(msg)
+
+    async def _dispatch_message(self, msg: InboundMessage) -> None:
+        """Execute one queued item, including guards, persistence and publication."""
+        try:
+            queued_interrupts = self._queued_interrupt_counts.get(msg.session_key, 0)
+            interrupted = bool(
+                queued_interrupts > 0 and msg.internal_handler is None and not msg.internal
+            )
+            if interrupted:
+                # Consume the snapshot even if a stale item's guard rejects it.
+                if queued_interrupts == 1:
+                    self._queued_interrupt_counts.pop(msg.session_key, None)
+                else:
+                    self._queued_interrupt_counts[msg.session_key] = queued_interrupts - 1
+            if msg.before_process is not None and not await msg.before_process():
+                return
+            if msg.internal_handler is not None:
+                await msg.internal_handler()
+                return
+            if interrupted:
+                response = await self._complete_interrupted_message(msg)
+            else:
+                response = await self._process_message_as_active_turn(msg, check_guard=False)
+            if response:
+                await self.bus.publish_outbound(response)
+        except (Exception, asyncio.CancelledError) as e:
+            if isinstance(e, asyncio.CancelledError) and asyncio.current_task().cancelling():
+                raise
+            logger.exception(f"Error processing message: {e}")
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    session_key=msg.session_key,
+                    content=f"Sorry, I encountered an error: {str(e) or type(e).__name__}",
+                    metadata=msg.metadata,
+                )
+            )
+
+    def _count_pending_session(self, session_key: SessionKey) -> int:
+        pending = self.bus.count_pending_inbound_session(session_key)
+        if self._session_dispatcher is not None:
+            pending += self._session_dispatcher.count_pending(session_key)
+        return pending
 
     async def interrupt(self, session_key: SessionKey) -> bool:
         """Interrupt the active or already queued turn for a session."""
-        active = self._active_turn
-        if (
-            active
-            and active.session_key == session_key
-            and active.interruptible
-            and not active.task.done()
-        ):
-            pending_count = self.bus.count_pending_inbound_session(session_key)
+        active = self._active_turns.get(session_key)
+        if active and active.interruptible and not active.interrupted and not active.task.done():
+            pending_count = self._count_pending_session(session_key)
             if pending_count:
                 self._queued_interrupt_counts[session_key] = pending_count
             active.interrupted = True
             active.task.cancel()
             return True
-        pending_count = self.bus.count_pending_inbound_session(session_key)
+        pending_count = self._count_pending_session(session_key)
         queued_interrupts = self._queued_interrupt_counts.get(session_key, 0)
         if queued_interrupts < pending_count:
             self._queued_interrupt_counts[session_key] = pending_count
@@ -1299,12 +1336,11 @@ class AgentLoop:
 
     def steer(self, msg: InboundMessage) -> bool:
         """Attach same-session input directly to the active turn."""
-        active = self._active_turn
+        active = self._active_turns.get(msg.session_key)
         if (
             active is None
             or msg.internal_handler is not None
             or msg.internal
-            or active.session_key != msg.session_key
             or not active.accepting_steer
             or active.interrupted
             or active.task.done()
@@ -1320,8 +1356,10 @@ class AgentLoop:
         )
         return True
 
-    async def _process_message_as_active_turn(self, msg: InboundMessage) -> OutboundMessage | None:
-        if msg.before_process is not None and not await msg.before_process():
+    async def _process_message_as_active_turn(
+        self, msg: InboundMessage, *, check_guard: bool = True
+    ) -> OutboundMessage | None:
+        if check_guard and msg.before_process is not None and not await msg.before_process():
             return None
         active: _ActiveTurn
 
@@ -1342,26 +1380,37 @@ class AgentLoop:
             interruptible=is_agent_turn,
             accepting_steer=is_agent_turn,
         )
-        self._active_turn = active
+        self._active_turns[msg.session_key] = active
         try:
             response = await task
             if active.accepted_steers:
                 raise RuntimeError("Active turn completed with unconsumed steer input")
             return response
         except asyncio.CancelledError:
-            if active.interrupted:
+            if active.interrupted and not asyncio.current_task().cancelling():
+                active.interruptible = active.accepting_steer = False
                 logger.info(f"Interrupted message from {msg.session_key}")
                 return await self._complete_interrupted_message(msg)
             raise
         except Exception:
-            if self._active_turn is active and (active.history_items or active.accepted_steers):
+            if self._active_turns.get(msg.session_key) is active and (
+                active.history_items or active.accepted_steers
+            ):
+                active.interruptible = active.accepting_steer = False
                 await self._complete_interrupted_message(msg)
             raise
         finally:
-            if self._active_turn is active:
+            if self._active_turns.get(msg.session_key) is active:
                 # Clear the active pointer before cleanup so later interrupt calls
                 # cannot cancel this turn while its local teardown is finishing.
-                self._active_turn = None
+                del self._active_turns[msg.session_key]
+            # Accepted preprocessing is owned by this turn, including on shutdown.
+            for steer in active.accepted_steers:
+                steer.task.cancel()
+            await asyncio.gather(
+                *(steer.task for steer in active.accepted_steers), return_exceptions=True
+            )
+            active.accepted_steers.clear()
 
     async def _prepare_steer_message(self, msg: InboundMessage) -> _PreparedSteer:
         try:
@@ -1499,7 +1548,10 @@ class AgentLoop:
 
     def stop(self) -> None:
         """Stop the agent loop."""
+        was_running = self._running
         self._running = False
+        if was_running and self._message_consumer_task is not None:
+            self._message_consumer_task.cancel()
         logger.info("Agent loop stopping")
 
     async def _complete_interrupted_message(self, msg: InboundMessage) -> OutboundMessage:
@@ -1507,9 +1559,9 @@ class AgentLoop:
         skip_heartbeat = session_key.type == "cli"
         session = self.sessions.get_or_create(session_key, skip_heartbeat=skip_heartbeat)
         session.add_message("user", msg.content, sender_id=msg.sender_id)
-        active = self._active_turn
+        active = self._active_turns.get(session_key)
         accepted_steers: list[_AcceptedSteer] = []
-        if active is not None and active.session_key == session_key:
+        if active is not None:
             accepted_steers = active.accepted_steers
             consumed = (
                 item.msg for item in active.history_items if isinstance(item, _PreparedSteer)
@@ -2842,9 +2894,9 @@ class AgentLoop:
                 tools_used=tools_used,
             )
 
-            if active_turn is not None:
+            if self._active_turns.get(session_key) is active_turn:
                 # Detach before persistence so a later interrupt cannot cancel final session writes.
-                self._active_turn = None
+                self._active_turns.pop(session_key, None)
 
             is_heartbeat = bool(msg.metadata.get(HEARTBEAT_METADATA_KEY))
             if not (is_heartbeat and is_heartbeat_noop_response(final_content)):
