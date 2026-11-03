@@ -35,6 +35,7 @@ class FakeCLI:
         self.fail_send = False
         self.before_send = self.before_close = None
         self.message = AsyncMock(side_effect=LarkCLIError("unavailable"))
+        self.chat_messages = AsyncMock(return_value={"items": [], "has_more": False})
 
     async def send_text(self, chat, text, key, *, before_call):
         if self.before_send:
@@ -98,7 +99,9 @@ class FakeAPI:
 async def desk(tmp_path):
     services = []
 
-    async def create(*, minutes=5, path=None, clock=None, api=None, bus=None, session_busy=None):
+    async def create(
+        *, minutes=5, path=None, clock=None, api=None, bus=None, session_busy=None, messages=None
+    ):
         clock = clock or Clock()
         config = FeishuChannelConfig(
             app_id="cli_bot",
@@ -107,6 +110,7 @@ async def desk(tmp_path):
                 "helpdesk_id": "desk",
                 "helpdesk_token": "fake",
                 "followup_interval_minutes": minutes,
+                "messages": messages or {},
             },
         )
         api = api or FakeAPI(clock)
@@ -177,7 +181,7 @@ async def initialized(desk, **kwargs):
     add_ticket(service, api, clock)
     await service.reconcile()
     await drain(service)
-    assert api.cli.sends[0][1] == WELCOME
+    assert api.cli.sends[0][1] == service.config.helpdesk.messages.render(WELCOME)
     return service, api, clock
 
 
@@ -728,10 +732,10 @@ async def test_same_user_manual_message_is_restored_after_automatic_echo(desk):
     original_send = api.cli.send_text
 
     async def send(chat, text, key, *, before_call):
-        await before_call("ou_operator")
-        human(service, clock, "om_auto1", sender="ou_operator")
+        receipt = await original_send(chat, text, key, before_call=before_call)
+        human(service, clock, "om_auto1", sender="ou_operator", text=text)
         human(service, clock, "om_manual", sender="ou_operator", text="我来处理")
-        return await original_send(chat, text, key, before_call=before_call)
+        return receipt
 
     api.cli.send_text = send
     await drain(service)
@@ -748,9 +752,9 @@ async def test_automatic_cli_echo_during_reminder_does_not_invalidate_its_receip
     original_send = api.cli.send_text
 
     async def echo(chat, text, key, *, before_call):
-        await before_call("ou_operator")
-        human(service, clock, "om_auto2", sender="ou_operator")
-        return await original_send(chat, text, key, before_call=before_call)
+        receipt = await original_send(chat, text, key, before_call=before_call)
+        human(service, clock, "om_auto2", sender="ou_operator", text=text)
+        return receipt
 
     api.cli.send_text = echo
     clock.advance(300)
@@ -780,7 +784,9 @@ async def test_close_and_notice_recover_after_lost_response(desk, tmp_path):
     await restarted.reconcile()
     await drain(restarted)
     assert len(api.cli.closes) == 1 and len(api.cli.sends) == 2
-    assert api.cli.sends[-1][1] == "问题已解决，工单已关闭。"
+    assert api.cli.sends[-1][1] == service.config.helpdesk.messages.render(
+        "问题已解决，工单已关闭。"
+    )
 
 
 @pytest.mark.asyncio

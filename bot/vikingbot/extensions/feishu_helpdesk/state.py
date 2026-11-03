@@ -119,8 +119,27 @@ class HelpdeskState:
             and status not in (50, 51, 52)
             and not (authoritative and updated is not None and updated > old["updated"])
         ):
+            if updated is not None and updated > old["updated"]:
+                # Persist the hint before the discovery cursor advances. Only
+                # a canonical detail read may actually reopen local state.
+                return self.save(old, refresh_pending=True)
             return old
         values = {"status": status, "updated": updated if updated is not None else old["updated"]}
+        if authoritative:
+            values["refresh_pending"] = False
+        if old["status"] in (50, 51, 52) and status not in (50, 51, 52):
+            values.update(
+                reopened_at=now,
+                reopen_waiting_for_human=True,
+                reopen_human_after=old["last_human"] or old["created"],
+                close_cycle=old.get("close_cycle", 0) + 1,
+                count=0,
+                last_send=None,
+                scenario="unknown",
+                close_pending=None,
+                notice_pending=False,
+                retry_at=0,
+            )
         if chat_id.startswith("oc_"):
             if old["chat_id"] and old["chat_id"] != chat_id:
                 raise ValueError("Conflicting ticket chat identity")
@@ -154,6 +173,12 @@ class HelpdeskState:
             if value.get("ticket") == ticket_id
             and not value.get("message_id")
             and value.get("attempted_at") is not None
+        ]
+
+    def outboxes(self):
+        return [
+            (key, json.loads(value))
+            for key, value in self.db.execute("SELECT id, value FROM outbox")
         ]
 
     def automatic(self, message_id):
@@ -211,6 +236,8 @@ class HelpdeskState:
                 "scenario": "unknown",
                 "retry_at": 0,
             }
+            if merged["time"] >= item.get("reopen_human_after", 0):
+                candidate["reopen_waiting_for_human"] = False
         elif (
             merged.get("human") is not False
             and not merged.get("pending_provenance")

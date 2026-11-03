@@ -13,7 +13,12 @@ from loguru import logger
 from vikingbot.bus.events import InboundMessage
 from vikingbot.config.schema import SessionKey
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
-from vikingbot.extensions.feishu_helpdesk.decision import BUSINESS_WAIT, WELCOME, ConversationJudge
+from vikingbot.extensions.feishu_helpdesk.decision import (
+    BUSINESS_WAIT,
+    ConversationJudge,
+    message_text,
+)
+from vikingbot.extensions.feishu_helpdesk.delivery import HelpdeskDelivery
 from vikingbot.extensions.feishu_helpdesk.state import HelpdeskState, timestamp
 from vikingbot.extensions.feishu_helpdesk.sync import HelpdeskSync
 
@@ -37,7 +42,6 @@ class HelpdeskFollowup:
         session_busy=None,
         budget=3000,
         clock=time.time,
-        replay=None,
         on_sync=None,
         activated_at=None,
     ):
@@ -52,7 +56,6 @@ class HelpdeskFollowup:
         )
         self.judge = ConversationJudge(provider, model, budget=budget)
         self.session_busy = session_busy or (lambda key: False)
-        self.replay = replay
         self.on_sync = on_sync
         self.sync = HelpdeskSync(self)
         self.running = False
@@ -65,7 +68,8 @@ class HelpdeskFollowup:
         )
         self._idle.set()
         self._callbacks = 0
-        self._sending, self._deferred = {}, {}
+        self._sending = {}
+        self.delivery = HelpdeskDelivery(self)
 
     async def start(self, *, background=True):
         self.running = True
@@ -73,6 +77,7 @@ class HelpdeskFollowup:
             self._tasks = {
                 asyncio.create_task(self._monitor(), name="helpdesk-reconcile"),
                 asyncio.create_task(self._timer(), name="helpdesk-deadlines"),
+                asyncio.create_task(self.delivery.run(), name="helpdesk-receipts"),
             }
 
     async def close(self):
@@ -85,7 +90,6 @@ class HelpdeskFollowup:
         await asyncio.gather(*(self._tasks | self._executions), return_exceptions=True)
         await self._idle.wait()
         self._tasks.clear()
-        self._deferred.clear()
         self._sending.clear()
         self.store.close()
 
@@ -103,33 +107,22 @@ class HelpdeskFollowup:
         self._dirty.add(ticket_id)
         self._sync_wakeup.set()
 
-    def for_chat(self, chat_id):
-        return next(
+    def for_chat(self, chat_id, *, include_closed=False):
+        return max(
             (
                 t
                 for t in self.store.tickets.values()
-                if t["chat_id"] == chat_id and t["status"] not in CLOSED
+                if t["chat_id"] == chat_id and (include_closed or t["status"] not in CLOSED)
             ),
-            None,
+            key=lambda t: t["created"],
+            default=None,
         )
 
     def observe(self, ticket_id, message):
         if not self.running or ticket_id not in self.store.tickets:
             return
-        actor = self._pending_actor(ticket_id)
-        if (
-            actor
-            and message.get("sender") == actor
-            and not self.store.automatic(message.get("im_id"))
-        ):
-            # A CLI user send can echo before its receipt. Defer its provenance,
-            # rather than ignoring every manual message from the same user.
-            message = {
-                **message,
-                "human": None,
-                "pending_provenance": True,
-                "deferred_human": message.get("human") is True,
-            }
+        if self.delivery.observe(ticket_id, message):
+            message = {**message, "human": False, "automatic": True}
         changed = self.store.observe(ticket_id, message)
         if changed:
             self._wakeup.set()
@@ -138,40 +131,31 @@ class HelpdeskFollowup:
         """Observe before native parsing, permissions, media I/O or steer can await."""
         event = data.event
         message, sender = event.message, event.sender
-        item = self.for_chat(message.chat_id)
-        if item is None:
-            return "pass"
         mid = message.message_id
         if self.store.automatic(mid):
             return "drop"
+        item = self.for_chat(message.chat_id) or self.for_chat(message.chat_id, include_closed=True)
+        if item is None:
+            return "pass"
         sender_id = getattr(getattr(sender, "sender_id", None), "open_id", "") or ""
         human = {"user": True, "app": False, "bot": False}.get(getattr(sender, "sender_type", ""))
         kind = getattr(message, "message_type", "unknown")
         if kind in ("system", "system_message"):
             human = False
-        from vikingbot.extensions.feishu_helpdesk.decision import message_text
-
-        self.observe(
-            item["id"],
-            {
-                "im_id": mid,
-                "sender": sender_id,
-                "human": human,
-                "kind": kind,
-                "time": timestamp(getattr(message, "create_time", None)) or self.clock(),
-                "text": message_text(getattr(message, "content", "")),
-            },
-        )
-        if self._pending_actor(item["id"]) == sender_id:
-            self._deferred.setdefault(item["id"], []).append(data)
-            return "defer"
+        record = {
+            "im_id": mid,
+            "sender": sender_id,
+            "human": human,
+            "kind": kind,
+            "time": timestamp(getattr(message, "create_time", None)) or self.clock(),
+            "text": message_text(getattr(message, "content", "")),
+        }
+        if self.delivery.observe(item["id"], record):
+            self.observe(item["id"], {**record, "human": False, "automatic": True})
+            return "drop"
+        if item["status"] not in CLOSED:
+            self.observe(item["id"], record)
         return "pass"
-
-    def _pending_actor(self, ticket_id):
-        if ticket_id in self._sending:
-            return self._sending[ticket_id]
-        pending = self.store.pending_sends(ticket_id)
-        return pending[0].get("actor") if pending else None
 
     def _key(self, item):
         # Ordinary Helpdesk chats use the native group key. Topic turns remain
@@ -198,7 +182,10 @@ class HelpdeskFollowup:
             [
                 t["id"]
                 for t in self.store.tickets.values()
-                if t["status"] not in CLOSED or t["notice_pending"] or t["close_pending"]
+                if t["status"] not in CLOSED
+                or t["notice_pending"]
+                or t["close_pending"]
+                or t.get("refresh_pending")
             ]
             if ids is None
             else list(ids)
@@ -393,9 +380,14 @@ class HelpdeskFollowup:
                     )
                 return
         if item["welcome_at"] is None:
-            receipt = await self._send(item, "welcome", WELCOME)
+            receipt = await self._send(item, "welcome", self.config.helpdesk.messages.welcome)
             item = self.store.tickets[ticket_id]
             self.store.save(item, welcome_at=receipt["sent_at"], retry_at=0)
+            return
+        if item.get("reopen_waiting_for_human"):
+            # Reopening is only a compatibility path. Old solved conversation
+            # must not immediately close it again before any new human input.
+            self.store.save(item, retry_at=self.clock() + 60)
             return
         decision = await self.judge.judge(item, self.store.messages(ticket_id))
         item = self._check(ticket_id, generation)
@@ -418,7 +410,9 @@ class HelpdeskFollowup:
             text = decision.followup
             if item["count"] == 1 and decision.scenario in BUSINESS_WAIT:
                 minutes = self.config.helpdesk.followup_interval_minutes
-                text += f"\n如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。"
+                text += "\n" + self.config.helpdesk.messages.second_reminder_suffix.format(
+                    minutes=minutes
+                )
             receipt = await self._send(item, f"reminder:{generation}:{item['count'] + 1}", text)
             current = self.store.tickets[ticket_id]
             if current["generation"] == generation:
@@ -432,16 +426,18 @@ class HelpdeskFollowup:
         key = f"{item['id']}:{kind}"
         out = self.store.outbox(key)
         if out and out.get("message_id"):
+            self.delivery.settle(key, out)
             return out
         if out is None:
             out = {
                 "ticket": item["id"],
                 "uuid": str(uuid.uuid4()),
-                "text": text,
+                "text": self.config.helpdesk.messages.render(text),
                 "kind": kind,
                 "generation": item["generation"],
                 "attempted_at": None,
                 "actor": None,
+                "cycle": item.get("close_cycle", 0),
             }
             self.store.save_outbox(key, out)
         if out["attempted_at"] is not None and self.clock() - out["attempted_at"] >= 3500:
@@ -454,36 +450,36 @@ class HelpdeskFollowup:
             raise LarkCLIError("uncertain receipt exceeds idempotency window")
 
         async def before(actor):
-            self._check(item["id"], item["generation"], closed=kind == "notice")
+            confirmed = self.store.outbox(key)
+            if confirmed and confirmed.get("message_id"):
+                # Read-only recovery may finish while this caller waits for
+                # the shared CLI lock. Do not overwrite or resend its receipt.
+                raise StaleAction()
+            self._check(item["id"], item["generation"], closed=kind.startswith("notice"))
             out.update(actor=actor, attempted_at=out["attempted_at"] or self.clock())
             self.store.save_outbox(key, out)
             self._sending[item["id"]] = actor
 
-        succeeded = False
         try:
             receipt = await self.api.cli.send_text(
                 item["chat_id"], out["text"], out["uuid"], before_call=before
             )
-            out.update(
-                message_id=receipt["message_id"],
-                sent_at=timestamp(receipt.get("create_time")) or self.clock(),
+            return self.delivery.confirm(
+                key,
+                out,
+                receipt["message_id"],
+                timestamp(receipt.get("create_time")) or self.clock(),
             )
-            self.store.save_outbox(key, out)
-            self.store.reconcile_automatic(item["id"])
-            for msg in self.store.messages(item["id"]):
-                if msg.get("deferred_human") and not self.store.automatic(msg.get("im_id")):
-                    if self.store.observe(item["id"], {**msg, "human": True}):
-                        self._wakeup.set()
-            succeeded = True
-            return out
+        except (LarkCLIError, StaleAction):
+            # A trusted IM echo can confirm the send before the subprocess
+            # loses its response. Preserve that receipt rather than retrying.
+            confirmed = self.store.outbox(key)
+            if confirmed and confirmed.get("message_id"):
+                return confirmed
+            raise
         finally:
             self._sending.pop(item["id"], None)
-            if succeeded:
-                for data in self._deferred.pop(item["id"], []):
-                    if not self.store.automatic(data.event.message.message_id):
-                        self.native(data)
-                        if self.replay is not None:
-                            await self.replay(data)
+            self.delivery.wakeup.set()
 
     async def _close(self, item, *, solved, reason):
         ticket_id, generation = item["id"], item["generation"]
@@ -541,10 +537,10 @@ class HelpdeskFollowup:
         )
 
     async def _notice(self, item):
+        messages = self.config.helpdesk.messages
         text = (
-            "问题已解决，工单已关闭。"
-            if item.get("closed_solved") == 2
-            else "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+            messages.closed_resolved if item.get("closed_solved") == 2 else messages.closed_timeout
         )
-        await self._send(item, "notice", text)
+        cycle = item.get("close_cycle", 0)
+        await self._send(item, f"notice:{cycle}" if cycle else "notice", text)
         self.store.save(self.store.tickets[item["id"]], notice_pending=False)

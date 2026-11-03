@@ -33,6 +33,13 @@ flowchart TD
         "helpdesk_id": "<服务台 ID>",
         "helpdesk_token": "<服务台 Token>",
         "followup_interval_minutes": 5,
+        "messages": {
+          "prefix": "【服务台自动消息】",
+          "welcome": "你好，请描述遇到的问题，并补充相关截图或报错信息。",
+          "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+          "closed_resolved": "问题已解决，工单已关闭。",
+          "closed_timeout": "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+        },
         "cli": {
           "executable": "/absolute/path/to/bin/lark-cli-helpdesk",
           "profile": "support"
@@ -44,6 +51,8 @@ flowchart TD
 ```
 
 `followup_interval_minutes` 默认 `5`，为严格正整数，不接受字符串、布尔值、小数和零。首次提醒、第二次提醒及最终关单等待共用此配置，修改后重启生效；连续成功提醒次数固定两次。
+
+`messages` 可全部省略，默认值如上。欢迎、跟进及关闭说明统一为 `prefix`、换行和正文；欢迎及两种关闭说明由配置生成，不调用模型。跟进正文仍结合对话生成，第二次业务提醒追加配置的 `second_reminder_suffix`，其中必须且只能出现一次 `{minutes}`。统一标识和固定文案不能为空，修改后重启生效。已尝试发送的消息保留当时的完整文案和 UUID，对账不受配置改动影响。
 
 先按 [CLI 兼容补丁说明](../../../compat/lark-cli/README.md) 构建私有副本，再用对应应用的 CLI profile 完成用户授权。欢迎、提醒、关闭说明和关单均显式 `--as user`；读取工单、消息、订阅使用原应用授权加服务台 Token。不在 Bot 中配置、读取或复制 CLI 用户 Token；续期由 CLI 自身完成。
 
@@ -64,11 +73,14 @@ flowchart TD
 - 每个已接管的未关闭工单独立轮询消息，不依赖工单 `updated_at`。消息查询时间为秒，返回记录时间为毫秒。计时用消息产生时间；页数/总数异常和失败不推进消息游标。
 - 群关联取可信事件，或通过工单中有效 `om_` 消息 ID 查询 IM 详情。缺少权限时保留待绑定，不猜群名、不猜目标。冲突关联拒绝合并。恢复绑定后沿用现有 Bot 入群流程。
 - 重启先同步状态和漏掉的消息，再放行到期动作；不依据不完整或来源未核实的对话自动关单。停机期间错过多轮期限，只执行当前一次提醒，下一次从本次成功时间计算。
+- 正常流程中，关闭后再次提问创建新工单，按新 ID 独立接管和欢迎。兼容外部系统将同一 ID 重新设为开放：增量列表先持久化待核对标记，再读取最新详情确认；详情失败或重启不会丢失标记。确认后清零本轮次数、保留欢迎记录，等待新的人工沟通后再判断，避免旧的解决结论立即关单。迟到的创建事件不能直接重新打开工单。
 
 ## 欢迎、计时和关单
 
-新工单欢迎成功一次，由代码固定发送，不调用模型，严格为：
+新工单欢迎成功一次，不调用模型，默认发送：
 
+> 【服务台自动消息】
+>
 > 你好，请描述遇到的问题，并补充相关截图或报错信息。
 
 欢迎语不包含时间。尚无人工沟通时从欢迎成功发送时间计时；有人工消息后按最后人工沟通时间。新人工消息到接收层立即清零本轮提醒、更新版本并作废旧期限，不等待 Agent 消费。所有话题的文本、图片、文件均计入人工活动。自动欢迎、跟进、关闭说明及系统消息不重置；同一 CLI 用户的手动沟通仍计入。
@@ -91,15 +103,15 @@ flowchart TD
 
 出队、模型返回、发送和关单前检查版本。人工消息改变版本后，旧判断作废。关单在等待 CLI 授权和操作锁后再读取最新状态和消息；同群任意话题有执行、排队或最终保存任务时推迟。服务台没有条件更新版本参数，最终读取与远端 PUT 之间仍有网络边界；版本检查覆盖已经收到的消息。
 
-本地到期任务按最近期限等待，最多 10 秒校准一次自然时间。执行额度不足时允许排队，到执行时重新验证。停止渠道先停接收和入队、使旧待办失效，取消并等待监测及执行回调，然后关闭 CLI、HTTP 和数据库。保持单个 AgentLoop、一套 MCP 和扩展实例，普通 Bot 发送 API 并发及外部文件规则不变。
+本地到期任务按最近期限等待，最多 10 秒校准一次自然时间。执行额度不足时允许排队，到执行时重新验证。另有独立的后台异步任务只查询发送回执、恢复本地记录，不调用模型、不重发旧轮提醒、不关单，不受工单自动化暂停影响。它与普通人工消息交付分开运行，仍与其他 CLI 操作共用锁。停止渠道先停接收和入队、使旧待办失效，取消并等待监测、回执查询及执行回调，再关闭数据库、CLI 和 HTTP。保持单个 AgentLoop、一套 MCP 和扩展实例，普通 Bot 发送 API 并发及外部文件规则不变。
 
 ## 持久化和不确定回执
 
 状态位于 `{storage_workspace}/bot/helpdesk/<应用与服务台的SHA256>/state.sqlite3`，SQLite WAL 和单实例文件锁保护，目录及数据库限制本机权限。记录启用时间、独立查询游标、绑定、消息别名、轮次、欢迎时间、人工活动、次数、期限依据及 outbox，不保存 OAuth 或服务台凭据。
 
-发送前持久化 UUID，同轮回执丢失时在 CLI 一小时消息幂等窗口内以同 UUID 重试对账。超过 3500 秒仍不确定，或旧轮提醒回执不确定且已有新人工沟通时，暂停该工单自动动作，保存 `paused` / `pause_reason` 并记录 `Helpdesk automation paused`。需要人工核对远端消息和本地 outbox 后恢复；不会重建数据库冒充首次启用。其他工单和普通回答继续工作。
+发送前持久化 UUID、完整文案和当前 CLI 用户。同轮回执丢失时在 CLI 一小时消息幂等窗口内以同 UUID 重试。超过 3500 秒仍不确定，或旧轮提醒回执不确定且已有新人工沟通时，仅暂停该工单的自动发送和关单，保存 `paused` / `pause_reason` 并记录 `Helpdesk automation paused`。后台对账继续以 CLI 用户身份分页查询目标群历史，按用户、目标群、完整文案及发送时间窗口确认回执，不重新发送已过期动作。全部不确定发送确认后自动解除回执原因导致的暂停；旧轮回执不增加新轮次数。查询失败或未确认时保持自动化暂停，人工消息仍正常处理；必要时人工核对远端消息和本地 outbox，不能删除数据库冒充首次启用。
 
-CLI 自身消息可能先产生回调、后返回发送回执；该窗口先暂存来源，回执确认后排除自动消息、恢复同用户的真实手动沟通。欢迎和关闭说明使用持久化幂等键。关单响应丢失时，恢复流程核对关闭状态和备注是否匹配本次操作，然后补发关闭说明。
+CLI 自身消息可能先产生回调、后返回发送回执。接收层依据已有发送记录识别并保存早到的自动消息回执；不会因为发送人和 CLI 用户相同而暂存其所有消息。客服手动沟通立即交给原生 IM，回执查询或自动化暂停均不阻塞它，也不再产生等待回执的内存消息队列。仅有统一标识的消息不能冒充本机自动发送，仍须匹配发送记录。工单关闭后继续识别自动回流，关闭说明不会进入普通回答。欢迎和关闭说明使用持久化幂等键；兼容同 ID 再次关闭时使用新的关闭轮次键。关单响应丢失时，恢复流程核对关闭状态和备注是否匹配本次操作，然后补发关闭说明。
 
 ## 验证
 
@@ -107,6 +119,7 @@ CLI 自身消息可能先产生回调、后返回发送回执；该窗口先暂�
 
 ```bash
 PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
+  bot/tests/test_helpdesk_delivery.py \
   bot/tests/test_helpdesk_followup.py \
   bot/tests/test_helpdesk_followup_concurrency.py \
   bot/tests/test_feishu_helpdesk.py \
@@ -126,3 +139,4 @@ PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
 - [工单查询](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/list.md)、[详情](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/get.md)
 - [消息查询](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket-message/list.md)、[消息事件](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket-message/events/created.md)
 - [订阅](https://open.feishu.cn/document/server-docs/helpdesk-v1/event/subscribe.md)、[用户关单](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/update.md)、[IM 详情](https://open.feishu.cn/document/server-docs/im-v1/message/get.md)
+- [IM 群历史与回执对账](https://open.feishu.cn/document/server-docs/im-v1/message/list.md)

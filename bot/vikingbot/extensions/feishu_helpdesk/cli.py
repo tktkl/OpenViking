@@ -202,6 +202,21 @@ class LarkCLIAdapter:
                 return item
         raise LarkCLIError("message detail missing")
 
+    async def chat_messages(self, chat_id, start, end, page_token=""):
+        params = {
+            "container_id_type": "chat",
+            "container_id": chat_id,
+            "start_time": str(int(start)),
+            "end_time": str(int(end) + 1),
+            "sort_type": "ByCreateTimeAsc",
+            "page_size": 50,
+        }
+        if page_token:
+            params["page_token"] = page_token
+        return await self._operate(
+            "api", "GET", "/open-apis/im/v1/messages", "--params", json.dumps(params)
+        )
+
     async def close_ticket(self, ticket_id, authorization, body, *, before_call=None):
         # --headers is supplied by the separately shipped CLI compatibility patch.
         # The user token never leaves the CLI, including during token renewal.

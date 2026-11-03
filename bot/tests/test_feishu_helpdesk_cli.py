@@ -87,6 +87,26 @@ async def test_close_passes_desk_header_on_stdin_and_keeps_uat_inside_cli(cli):
 
 
 @pytest.mark.asyncio
+async def test_receipt_reconciliation_reads_raw_user_history_with_seconds_and_pagination(cli):
+    cli._command.side_effect = lambda *args: (
+        authorization() if args[0] == "auth" else success({"items": [], "has_more": False})
+    )
+    await cli.chat_messages("oc_ticket", 1800000000.123, 1800000060.456, "next")
+    args = cli._command.call_args.args
+    assert args[:4] == ("api", "GET", "/open-apis/im/v1/messages", "--params")
+    assert json.loads(args[4]) == {
+        "container_id_type": "chat",
+        "container_id": "oc_ticket",
+        "start_time": "1800000000",
+        "end_time": "1800000061",
+        "sort_type": "ByCreateTimeAsc",
+        "page_size": 50,
+        "page_token": "next",
+    }
+    assert args[-4:] == ("--as", "user", "--format", "json")
+
+
+@pytest.mark.asyncio
 async def test_send_guard_runs_after_cli_lock_and_auth(cli):
     lock_entered, release = asyncio.Event(), asyncio.Event()
 

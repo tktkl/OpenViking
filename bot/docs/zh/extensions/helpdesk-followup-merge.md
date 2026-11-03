@@ -10,11 +10,12 @@
 | `extensions/feishu_helpdesk/sync.py` | 创建/更新窗口完整分页，消息游标独立，时间单位和可信群绑定，未知来源重试 |
 | `extensions/feishu_helpdesk/decision.py` | 独立预算、无工具、可信角色与最新消息依据，不让模型编造关单期限 |
 | `extensions/feishu_helpdesk/followup.py` | 仅通过主会话队列执行；版本检查、成功发送计时、跨重启幂等及关闭等待 |
+| `extensions/feishu_helpdesk/delivery.py` | 独立后台只读对账，暂停后继续运行；人工消息立即交付，关闭后仍过滤自动回流；回执结算可重入 |
 | `extensions/feishu_helpdesk/channel.py` | 复用飞书长连接；在原生媒体解析/steer 等待前观察人工活动；补漏恢复入群不阻塞扫描 |
 | `agent/loop.py` | 只增加物理群忙碌查询，涵盖话题、总线/调度器排队、执行及最终保存；ContextVar 排除回调自身 |
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
-| `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，默认 5；沿用既有 helpdesk 字段 |
+| `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，默认 5；`messages` 统一标识和文案，时间模板校验 |
 | `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；用户操作仍显式 CLI `--as user`；请求头 stdin、进程取消和脱敏 |
 
 本次没有修改 `bus/events.py`、`bus/queue.py`、原生 `channels/feishu.py` 或 `channels/openapi.py`。内部事件继续使用并发分支已有的 `before_process` / `internal_handler`。不增加发送 API 并发，不改变共享文件、工具、MCP 或沙箱权限。
@@ -42,3 +43,9 @@
 - CLI 完整 `make unit-test` 在动态元数据 bot-only 判定、semantic-review 策略/waiver 及 minutes 下载地址校验失败；在同固定提交的无补丁克隆中复现。新增请求头测试通过。
 
 自动化验证未向真实飞书工单发消息、关单或修改真实授权。部署前还需在测试服务台核验真实事件投递、当前 CLI 用户权限和所需 OAuth scopes。
+
+## 审查修复
+
+人工消息不再等待 CLI 自动发送回执。后台只读对账与业务调度分开，暂停后仍可恢复回执，关闭说明在工单关闭后仍经过自动消息过滤。欢迎、跟进和关闭说明使用统一可配置格式，既有 outbox 继续使用原文案对账。正常再次提问按新工单接管；同 ID 重新打开作为兼容分支，使用持久化核对标记和独立关闭轮次，避免漏恢复、重复欢迎或按旧对话立即关单。
+
+本轮新增 19 个回归用例，覆盖暂停且后台查询阻塞时人工消息交付、旧轮回执只读恢复、重启及配置变化、关闭说明早到/晚到回流、分页与来源隔离、CLI 锁等待时回执竞争，以及新工单和异常重新打开的兼容。完整 Bot 回归 **841 passed、4 skipped、1 项上述既有超时失败**；Python 3.10 服务台、并发和来源回归 **270 passed**。Ruff 与差异空白检查通过，未调用真实用户发送或关单接口。

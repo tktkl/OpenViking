@@ -117,7 +117,6 @@ class FeishuHelpdeskChannel(FeishuChannel):
                     self._helpdesk_api,
                     self._bot_config.bot_data_path,
                     budget=getattr(agents, "session_context_token_budget", 3000),
-                    replay=self._replay_native,
                     on_sync=self._restore_ticket,
                     activated_at=activated_at,
                     **self._followup_deps,
@@ -214,9 +213,6 @@ class FeishuHelpdeskChannel(FeishuChannel):
             },
         )
         service.dirty(ticket_id)
-
-    async def _replay_native(self, data):
-        await super()._on_message(data)
 
     async def _restore_ticket(self, item):
         """Recovery uses the same admission ownership and retries as live events."""
