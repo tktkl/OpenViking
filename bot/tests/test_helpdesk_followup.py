@@ -827,6 +827,68 @@ def test_closed_ticket_cannot_be_reopened_by_late_create(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("updated_event", [False, True])
+async def test_late_ticket_event_binds_chat_without_reverting_scanned_state(
+    desk, tmp_path, updated_event
+):
+    from test_feishu_helpdesk import ticket_event
+    from vikingbot.extensions.feishu_helpdesk.channel import FeishuHelpdeskChannel
+
+    service, api, clock = await desk()
+    created = clock()
+    add_ticket(service, api, clock, chat="")
+    clock.advance(60)
+    api.tickets["t1"].update(status=2, updated_at=int(clock() * 1000))
+    await service.reconcile()
+    scanned = copy.deepcopy(service.store.tickets["t1"])
+    channel = FeishuHelpdeskChannel(service.config, service.bus)
+    channel._followup = service
+    channel._helpdesk_api.ensure_in_chat = AsyncMock(return_value=True)
+    try:
+        await channel._on_ticket(
+            ticket_event(
+                updated=updated_event,
+                ticket_id="t1",
+                helpdesk_id="desk",
+                created_at=str(int(created * 1000)),
+                updated_at=str(int(created * 1000)),
+                guest={"id": {"open_id": "ou_stale_guest"}},
+            )
+        )
+        assert channel._ticket_chats["oc_ticket"] == "t1"
+        assert service.store.tickets["t1"] == {**scanned, "chat_id": "oc_ticket"}
+        # The binding, rather than just the admission cache, must survive restart.
+        await service.close()
+        restarted, _, _ = await desk(path=tmp_path, clock=clock, api=api)
+        await restarted.reconcile()
+        await drain(restarted)
+        assert len(api.cli.sends) == 1 and api.cli.sends[0][0] == "oc_ticket"
+    finally:
+        await channel.stop()
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_late_chat_binding_rejects_conflicts_and_preserves_ticket_state(tmp_path, closed):
+    clock = Clock()
+    state = HelpdeskState(tmp_path / "state.sqlite3", clock())
+    try:
+        ticket = {"ticket_id": "t1", "created_at": int(clock() * 1000), "status": 1}
+        state.register(ticket, clock())
+        latest = state.register(
+            {**ticket, "status": 51 if closed else 2, "updated_at": int((clock() + 60) * 1000)},
+            clock(),
+        )
+        stale = {**ticket, "updated_at": int(clock() * 1000)}
+        bound = state.register(stale, clock(), chat_id="oc_ticket")
+        assert bound == {**latest, "chat_id": "oc_ticket"}
+        with pytest.raises(ValueError, match="Conflicting"):
+            state.register(stale, clock(), chat_id="oc_other")
+        assert state.tickets["t1"] == bound
+    finally:
+        state.close()
+
+
+@pytest.mark.asyncio
 async def test_judge_has_independent_budget_and_requires_latest_evidence():
     provider = SimpleNamespace(
         chat=AsyncMock(
@@ -1049,6 +1111,103 @@ async def test_close_and_notice_recover_after_lost_response(desk, tmp_path):
     assert api.cli.sends[-1][1] == service.config.helpdesk.messages.render(
         "问题已解决，工单已关闭。"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_read", [False, True])
+async def test_recovery_drops_old_close_notice_when_ticket_reopens(desk, during_read):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+    close = api.cli.close_ticket
+
+    async def lost(*args, **kwargs):
+        await close(*args, **kwargs)
+        raise LarkCLIError("response lost", retryable=True)
+
+    api.cli.close_ticket = lost
+    await drain(service)
+    assert service.store.tickets["t1"]["close_pending"]
+    clock.advance(60)
+    reads = 0
+
+    async def reopen(tid):
+        nonlocal reads
+        reads += 1
+        old_response = copy.deepcopy(api.tickets[tid])
+        if reads == 2:
+            # _execute's first sync saw CLOSED. The recovery read is now stale
+            # or itself returns the newer OPEN state with the old close comment.
+            api.tickets[tid].update(status=2, updated_at=int(clock() * 1000))
+            if during_read:
+                service.register(copy.deepcopy(api.tickets[tid]), authoritative=True)
+                return old_response
+        return copy.deepcopy(api.tickets[tid])
+
+    api.ticket.side_effect = reopen
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["status"] == 2 and item["close_pending"] is None
+    assert item["close_cycle"] == 1 and item["reopen_waiting_for_human"]
+    assert not item["notice_pending"] and len(api.cli.sends) == 1
+    assert service.store.outbox("t1:notice") is None
+    # Once the new round really resolves, it gets its own notice and UUID.
+    api.cli.close_ticket = close
+    clock.advance(1)
+    human(service, clock, "om_new_resolution")
+    await drain(service)
+    assert len(api.cli.closes) == 2 and len(api.cli.sends) == 2
+    assert service.store.outbox("t1:notice:1")["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_close_confirmation_cannot_overwrite_reopened_state(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+    close = api.cli.close_ticket
+
+    async def reopened(*args, **kwargs):
+        await close(*args, **kwargs)
+        closed_response = copy.deepcopy(api.tickets["t1"])
+        service.register(closed_response, authoritative=True)
+        clock.advance(1)
+        api.tickets["t1"].update(status=2, updated_at=int(clock() * 1000))
+        service.register(copy.deepcopy(api.tickets["t1"]), authoritative=True)
+        api.ticket.side_effect = None
+        api.ticket.return_value = closed_response
+        return {}
+
+    api.cli.close_ticket = reopened
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["status"] == 2 and item["close_cycle"] == 1
+    assert not item["notice_pending"] and len(api.cli.sends) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["poll", "human"])
+async def test_concurrent_close_confirmation_recovers_notice_without_closing_twice(desk, change):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
+    human(service, clock)
+    close = api.cli.close_ticket
+
+    async def changed(*args, **kwargs):
+        await close(*args, **kwargs)
+        if change == "poll":
+            service.register(copy.deepcopy(api.tickets["t1"]), authoritative=True)
+        else:
+            human(service, clock, "om_during_confirmation")
+        return {}
+
+    api.cli.close_ticket = changed
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["status"] == 51 and item["close_pending"] is None
+    assert not item["notice_pending"]
+    assert len(api.cli.closes) == 1 and len(api.cli.sends) == 2
+    assert service.store.outbox("t1:notice")["settled"]
 
 
 @pytest.mark.asyncio

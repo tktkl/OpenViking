@@ -106,6 +106,13 @@ class HelpdeskState:
                 "notice_pending": False,
                 "paused": False,
             }
+        # Trusted chat identity is independent of the event's state version.
+        # A scan can learn newer status before an older event supplies the group.
+        if chat_id.startswith("oc_"):
+            if old["chat_id"] and old["chat_id"] != chat_id:
+                raise ValueError("Conflicting ticket chat identity")
+            if not old["chat_id"]:
+                old = self.save(old, chat_id=chat_id)
         updated = timestamp(ticket.get("updated_at"))
         if updated is not None and updated < old["updated"]:
             return old
@@ -140,10 +147,6 @@ class HelpdeskState:
                 notice_pending=False,
                 retry_at=0,
             )
-        if chat_id.startswith("oc_"):
-            if old["chat_id"] and old["chat_id"] != chat_id:
-                raise ValueError("Conflicting ticket chat identity")
-            values["chat_id"] = chat_id
         for key in ("guest", "agents", "collaborators", "ticket_type", "channel"):
             if key in ticket:
                 values[key] = ticket[key]

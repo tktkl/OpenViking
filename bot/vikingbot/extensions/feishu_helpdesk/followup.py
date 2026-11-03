@@ -462,7 +462,13 @@ class HelpdeskFollowup:
                 # Read-only recovery may finish while this caller waits for
                 # the shared CLI lock. Do not overwrite or resend its receipt.
                 raise StaleAction()
-            self._check(item["id"], item["generation"], closed=kind.startswith("notice"))
+            notice = kind.startswith("notice")
+            current = self._check(item["id"], item["generation"], closed=notice)
+            if notice and (
+                current["status"] not in CLOSED
+                or current.get("close_cycle", 0) != out.get("cycle", 0)
+            ):
+                raise StaleAction()
             # Waiting for the CLI lock and authorization may exhaust the UUID
             # window. An expired attempt must go through read-only recovery.
             check_expiry()
@@ -514,7 +520,7 @@ class HelpdeskFollowup:
             raise StaleAction()
         body = {"status": 51, "solved": solved, "comment": reason}
         pending = {"body": body, "generation": generation}
-        self.store.save(current, close_pending=pending)
+        current = self.store.save(current, close_pending=pending)
 
         async def before(_actor):
             # CLI authorization/its shared send lock can wait. Re-read after that
@@ -527,12 +533,9 @@ class HelpdeskFollowup:
 
         await self.api.cli.close_ticket(ticket_id, self.api.authorization, body, before_call=before)
         remote = await self.api.ticket(ticket_id)
-        if remote.get("status") not in CLOSED:
-            raise ValueError("Helpdesk close not confirmed")
-        current = self.store.tickets[ticket_id]
+        current = self._confirm_close_state(current, remote)
         current = self.store.save(
             current,
-            status=remote["status"],
             close_pending=None,
             closed_solved=solved,
             notice_pending=True,
@@ -540,15 +543,40 @@ class HelpdeskFollowup:
         )
         await self._notice(current)
 
+    def _confirm_close_state(self, item, remote):
+        current = self.store.tickets[item["id"]]
+        cycle = item.get("close_cycle", 0)
+        if (
+            not self.running
+            or current["generation"] != item["generation"]
+            or current.get("close_cycle", 0) != cycle
+            or current["close_pending"] != item["close_pending"]
+        ):
+            raise StaleAction()
+        # Apply the detail response before accepting a close receipt. It may
+        # itself establish a reopen and invalidate this pending operation.
+        current = self.register(remote, authoritative=True)
+        if current is None:
+            raise ValueError("Ticket does not belong to this Helpdesk")
+        if remote.get("status") not in CLOSED or current["status"] not in CLOSED:
+            raise ValueError("Helpdesk close not confirmed")
+        if (
+            current.get("close_cycle", 0) != cycle
+            or current["close_pending"] != item["close_pending"]
+        ):
+            raise StaleAction()
+        return current
+
     async def _recover_close(self, item):
         pending = item["close_pending"]
         if pending is None:
             return
         remote = await self.api.ticket(item["id"])
+        current = self._confirm_close_state(item, remote)
         comment = remote.get("comments", {}).get("content", "")
         owned = comment == pending["body"]["comment"]
         self.store.save(
-            self.store.tickets[item["id"]],
+            current,
             close_pending=None,
             notice_pending=owned,
             closed_solved=pending["body"]["solved"],
@@ -561,4 +589,6 @@ class HelpdeskFollowup:
         )
         cycle = item.get("close_cycle", 0)
         await self._send(item, f"notice:{cycle}" if cycle else "notice", text)
-        self.store.save(self.store.tickets[item["id"]], notice_pending=False)
+        current = self.store.tickets[item["id"]]
+        if current["generation"] == item["generation"] and current.get("close_cycle", 0) == cycle:
+            self.store.save(current, notice_pending=False)
