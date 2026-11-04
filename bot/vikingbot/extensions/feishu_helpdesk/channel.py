@@ -1,9 +1,11 @@
 """Join Helpdesk ticket chats, then use the upstream Feishu IM implementation unchanged."""
 
 import asyncio
+import hashlib
 import time
 from collections import OrderedDict
 from functools import partial
+from pathlib import Path
 
 import httpx
 from loguru import logger
@@ -40,6 +42,8 @@ def _ticket_data(ticket):
             "created_at",
             "updated_at",
             "channel",
+            "actual_agent_group",
+            "hit_agent_groups",
         )
         if getattr(ticket, key, None) is not None
     }
@@ -66,21 +70,45 @@ class FeishuHelpdeskChannel(FeishuChannel):
         provider=None,
         model=None,
         session_busy=None,
+        reply_sender=None,
         **kwargs,
     ):
         super().__init__(config, bus, bot_config=bot_config, **kwargs)
+        self._reply_sender = reply_sender
         self._helpdesk_api = HelpdeskAPI(
             config.helpdesk,
             app_id=config.app_id,
             domain=config.domain,
             tenant_token=self._get_tenant_access_token,
         )
+        if reply_sender is not None and hasattr(reply_sender, "bind_helpdesk"):
+            cache_path = None
+            data_path = getattr(bot_config, "bot_data_path", None)
+            if data_path is not None:
+                identity = hashlib.sha256(
+                    f"{config.app_id}:{config.helpdesk.helpdesk_id}".encode()
+                ).hexdigest()
+                cache_path = Path(data_path) / "helpdesk" / identity / "feishu_feed_ids.json"
+            reply_sender.bind_helpdesk(self._helpdesk_api, cache_path=cache_path)
         self._helpdesk_tasks: set[asyncio.Task] = set()
+        self._resolver_task = None
+        if reply_sender is not None and hasattr(reply_sender, "warm"):
+            try:
+                self._resolver_task = asyncio.get_running_loop().create_task(
+                    reply_sender.warm(), name="feishu-feed-warmup"
+                )
+            except RuntimeError:
+                pass
         self._helpdesk_ready = False
         self._join_tasks: dict[str, asyncio.Task] = {}
         self._ticket_chats: OrderedDict[str, str] = OrderedDict()
         self._followup = None
-        self._followup_deps = {"provider": provider, "model": model, "session_busy": session_busy}
+        self._followup_deps = {
+            "provider": provider,
+            "model": model,
+            "session_busy": session_busy,
+            "reply_sender": reply_sender,
+        }
 
     def _event_handler_builder(self):
         return (
@@ -89,6 +117,8 @@ class FeishuHelpdeskChannel(FeishuChannel):
             .register_p2_helpdesk_ticket_created_v1(self._on_ticket_sync)
             .register_p2_helpdesk_ticket_updated_v1(self._on_ticket_sync)
             .register_p2_helpdesk_ticket_message_created_v1(self._on_ticket_message_sync)
+            .register_p2_im_message_reaction_created_v1(self._on_reaction_sync)
+            .register_p2_im_message_reaction_deleted_v1(self._on_reaction_sync)
         )
 
     async def start(self):
@@ -127,6 +157,12 @@ class FeishuHelpdeskChannel(FeishuChannel):
                 await self._followup.start()
             self._helpdesk_api.start()
             self._helpdesk_ready = True
+            if self._resolver_task is None and self._reply_sender is not None and hasattr(
+                self._reply_sender, "warm"
+            ):
+                self._resolver_task = asyncio.create_task(
+                    self._reply_sender.warm(), name="feishu-feed-warmup"
+                )
             logger.info("Feishu Helpdesk ready")
         except Exception as error:
             if self._followup is not None:
@@ -157,12 +193,23 @@ class FeishuHelpdeskChannel(FeishuChannel):
         self._helpdesk_tasks.clear()
         self._join_tasks.clear()
         self._ticket_chats.clear()
+        if self._resolver_task is not None:
+            self._resolver_task.cancel()
+            await asyncio.gather(self._resolver_task, return_exceptions=True)
+            self._resolver_task = None
+        if self._reply_sender is not None and hasattr(self._reply_sender, "close"):
+            await self._reply_sender.close()
         await self._helpdesk_api.close()
 
     def _on_ticket_sync(self, data):
         # The SDK dispatches from its WebSocket thread; all state belongs to the bot loop.
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._schedule_ticket, data)
+
+    def _on_reaction_sync(self, _data):
+        # Reaction events are subscribed but carry no Helpdesk state. Registering
+        # an explicit no-op prevents the SDK from logging processor-not-found.
+        return
 
     def _on_ticket_message_sync(self, data):
         if self._loop and self._loop.is_running():
@@ -223,9 +270,16 @@ class FeishuHelpdeskChannel(FeishuChannel):
         )
         service.dirty(ticket_id)
 
+    def _ticket_is_ignored(self, item):
+        return bool(
+            item
+            and item.get("paused")
+            and item.get("pause_reason") == "actor_not_assigned"
+        )
+
     async def _restore_ticket(self, item):
         """Recovery uses the same admission ownership and retries as live events."""
-        if not self._running:
+        if not self._running or self._ticket_is_ignored(item):
             return
         chat_id = item["chat_id"]
         if not chat_id:
@@ -241,7 +295,13 @@ class FeishuHelpdeskChannel(FeishuChannel):
                 # not hold up recovery of other tickets or a session worker.
                 task = asyncio.create_task(self._admit_chat(chat_id, item["id"]))
                 self._helpdesk_tasks.add(task)
-                task.add_done_callback(self._ticket_done)
+                task.add_done_callback(
+                    partial(
+                        self._ticket_done,
+                        ticket_id=item["id"],
+                        chat_id=chat_id,
+                    )
+                )
 
     async def _on_message(self, data):
         if self._followup is not None and self._followup.running:
@@ -256,15 +316,17 @@ class FeishuHelpdeskChannel(FeishuChannel):
         self._helpdesk_tasks.add(task)
         task.add_done_callback(partial(self._ticket_done, data=data))
 
-    def _ticket_done(self, task, *, data=None):
+    def _ticket_done(self, task, *, data=None, ticket_id=None, chat_id=None):
         self._helpdesk_tasks.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
             event = getattr(data, "event", None)
             ticket = getattr(event, "object", event)
+            ticket_id = getattr(ticket, "ticket_id", None) or ticket_id
+            chat_id = getattr(ticket, "chat_id", None) or chat_id
             logger.error(
                 "Feishu Helpdesk event failed: ticket_id={}, chat_id={}, {}",
-                getattr(ticket, "ticket_id", None),
-                getattr(ticket, "chat_id", None),
+                ticket_id,
+                chat_id,
                 _error_details(error),
             )
 
@@ -321,7 +383,12 @@ class FeishuHelpdeskChannel(FeishuChannel):
             ticket = data.event.object
         else:
             return
-        if str(ticket.helpdesk_id or "") != self.config.helpdesk.helpdesk_id:
+        if ticket is None:
+            return
+        ticket_id = str(getattr(ticket, "ticket_id", "") or "")
+        if not ticket_id:
+            return
+        if str(getattr(ticket, "helpdesk_id", "") or "") != self.config.helpdesk.helpdesk_id:
             return
         item = None
         if self._followup is not None and self._followup.running:
@@ -337,12 +404,13 @@ class FeishuHelpdeskChannel(FeishuChannel):
                     authoritative=True,
                 )
             if item is not None:
+                if self._ticket_is_ignored(item):
+                    return
                 self._followup.dirty(item["id"])
                 if item["status"] in CLOSED_STATUSES:
                     await self._restore_ticket(item)
                     return
         chat_id = (item["chat_id"] if item is not None else "") or ticket.chat_id or ""
-        ticket_id = str(ticket.ticket_id or "")
         if not chat_id.startswith("oc_") or not ticket_id:
             # Creation can precede group creation; updated_v1 supplies its eventual chat_id.
             return

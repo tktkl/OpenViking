@@ -219,12 +219,24 @@ class CLIProbe:
             "--data",
             json.dumps(self.request.body, ensure_ascii=False),
         )
-        # v1.0.66 dry-run is a raw diagnostic, not an ok/identity envelope.
-        if (
-            dry_run.get("as") != "user"
-            or dry_run.get("appId") != session.app_id
-            or dry_run.get("userOpenId") != session.user_id
-        ):
+        # v1.0.66 returned a raw diagnostic. Newer CLI releases wrap the
+        # identity under data.context. Accept both contracts, but only when
+        # the CLI explicitly confirms user identity.
+        legacy_identity = (
+            dry_run.get("as") == "user"
+            and dry_run.get("appId") == session.app_id
+            and dry_run.get("userOpenId") == session.user_id
+        )
+        data = dry_run.get("data")
+        context = data.get("context") if isinstance(data, dict) else None
+        current_identity = (
+            dry_run.get("ok") is True
+            and dry_run.get("identity") == "user"
+            and isinstance(context, dict)
+            and context.get("app_id") == session.app_id
+            and context.get("user_open_id") == session.user_id
+        )
+        if not (legacy_identity or current_identity):
             raise CloseFailure("CLI close policy or identity check failed")
         await self.renew(session)
         return session
@@ -365,11 +377,9 @@ class CloseOperation:
                     raise ValueError()
             except (ValueError, TypeError):
                 raise CloseFailure("close returned an invalid response", rejected=False) from None
-            if (
-                200 <= response.status_code < 300
-                and code == 0
-                and isinstance(value.get("data"), dict)
-            ):
+            # Native PUT close responses may omit or null data on success.
+            # A 2xx response with the native API's code=0 is authoritative.
+            if 200 <= response.status_code < 300 and code == 0:
                 return
             # Only explicit API refusals prove that this PUT did not close.
             rejected = code in API_REJECTION_CODES and response.status_code < 500

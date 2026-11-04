@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import time
 from collections.abc import Awaitable, Callable
 from urllib.parse import quote
@@ -83,6 +84,20 @@ class HelpdeskAPI:
             raise HelpdeskAPIError("read ticket", "invalid_response")
         return ticket
 
+    async def chat(self, chat_id):
+        if not chat_id.startswith("oc_"):
+            raise HelpdeskAPIError("read chat", "invalid_chat_id")
+        result = await self._bot_request(
+            "GET",
+            f"/open-apis/im/v1/chats/{quote(chat_id, safe='')}",
+            operation="read chat",
+            params={"user_id_type": "open_id"},
+        )
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise HelpdeskAPIError("read chat", "invalid_response")
+        return data
+
     async def tickets_page(self, field, start, end, page):
         if field not in ("create", "update"):
             raise ValueError("Invalid ticket time filter")
@@ -149,6 +164,32 @@ class HelpdeskAPI:
             headers={"X-Lark-Helpdesk-Authorization": authorization},
             json={"events": list(TICKET_EVENTS)},
         )
+
+    async def send_bot_text(self, chat_id, text, idempotency_key, *, before_call=None):
+        """Send to an ordinary IM chat as this channel's application bot."""
+        if not str(chat_id).startswith("oc_"):
+            raise HelpdeskAPIError("send bot message", "invalid_chat_id")
+        timeout = await before_call(self.app_id) if before_call is not None else None
+        request = self._bot_request(
+            "POST",
+            "/open-apis/im/v1/messages",
+            operation="send bot message",
+            params={"receive_id_type": "chat_id"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+                "uuid": idempotency_key,
+            },
+        )
+        result = await asyncio.wait_for(request, timeout) if timeout is not None else await request
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise HelpdeskAPIError("send bot message", "invalid_response")
+        message_id = data.get("message_id")
+        if not isinstance(message_id, str) or not message_id.startswith("om_"):
+            raise HelpdeskAPIError("send bot message", "invalid_response")
+        return {"message_id": message_id, "create_time": data.get("create_time")}
 
     async def bot_open_id(self) -> str:
         result = await self._bot_request(

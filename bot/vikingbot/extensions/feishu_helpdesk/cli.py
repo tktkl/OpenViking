@@ -13,6 +13,25 @@ from loguru import logger
 
 from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
+CLOSE_OPERATION_DIAGNOSTICS = frozenset(
+    {
+        "CLI returned an unsupported response",
+        "invalid close request",
+        "CLI profile or brand does not match this close operation",
+        "CLI close policy or identity check failed",
+        "CLI renewal did not confirm the expected user",
+        "CLI profile changed during renewal",
+        "close operation timed out",
+        "close operation failed",
+        "CLI user token expired before commit",
+        "close response was not received",
+        "close returned an invalid response",
+        "close API refused the request",
+        "close result is uncertain",
+        "close input was interrupted",
+        "invalid close input",
+    }
+)
 CLOSE_CREDENTIAL_DIAGNOSTICS = frozenset(
     {
         "unsupported credential provider; use a local CLI profile",
@@ -366,11 +385,13 @@ class LarkCLIAdapter:
             # diagnostics make storage incompatibility actionable without
             # exposing decrypted data, paths or captured process output.
             reason = "Python close helper failed"
+            detail = error.get("reason")
             if error.get("kind") == "credentials":
-                detail = error.get("reason")
                 reason = "Python close cannot read compatible local CLI credentials"
                 if isinstance(detail, str) and detail in CLOSE_CREDENTIAL_DIAGNOSTICS:
                     reason += f": {detail}"
+            elif isinstance(detail, str) and detail in CLOSE_OPERATION_DIAGNOSTICS:
+                reason += f": {detail}"
             raise LarkCLIError(
                 reason,
                 code=error.get("code"),

@@ -891,3 +891,46 @@ async def test_default_feishu_is_unchanged_and_helpdesk_is_explicit_opt_in(tmp_p
         assert "desk_secret" not in repr(configured)
     finally:
         await extension.stop()
+
+
+@pytest.mark.asyncio
+async def test_unassigned_ticket_is_ignored_before_admission(channel):
+    item = {
+        "id": "ticket_1",
+        "chat_id": "oc_ticket",
+        "status": 2,
+        "paused": True,
+        "pause_reason": "actor_not_assigned",
+    }
+    channel._followup = SimpleNamespace(
+        running=True,
+        register=Mock(return_value=item),
+        dirty=Mock(),
+    )
+    try:
+        await channel._on_ticket(ticket_event(updated=True))
+        channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+        channel._followup.dirty.assert_not_called()
+
+        channel._running = True
+        await channel._restore_ticket(item)
+        channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+    finally:
+        channel._followup = None
+
+
+@pytest.mark.asyncio
+async def test_empty_ticket_event_is_ignored_without_admission(channel):
+    channel._followup = SimpleNamespace(running=True, register=Mock(), dirty=Mock())
+    try:
+        await channel._on_ticket(ticket_event(ticket_id=""))
+        channel._followup.register.assert_not_called()
+        channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+    finally:
+        channel._followup = None
+
+
+def test_reaction_events_have_explicit_noop_handlers(channel):
+    handler = channel._event_handler_builder().build()
+    assert handler is not None
+    assert channel._on_reaction_sync(None) is None

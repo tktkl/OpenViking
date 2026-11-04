@@ -72,12 +72,17 @@ class ChannelManager:
                 helpdesk_deps = {}
                 if channel_config.helpdesk.enabled:
                     from vikingbot.extensions.feishu_helpdesk.channel import FeishuHelpdeskChannel
+                    from vikingbot.extensions.feishu_helpdesk.reply import build_reply_sender
 
                     FeishuChannel = FeishuHelpdeskChannel
                     helpdesk_deps = {
                         "provider": additional_deps.get("helpdesk_provider"),
                         "model": additional_deps.get("helpdesk_model"),
                         "session_busy": additional_deps.get("helpdesk_session_busy"),
+                        "reply_sender": build_reply_sender(
+                            channel_config.helpdesk.reply,
+                            additional_deps.get("bot_config"),
+                        ),
                     }
 
                 channel = FeishuChannel(

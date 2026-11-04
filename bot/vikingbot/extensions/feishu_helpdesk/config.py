@@ -1,19 +1,27 @@
 """Opt-in configuration, independent of the upstream channel schema."""
 
 from string import Formatter
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-WELCOME = "你好，请描述遇到的问题，并补充相关截图或报错信息。"
+from vikingbot.extensions.feishu_helpdesk.escalation import normalize_system
+
+WELCOME = "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。"
 
 
 class HelpdeskMessagesConfig(BaseModel):
     """A reserved prefix distinguishes user-owned automation from manual conversation."""
 
-    prefix: str = Field(default="【服务台自动消息】", min_length=1, max_length=100)
+    prefix: str = Field(default="【AI分身自动回复】", min_length=1, max_length=100)
     welcome: str = Field(default=WELCOME, min_length=1, max_length=1000)
     second_reminder_suffix: str = Field(
         default="如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+        min_length=1,
+        max_length=1000,
+    )
+    escalation_reminder_suffix: str = Field(
+        default="如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
         min_length=1,
         max_length=1000,
     )
@@ -29,7 +37,7 @@ class HelpdeskMessagesConfig(BaseModel):
             raise ValueError("Helpdesk automatic message text cannot be blank")
         return value.strip()
 
-    @field_validator("second_reminder_suffix")
+    @field_validator("second_reminder_suffix", "escalation_reminder_suffix")
     @classmethod
     def validate_suffix(cls, value):
         try:
@@ -42,7 +50,7 @@ class HelpdeskMessagesConfig(BaseModel):
                 raise ValueError()
             value.format(minutes=5)
         except (ValueError, KeyError, IndexError):
-            raise ValueError("second_reminder_suffix must contain exactly one {minutes}") from None
+            raise ValueError("reminder suffix must contain exactly one {minutes}") from None
         return value.strip()
 
     def render(self, text):
@@ -57,13 +65,67 @@ class LarkCLIConfig(BaseModel):
     keepalive_interval_seconds: float = Field(default=1800, gt=0)
 
 
+class FeishuHelpdeskReplyConfig(BaseModel):
+    """Reply transport; lark_cli stays the backward-compatible default."""
+
+    mode: Literal["lark_cli", "feishu_web"] = "lark_cli"
+    auth_mcp_server: str = "wangoon-auth-mcp"
+    provider: str = "feishu_helpdesk"
+    environment: str = "prod"
+    profile: str = "default"
+    actor_open_id: str = ""
+    gateway_url: str = "https://internal-api-lark-api.feishu.cn/im/gateway/"
+    web_url: str = ""
+    feed_ids: dict[str, str] = Field(default_factory=dict)
+    auto_resolve_feed_id: bool = False
+    browser_executable: str = ""
+    feed_resolution_timeout_seconds: float = Field(default=30, gt=0)
+    feed_cache_path: str = ""
+    cookie_cache_seconds: float = Field(default=60, ge=0)
+
+    @model_validator(mode="after")
+    def validate_web_reply(self):
+        if self.mode == "feishu_web":
+            if not self.actor_open_id.strip():
+                raise ValueError("feishu_web reply requires actor_open_id")
+            if not self.auth_mcp_server.strip():
+                raise ValueError("feishu_web reply requires auth_mcp_server")
+        return self
+
+
+class FeishuHelpdeskEscalationConfig(BaseModel):
+    """Configurable system-to-group routing for unresolved escalations."""
+
+    enabled: bool = True
+    interval_minutes: int = Field(default=30, gt=0, strict=True)
+    sender: Literal["bot", "lark_cli"] = "bot"
+    groups: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("groups")
+    @classmethod
+    def valid_groups(cls, value):
+        groups = {}
+        for system, chat_id in value.items():
+            name, target = normalize_system(system), str(chat_id).strip()
+            if not name or not target.startswith("oc_"):
+                raise ValueError("escalation groups require system names and oc_ chat ids")
+            if name in groups:
+                raise ValueError("escalation group system names are case-insensitive duplicates")
+            groups[name] = target
+        return groups
+
+
 class FeishuHelpdeskConfig(BaseModel):
     enabled: bool = False
     helpdesk_id: str = ""
     helpdesk_token: str = Field(default="", repr=False)
-    followup_interval_minutes: int = Field(default=5, gt=0, strict=True)
+    followup_interval_minutes: int = Field(default=3, gt=0, strict=True)
     messages: HelpdeskMessagesConfig = Field(default_factory=HelpdeskMessagesConfig)
     cli: LarkCLIConfig = Field(default_factory=LarkCLIConfig)
+    reply: FeishuHelpdeskReplyConfig = Field(default_factory=FeishuHelpdeskReplyConfig)
+    escalation: FeishuHelpdeskEscalationConfig = Field(
+        default_factory=FeishuHelpdeskEscalationConfig
+    )
 
     @model_validator(mode="after")
     def validate_enabled(self):

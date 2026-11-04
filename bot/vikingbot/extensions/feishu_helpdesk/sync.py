@@ -2,7 +2,7 @@
 
 import asyncio
 
-from vikingbot.extensions.feishu_helpdesk.decision import message_text
+from vikingbot.extensions.feishu_helpdesk.decision import message_text, open_id
 from vikingbot.extensions.feishu_helpdesk.state import timestamp
 
 
@@ -169,6 +169,21 @@ class HelpdeskSync:
                 msg["human"] = known["human"]
             if verify and (msg["human"] is None or not self.store.tickets[ticket_id]["chat_id"]):
                 await self._detail(ticket_id, msg)
+        else:
+            # Helpdesk polling returns internal message ids, not ``om_`` ids.
+            # Its user_id is still authoritative for guest/agent/system sources;
+            # leaving every such message unknown blocks conversation judgement.
+            item = self.store.tickets[ticket_id]
+            guest = open_id(item.get("guest"))
+            agents = {
+                open_id(user)
+                for user in (item.get("agents") or []) + (item.get("collaborators") or [])
+            }
+            sender = msg["sender"]
+            if not sender or msg["kind"] in ("system", "system_message"):
+                msg["human"] = False
+            elif sender == guest or sender in agents:
+                msg["human"] = True
         self.service.observe(ticket_id, msg)
 
     async def _detail(self, ticket_id, msg):

@@ -33,6 +33,9 @@ elif mode in ('credentials', 'secret_diagnostic'):
     reason = 'unsupported or invalid CLI credential format' if mode == 'credentials' else 'fake-user-secret'
     emit('result', outcome='rejected', error={'kind': 'credentials', 'reason': reason})
     sys.exit(0)
+elif mode == 'operation':
+    emit('result', outcome='rejected', error={'kind': 'operation', 'reason': 'close API refused the request', 'code': 154003})
+    sys.exit(0)
 emit('ready', app_id=request['app_id'], user_id=request['user_id'])
 control = json.loads(sys.stdin.readline())
 log({'action': control['action']})
@@ -188,6 +191,17 @@ async def test_credential_errors_are_actionable_but_only_fixed_diagnostics_are_d
     if mode == "credentials":
         assert "unsupported or invalid CLI credential format" in str(error.value)
     assert "fake-user-secret" not in str(error.value)
+    await assert_child_gone(adapter)
+
+
+@pytest.mark.asyncio
+async def test_operation_errors_display_only_fixed_diagnostics(adapter, monkeypatch):
+    monkeypatch.setenv("FAKE_CLOSE_MODE", "operation")
+    with pytest.raises(LarkCLIError) as error:
+        await adapter.close_ticket("123", "fake-service-secret", {"status": 51, "solved": 2})
+    assert error.value.rejected and error.value.code == 154003
+    assert "close API refused the request" in str(error.value)
+    assert "fake-service-secret" not in str(error.value)
     await assert_child_gone(adapter)
 
 

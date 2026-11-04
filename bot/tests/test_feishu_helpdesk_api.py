@@ -54,6 +54,48 @@ async def test_subscribes_lifecycle_and_message_events_with_helpdesk_and_tenant_
 
 
 @pytest.mark.asyncio
+async def test_bot_text_uses_official_im_api_with_tenant_identity():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {"message_id": "om_escalation", "create_time": "1793785559000"},
+            },
+        )
+
+    api = make_api(handler)
+    actors = []
+    try:
+        receipt = await api.send_bot_text(
+            "oc_escalation",
+            "升级提醒",
+            "uuid-1",
+            before_call=AsyncMock(side_effect=lambda actor: actors.append(actor) or 30),
+        )
+        assert receipt == {
+            "message_id": "om_escalation",
+            "create_time": "1793785559000",
+        }
+        request = requests[0]
+        assert request.url.path == "/open-apis/im/v1/messages"
+        assert request.url.params["receive_id_type"] == "chat_id"
+        assert request.headers["Authorization"] == "Bearer tenant_token"
+        assert json.loads(request.content) == {
+            "receive_id": "oc_escalation",
+            "msg_type": "text",
+            "content": json.dumps({"text": "升级提醒"}, ensure_ascii=False),
+            "uuid": "uuid-1",
+        }
+        assert actors == ["cli_bot"]
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
 async def test_read_time_filters_use_milliseconds_for_tickets_and_seconds_for_messages(monkeypatch):
     api = make_api(lambda request: httpx.Response(500))
     api._read = AsyncMock(return_value={"tickets": [], "messages": [], "total": 0})

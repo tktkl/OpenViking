@@ -178,19 +178,29 @@ async def test_late_old_ticket_notice_uses_its_chat_before_observing_new_ticket(
     desk, monkeypatch, legacy, same_chat
 ):
     service, api, clock = await initialized(desk)
-    service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
-    send = api.cli.send_text
-
-    async def lost_notice(*args, **kwargs):
-        await send(*args, **kwargs)
-        raise LarkCLIError("response lost", retryable=True)
-
-    api.cli.send_text = lost_notice
-    human(service, clock)
-    await drain(service)
-    out = service.store.pending_sends("t1")[0]
-    assert out["kind"] == "notice" and service.store.tickets["t1"]["status"] == 51
-    sent = api.cli.receipts[out["uuid"]]
+    item = service.store.tickets["t1"]
+    attempted_at = clock() - 1
+    text = service.config.helpdesk.messages.render(
+        service.config.helpdesk.messages.closed_resolved
+    )
+    service.store.save(item, status=51, closed_solved=2, notice_pending=True)
+    out = {
+        "ticket": "t1",
+        "chat_id": "oc_ticket",
+        "uuid": "lost-notice",
+        "text": text,
+        "kind": "notice",
+        "generation": item["generation"],
+        "attempted_at": attempted_at,
+        "actor": "ou_operator",
+        "cycle": 0,
+        "transport": "lark_cli",
+    }
+    service.store.save_outbox("t1:notice", out)
+    sent = {
+        "message_id": "om_lost_notice",
+        "create_time": int(attempted_at * 1000),
+    }
     if legacy:
         del out["chat_id"]
         service.store.save_outbox("t1:notice", out)
@@ -244,7 +254,7 @@ async def test_identical_pending_sends_in_one_chat_do_not_settle_the_wrong_ticke
 @pytest.mark.asyncio
 async def test_prefix_or_another_sender_cannot_impersonate_automatic_messages(desk):
     service, api, clock, out = await paused(desk)
-    assert service.native(native(clock, "om_prefixed", "【服务台自动消息】\n我手动补充")) == "pass"
+    assert service.native(native(clock, "om_prefixed", "【AI分身自动回复】\n我手动补充")) == "pass"
     assert service.native(native(clock, "om_other", out["text"], sender="ou_other")) == "pass"
     records = {m["im_id"]: m for m in service.store.messages("t1")}
     assert records["om_prefixed"]["human"] is True and records["om_other"]["human"] is True

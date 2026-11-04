@@ -133,6 +133,11 @@ class HelpdeskState:
                 "close_pending": None,
                 "notice_pending": False,
                 "paused": False,
+                "escalation_system": "",
+                "escalation_chat_id": "",
+                "escalation_started_at": None,
+                "escalation_last_sent": None,
+                "escalation_count": 0,
             }
         # Trusted chat identity is independent of the event's state version.
         # A scan can learn newer status before an older event supplies the group.
@@ -182,8 +187,21 @@ class HelpdeskState:
                 close_pending=None,
                 notice_pending=False,
                 retry_at=0,
+                escalation_system="",
+                escalation_chat_id="",
+                escalation_started_at=None,
+                escalation_last_sent=None,
+                escalation_count=0,
             )
-        for key in ("guest", "agents", "collaborators", "ticket_type", "channel"):
+        for key in (
+            "guest",
+            "agents",
+            "collaborators",
+            "ticket_type",
+            "channel",
+            "actual_agent_group",
+            "hit_agent_groups",
+        ):
             if key in ticket:
                 values[key] = ticket[key]
         candidate = {**old, **values}
@@ -202,6 +220,10 @@ class HelpdeskState:
                 "INSERT OR REPLACE INTO outbox VALUES (?,?)",
                 (key, json.dumps(value, ensure_ascii=False)),
             )
+
+    def delete_outbox(self, key):
+        with self.db:
+            self.db.execute("DELETE FROM outbox WHERE id=?", (key,))
 
     def _rebase_pending_outboxes(self, ticket_id, chat_id):
         """Move unconfirmed sends to the ticket's canonical chat."""
@@ -231,6 +253,7 @@ class HelpdeskState:
             for value in values
             if value.get("ticket") == ticket_id
             and not value.get("message_id")
+            and not value.get("dead_letter")
             and value.get("attempted_at") is not None
         ]
 
@@ -245,8 +268,11 @@ class HelpdeskState:
             return False
         # Receipts are few (welcome + two per human round). Keep them across restarts.
         return any(
-            json.loads(value).get("message_id") == message_id
-            for (value,) in self.db.execute("SELECT value FROM outbox")
+            message_id in (value.get("message_id"), value.get("im_message_id"))
+            for value in (
+                json.loads(row[0])
+                for row in self.db.execute("SELECT value FROM outbox")
+            )
         )
 
     def observe(self, ticket_id, message):

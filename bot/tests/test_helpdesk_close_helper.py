@@ -176,7 +176,7 @@ async def test_commit_must_match_request_and_protocol(operation, control):
         (200, {"code": False, "data": {}}, "uncertain", False),
         (200, {"code": "0", "data": {}}, "uncertain", False),
         (200, ["unexpected"], "uncertain", False),
-        (200, {"code": 0}, "uncertain", False),
+        (200, {"code": 0}, "accepted", False),
         (302, {"code": 0, "data": {}}, "uncertain", False),
     ],
 )
@@ -186,8 +186,12 @@ async def test_api_failure_is_classified_without_retry(
     operation.response.update(status=status, body=body)
     await operation.op.run()
     assert len(operation.calls) == 1
-    assert operation.records[-1]["outcome"] == outcome
-    assert operation.records[-1]["error"]["authentication"] is authentication
+    record = operation.records[-1]
+    assert record["outcome"] == outcome
+    if outcome == "accepted":
+        assert "error" not in record
+    else:
+        assert record["error"]["authentication"] is authentication
 
 
 @pytest.mark.asyncio
@@ -327,6 +331,50 @@ async def test_official_cli_dry_run_and_user_read_are_checked_before_ready(
     read = next(i for i, args in enumerate(calls) if "/open-apis/authen/v1/user_info" in args)
     assert dry < read
     assert all("fake-service-token" not in json.dumps(args) for args in calls)
+
+
+@pytest.mark.asyncio
+async def test_official_cli_current_dry_run_context_identity_is_accepted(
+    request_data, monkeypatch
+):
+    probe = helper.CLIProbe(helper.CloseRequest.parse(request_data))
+    config = {"profile": "support", "workspace": "local", "appId": "cli_bot", "brand": "feishu"}
+    status = {
+        "appId": "cli_bot",
+        "brand": "feishu",
+        "identities": {
+            "user": {
+                "openId": "ou_agent",
+                "available": True,
+                "status": "ready",
+                "tokenStatus": "valid",
+            }
+        },
+    }
+
+    async def run(*args):
+        if args[:2] == ("config", "show"):
+            return config
+        if args[:2] == ("auth", "status"):
+            return status
+        if "--dry-run" in args:
+            return {
+                "ok": True,
+                "identity": "user",
+                "dry_run": True,
+                "data": {
+                    "api": [{"method": "PUT", "url": request_data["ticket_id"]}],
+                    "context": {"app_id": "cli_bot", "user_open_id": "ou_agent"},
+                },
+            }
+        return {"ok": True, "identity": "user", "data": {"open_id": "ou_agent"}}
+
+    monkeypatch.setattr(helper, "verify_profile", lambda *a, **kw: None)
+    for key in PROVIDER_ENV:
+        monkeypatch.delenv(key, raising=False)
+    probe.run = AsyncMock(side_effect=run)
+    session = await probe.prepare()
+    assert session.user_id == "ou_agent"
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from vikingbot.bus.queue import MessageBus
 from vikingbot.config.schema import FeishuChannelConfig
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
 from vikingbot.extensions.feishu_helpdesk.decision import WELCOME, ConversationJudge, Decision
-from vikingbot.extensions.feishu_helpdesk.followup import HelpdeskFollowup
+from vikingbot.extensions.feishu_helpdesk.followup import HelpdeskFollowup, StaleAction
 from vikingbot.extensions.feishu_helpdesk.state import HelpdeskState
 from vikingbot.providers.base import LLMResponse
 
@@ -73,9 +73,22 @@ class FakeAPI:
     def __init__(self, clock):
         self.clock, self.tickets, self.messages = clock, {}, {}
         self.cli = FakeCLI(self, clock)
+        self.send_bot_text = AsyncMock(side_effect=self._send_bot_text)
         self.ticket = AsyncMock(side_effect=lambda tid: copy.deepcopy(self.tickets[tid]))
         self.messages_page = AsyncMock(side_effect=self._messages)
         self.tickets_page = AsyncMock(side_effect=self._tickets)
+
+    async def _send_bot_text(self, chat, text, key, *, before_call):
+        await before_call("cli_bot")
+        if self.cli.fail_send:
+            raise LarkCLIError("timed out", retryable=True)
+        if key not in self.cli.receipts:
+            self.cli.sends.append((chat, text, key))
+            self.cli.receipts[key] = {
+                "message_id": f"om_bot{len(self.cli.sends)}",
+                "create_time": int(self.clock() * 1000),
+            }
+        return self.cli.receipts[key]
 
     def _tickets(self, field, start, end, page):
         rows = [
@@ -102,7 +115,15 @@ async def desk(tmp_path):
     services = []
 
     async def create(
-        *, minutes=5, path=None, clock=None, api=None, bus=None, session_busy=None, messages=None
+        *,
+        minutes=5,
+        path=None,
+        clock=None,
+        api=None,
+        bus=None,
+        session_busy=None,
+        messages=None,
+        escalation=None,
     ):
         clock = clock or Clock()
         config = FeishuChannelConfig(
@@ -113,6 +134,7 @@ async def desk(tmp_path):
                 "helpdesk_token": "fake",
                 "followup_interval_minutes": minutes,
                 "messages": messages or {},
+                **({"escalation": escalation} if escalation is not None else {}),
             },
         )
         api = api or FakeAPI(clock)
@@ -193,8 +215,8 @@ def test_interval_is_a_strict_positive_integer(value):
         FeishuChannelConfig(helpdesk={"followup_interval_minutes": value})
 
 
-def test_interval_defaults_to_five_minutes():
-    assert FeishuChannelConfig().helpdesk.followup_interval_minutes == 5
+def test_interval_defaults_to_three_minutes():
+    assert FeishuChannelConfig().helpdesk.followup_interval_minutes == 3
 
 
 @pytest.mark.asyncio
@@ -989,6 +1011,8 @@ async def test_judge_has_independent_budget_and_requires_latest_evidence():
     assert result.scenario == "unknown"
     call = provider.chat.call_args.kwargs
     assert not call["tools"] and not call["thinking"]
+    assert call["max_tokens"] == 1024
+    assert call["reasoning_effort"] == "none"
     from openviking.utils.token_estimation import estimate_serialized_tokens
 
     assert estimate_serialized_tokens(call["messages"]) <= 3000
@@ -1299,7 +1323,7 @@ async def test_uncertain_open_close_is_reconciled_without_replaying_put(desk, tm
     api.tickets["t1"].update(
         status=51,
         solve=2,
-        comments={"content": attempts[0]["comment"]},
+        comments=[{"content": attempts[0]["comment"]}],
         updated_at=int(clock() * 1000),
     )
     clock.advance(60)
@@ -1309,6 +1333,61 @@ async def test_uncertain_open_close_is_reconciled_without_replaying_put(desk, tm
     assert service.store.tickets["t1"]["close_pending"] is None
     await drain(service)
     assert len(api.cli.sends) == 2
+
+
+@pytest.mark.asyncio
+async def test_closed_ticket_notice_failure_is_dead_lettered_without_retry(desk):
+    service, api, clock = await desk()
+    item = add_ticket(service, api, clock)
+    service.store.save(
+        item,
+        status=51,
+        closed_solved=1,
+        notice_pending=True,
+        retry_at=clock() + 60,
+    )
+    api.cli.fail_send = True
+
+    await service._notice(service.store.tickets["t1"])
+
+    current = service.store.tickets["t1"]
+    out = service.store.outbox("t1:notice")
+    assert current["status"] == 51
+    assert current["notice_pending"] is False
+    assert current["retry_at"] == 0
+    assert out["attempted_at"] is not None
+    assert out["dead_letter"] is True
+    assert not service._due(current)
+
+
+@pytest.mark.asyncio
+async def test_startup_retires_previously_attempted_closed_notice(desk):
+    service, api, clock = await desk()
+    item = add_ticket(service, api, clock)
+    service.store.save(
+        item,
+        status=51,
+        closed_solved=1,
+        notice_pending=True,
+        retry_at=clock() + 60,
+    )
+    service.store.save_outbox(
+        "t1:notice",
+        {
+            "ticket": "t1",
+            "kind": "notice",
+            "attempted_at": clock() - 1,
+            "text": "closed",
+        },
+    )
+
+    service._retire_attempted_closed_notices()
+
+    current = service.store.tickets["t1"]
+    out = service.store.outbox("t1:notice")
+    assert current["notice_pending"] is False
+    assert current["retry_at"] == 0
+    assert out["dead_letter"] is True
 
 
 @pytest.mark.asyncio
@@ -1534,3 +1613,366 @@ def test_state_is_single_owner_and_can_merge_two_previously_distinct_aliases(tmp
         assert len(state.messages("t")) == 1
     finally:
         state.close()
+
+
+@pytest.mark.asyncio
+async def test_web_numeric_receipt_links_later_im_echo(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock)
+    key = "t1:welcome"
+    service.store.save_outbox(
+        key,
+        {
+            "ticket": "t1",
+            "chat_id": "oc_ticket",
+            "uuid": "stable",
+            "text": "【AI分身自动回复】\n你好",
+            "kind": "welcome",
+            "generation": 1,
+            "attempted_at": clock.now,
+            "actor": "ou_operator",
+            "message_id": "7704209428689505542",
+            "transport": "feishu_web",
+            "cycle": 0,
+        },
+    )
+    assert service.delivery.observe(
+        "t1",
+        {
+            "im_id": "om_echo",
+            "sender": "ou_service_desk",
+            "text": "【AI分身自动回复】\n你好",
+            "time": clock.now + 1,
+        },
+    )
+    receipt = service.store.outbox(key)
+    assert receipt["message_id"] == "7704209428689505542"
+    assert receipt["im_message_id"] == "om_echo"
+    assert service.store.automatic("om_echo")
+
+
+@pytest.mark.asyncio
+async def test_followup_pauses_when_actor_is_not_a_ticket_agent(desk):
+    service, api, clock = await desk()
+    item = add_ticket(service, api, clock)
+    service.reply_sender = SimpleNamespace(can_send=lambda ticket: False)
+    with pytest.raises(StaleAction):
+        await service._send(item, "welcome", "hello")
+    current = service.store.tickets["t1"]
+    assert current["paused"] is True
+    assert current["pause_reason"] == "actor_not_assigned"
+    assert service.store.outbox("t1:welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_numeric_helpdesk_messages_get_provenance_from_ticket_participants(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock)
+    api.messages["t1"] = [
+        {
+            "id": "tm_guest",
+            "message_id": "7704222585776524536",
+            "created_at": int(clock() * 1000),
+            "content": "供应链管理人工客服（SCM）",
+            "user_id": "ou_guest",
+            "message_type": "text",
+        },
+        {
+            "id": "tm_system",
+            "message_id": "7704222618425904137",
+            "created_at": int(clock() * 1000),
+            "content": "已分配人工",
+            "user_id": "",
+            "message_type": "text",
+        },
+    ]
+    await service.reconcile()
+    messages = {m["ticket_id"]: m for m in service.store.messages("t1")}
+    assert messages["tm_guest"]["human"] is True
+    assert messages["tm_system"]["human"] is False
+
+
+@pytest.mark.asyncio
+async def test_start_repairs_legacy_numeric_message_provenance(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock)
+    service.store.observe(
+        "t1",
+        {
+            "ticket_id": "tm_guest",
+            "im_id": "7704222585776524536",
+            "sender": "ou_guest",
+            "human": None,
+            "time": clock() - 60,
+            "text": "供应链管理人工客服（SCM）",
+            "kind": "text",
+        },
+    )
+    service.store.observe(
+        "t1",
+        {
+            "ticket_id": "tm_system",
+            "im_id": "7704222618425904137",
+            "sender": "",
+            "human": None,
+            "time": clock() - 59,
+            "text": "已分配人工",
+            "kind": "text",
+        },
+    )
+    service._reclassify_numeric_messages()
+    messages = {m["ticket_id"]: m for m in service.store.messages("t1")}
+    assert messages["tm_guest"]["human"] is True
+    assert messages["tm_system"]["human"] is False
+    assert service.store.tickets["t1"]["last_human"] == clock()
+
+
+@pytest.mark.asyncio
+async def test_judge_accepts_json_inside_model_prose_and_fences():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=(
+                    "分析如下，仅返回 JSON：\n```json\n"
+                    + json.dumps(
+                        {
+                            "scenario": "awaiting_details",
+                            "evidence_ids": ["om_1"],
+                            "reason": "客户只选择了分类",
+                            "followup": "请补充具体问题。",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n```\n以上。"
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}},
+        [
+            {
+                "im_id": "om_1",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "供应链管理人工客服（SCM）",
+                "time": 1,
+            }
+        ],
+    )
+    assert result.scenario == "awaiting_details"
+    assert result.followup == "请补充具体问题。"
+
+
+@pytest.mark.asyncio
+async def test_judge_coalesces_ticket_and_im_echo_before_evidence_validation():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_confirmation",
+                        "evidence_ids": ["om_answer", "om_exception"],
+                        "reason": "处理方补充例外后等待业务确认",
+                        "followup": "请确认是否已解答。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": []},
+        [
+            {
+                "ticket_id": "tm_question",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "问题是什么？",
+                "time": 1,
+            },
+            {
+                "ticket_id": "tm_answer",
+                "human": True,
+                "sender": "ou_relay",
+                "text": "这是答案。",
+                "time": 2,
+            },
+            {
+                "im_id": "om_answer",
+                "human": True,
+                "sender": "ou_different_relay",
+                "text": "这是答案。",
+                "time": 2,
+            },
+            {
+                "ticket_id": "tm_exception",
+                "human": True,
+                "sender": "ou_relay",
+                "text": "但还有一个例外。",
+                "time": 3,
+            },
+            {
+                "im_id": "om_exception",
+                "human": True,
+                "sender": "ou_different_relay",
+                "text": "但还有一个例外。",
+                "time": 3,
+            },
+        ],
+    )
+    assert result.scenario == "awaiting_confirmation"
+    prompt_messages = json.loads(provider.chat.await_args.kwargs["messages"][1]["content"])
+    assert [item["id"] for item in prompt_messages] == [
+        "tm_question",
+        "om_answer",
+        "om_exception",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_judge_trusts_human_relay_sender_as_processing_side():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_confirmation",
+                        "evidence_ids": ["om_answer", "om_thanks", "om_exception"],
+                        "reason": "处理方给出结论后又补充例外，等待业务确认",
+                        "followup": "请确认上述说明是否已解答您的问题。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_named_agent"}]},
+        [
+            {
+                "im_id": "om_question",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "企划变更后的推送范围是什么？",
+                "time": 1,
+            },
+            {
+                "im_id": "om_answer",
+                "human": True,
+                "sender": "ou_relay_agent",
+                "text": "只会推送给当前企划和当前设计师。",
+                "time": 2,
+            },
+            {
+                "im_id": "om_thanks",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "好的，谢谢",
+                "time": 3,
+            },
+            {
+                "im_id": "om_exception",
+                "human": True,
+                "sender": "ou_relay_agent",
+                "text": "但预报价评审的范围会更大。",
+                "time": 4,
+            },
+        ],
+    )
+    assert result.scenario == "awaiting_confirmation"
+    assert result.followup == "请确认上述说明是否已解答您的问题。"
+
+
+@pytest.mark.asyncio
+async def test_judge_accepts_awaiting_details_despite_unrelated_latest_chatter():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_details",
+                        "evidence_ids": ["om_guest"],
+                        "reason": "业务仅选择了服务分类，尚未描述具体问题",
+                        "followup": "请补充具体遇到的问题。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_agent"}]},
+        [
+            {
+                "im_id": "om_guest",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "供应链管理人工客服（SCM）",
+                "time": 1,
+            },
+            {
+                "im_id": "om_chatter",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "我已经重启 拉闸",
+                "time": 2,
+            },
+        ],
+    )
+    assert result.scenario == "awaiting_details"
+    assert result.followup == "请补充具体遇到的问题。"
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_stops_receipt_reconciliation(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock)
+    service.store.save(
+        service.store.tickets["t1"], paused=True, pause_reason="receipt_expired"
+    )
+    service.store.save_outbox(
+        "t1:welcome",
+        {
+            "ticket": "t1",
+            "chat_id": "oc_ticket",
+            "kind": "welcome",
+            "attempted_at": clock() - 4000,
+            "actor": "ou_operator",
+            "text": "hello",
+        },
+    )
+    await service.delivery.reconcile()
+    assert service.store.outbox("t1:welcome")["dead_letter"] is True
+    assert service.store.pending_sends("t1") == []
+    api.cli.chat_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_close_failure_does_not_block_due_second_reminder(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge = AsyncMock(
+        side_effect=[
+            Decision("resolved", reason="业务确认恢复"),
+            Decision("awaiting_details", "请补充问题。"),
+        ]
+    )
+    human(service, clock)
+    clock.advance(300)
+
+    async def refused(*args, **kwargs):
+        raise LarkCLIError("close refused", rejected=True)
+
+    api.cli.close_ticket = refused
+    await drain(service)
+    assert len(api.cli.sends) == 1
+    assert service.store.tickets["t1"]["retry_at"] == clock() + 5
+
+    clock.advance(5)
+    await drain(service)
+    assert len(api.cli.sends) == 2
+    assert "请补充问题" in api.cli.sends[-1][1]
