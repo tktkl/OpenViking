@@ -8,13 +8,14 @@ from vikingbot.extensions.feishu_helpdesk.state import timestamp
 
 def page_items(data, field):
     items, total = data.get(field), data.get("total")
-    if (
-        not isinstance(items, list)
-        or not all(isinstance(i, dict) for i in items)
-        or isinstance(total, bool)
-        or not isinstance(total, int)
-        or total < 0
-    ):
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise ValueError("Incomplete Helpdesk page")
+    # The Helpdesk list API returns ``null`` instead of ``[]`` when a valid
+    # time window contains no tickets. Treat only that zero-total shape as an
+    # empty page; a null list with a positive total is still incomplete data.
+    if items is None and total == 0:
+        return [], total
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
         raise ValueError("Incomplete Helpdesk page")
     return items, total
 

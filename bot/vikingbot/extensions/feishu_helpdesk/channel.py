@@ -189,7 +189,16 @@ class FeishuHelpdeskChannel(FeishuChannel):
             return
         chat = getattr(event, "chat_id", "") or ""
         if chat.startswith("oc_") and item["chat_id"] and item["chat_id"] != chat:
-            raise ValueError("Conflicting ticket chat identity")
+            # A stale create event may carry a transient chat ID. Resolve the
+            # conflict against canonical ticket detail before rejecting the
+            # message or binding follow-up automation to the wrong group.
+            item = service.register(
+                await self._helpdesk_api.ticket(ticket_id), authoritative=True
+            )
+            if item is None or item["status"] in CLOSED_STATUSES:
+                return
+            if item["chat_id"] and item["chat_id"] != chat:
+                raise ValueError("Conflicting ticket chat identity")
         if chat.startswith("oc_") and (not item["chat_id"] or item["chat_id"] == chat):
             service.store.save(item, chat_id=chat)
         service.observe(
@@ -314,14 +323,25 @@ class FeishuHelpdeskChannel(FeishuChannel):
             return
         if str(ticket.helpdesk_id or "") != self.config.helpdesk.helpdesk_id:
             return
+        item = None
         if self._followup is not None and self._followup.running:
-            item = self._followup.register(_ticket_data(ticket), chat_id=ticket.chat_id or "")
+            try:
+                item = self._followup.register(
+                    _ticket_data(ticket), chat_id=ticket.chat_id or ""
+                )
+            except ValueError:
+                # Creation events can expose a transient chat ID. Canonical
+                # detail owns the durable ticket-group binding.
+                item = self._followup.register(
+                    await self._helpdesk_api.ticket(str(ticket.ticket_id or "")),
+                    authoritative=True,
+                )
             if item is not None:
                 self._followup.dirty(item["id"])
                 if item["status"] in CLOSED_STATUSES:
                     await self._restore_ticket(item)
                     return
-        chat_id = ticket.chat_id or ""
+        chat_id = (item["chat_id"] if item is not None else "") or ticket.chat_id or ""
         ticket_id = str(ticket.ticket_id or "")
         if not chat_id.startswith("oc_") or not ticket_id:
             # Creation can precede group creation; updated_v1 supplies its eventual chat_id.

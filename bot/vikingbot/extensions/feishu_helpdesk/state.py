@@ -6,7 +6,32 @@ import json
 import math
 import os
 import sqlite3
+import uuid
 from pathlib import Path
+
+
+def _identity_signature(ticket):
+    """Stable ticket participants; Feishu profile/CDN fields are volatile."""
+
+    def ids(value):
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return ()
+        return tuple(
+            sorted(
+                str(row.get("id") or row.get("agent_id") or row.get("user_id") or "")
+                for row in value
+                if isinstance(row, dict)
+            )
+        )
+
+    guest = ticket.get("guest")
+    return (
+        str(guest.get("id") or "") if isinstance(guest, dict) else "",
+        ids(ticket.get("agents")),
+        ids(ticket.get("collaborators")),
+    )
 
 
 class HelpdeskState:
@@ -42,6 +67,8 @@ class HelpdeskState:
                 key: json.loads(value)
                 for key, value in self.db.execute("SELECT id, value FROM tickets")
             }
+            for ticket_id, item in self.tickets.items():
+                self._rebase_pending_outboxes(ticket_id, item.get("chat_id", ""))
         except BaseException:
             if hasattr(self, "db"):
                 self.db.close()
@@ -75,6 +102,7 @@ class HelpdeskState:
 
     def register(self, ticket, now, *, chat_id="", authoritative=False):
         ticket_id = str(ticket.get("ticket_id") or "")
+        chat_id = chat_id or str(ticket.get("chat_id") or "")
         old = self.tickets.get(ticket_id)
         created = timestamp(ticket.get("created_at"))
         if not ticket_id or (
@@ -110,8 +138,14 @@ class HelpdeskState:
         # A scan can learn newer status before an older event supplies the group.
         if chat_id.startswith("oc_"):
             if old["chat_id"] and old["chat_id"] != chat_id:
-                raise ValueError("Conflicting ticket chat identity")
-            if not old["chat_id"]:
+                if not authoritative:
+                    raise ValueError("Conflicting ticket chat identity")
+                # Ticket detail is the canonical source. Feishu can emit a
+                # transient chat during creation and replace it with the real
+                # ticket group in a later event/detail read.
+                old = self.save(old, chat_id=chat_id)
+                self._rebase_pending_outboxes(ticket_id, chat_id)
+            elif not old["chat_id"]:
                 old = self.save(old, chat_id=chat_id)
         updated = timestamp(ticket.get("updated_at"))
         if updated is not None and updated < old["updated"]:
@@ -152,9 +186,8 @@ class HelpdeskState:
         for key in ("guest", "agents", "collaborators", "ticket_type", "channel"):
             if key in ticket:
                 values[key] = ticket[key]
-        if status != old["status"] or any(
-            values.get(k, old.get(k)) != old.get(k) for k in ("guest", "agents", "collaborators")
-        ):
+        candidate = {**old, **values}
+        if status != old["status"] or _identity_signature(candidate) != _identity_signature(old):
             values["generation"] = old["generation"] + 1
             values["evaluated_generation"] = -1
         return self.save(old, **values)
@@ -169,6 +202,27 @@ class HelpdeskState:
                 "INSERT OR REPLACE INTO outbox VALUES (?,?)",
                 (key, json.dumps(value, ensure_ascii=False)),
             )
+
+    def _rebase_pending_outboxes(self, ticket_id, chat_id):
+        """Move unconfirmed sends to the ticket's canonical chat."""
+        if not chat_id:
+            return
+        for key, out in self.outboxes():
+            if (
+                out.get("ticket") == ticket_id
+                and not out.get("message_id")
+                and out.get("chat_id") != chat_id
+            ):
+                self.save_outbox(
+                    key,
+                    {
+                        **out,
+                        "chat_id": chat_id,
+                        "uuid": str(uuid.uuid4()),
+                        "attempted_at": None,
+                        "actor": None,
+                    },
+                )
 
     def pending_sends(self, ticket_id):
         values = (json.loads(value) for (value,) in self.db.execute("SELECT value FROM outbox"))

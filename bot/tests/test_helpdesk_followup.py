@@ -889,6 +889,68 @@ def test_late_chat_binding_rejects_conflicts_and_preserves_ticket_state(tmp_path
         with pytest.raises(ValueError, match="Conflicting"):
             state.register(stale, clock(), chat_id="oc_other")
         assert state.tickets["t1"] == bound
+        state.save_outbox(
+            "t1:welcome",
+            {
+                "ticket": "t1",
+                "chat_id": "oc_ticket",
+                "uuid": "old-uuid",
+                "attempted_at": clock(),
+                "actor": "ou_operator",
+            },
+        )
+        corrected = state.register(
+            {
+                **ticket,
+                "status": latest["status"],
+                "updated_at": int(latest["updated"] * 1000),
+            },
+            clock(),
+            chat_id="oc_authoritative",
+            authoritative=True,
+        )
+        assert corrected["chat_id"] == "oc_authoritative"
+        rebased = state.outbox("t1:welcome")
+        assert rebased["chat_id"] == "oc_authoritative"
+        assert rebased["uuid"] != "old-uuid"
+        assert rebased["attempted_at"] is None
+        assert rebased["actor"] is None
+    finally:
+        state.close()
+
+
+def test_ticket_generation_ignores_volatile_profile_fields(tmp_path):
+    clock = Clock()
+    state = HelpdeskState(tmp_path / "state.sqlite3", clock())
+    try:
+        ticket = {
+            "ticket_id": "t1",
+            "created_at": int(clock() * 1000),
+            "status": 2,
+            "guest": {"id": "ou_guest", "avatar_url": "https://s1.example/avatar"},
+            "agents": [{"id": "ou_agent", "avatar_url": "https://s1.example/agent"}],
+        }
+        first = state.register(ticket, clock())
+        second = state.register(
+            {
+                **ticket,
+                "guest": {**ticket["guest"], "avatar_url": "https://s2.example/avatar"},
+                "agents": [
+                    {**ticket["agents"][0], "avatar_url": "https://s3.example/agent"}
+                ],
+            },
+            clock(),
+        )
+        assert second["generation"] == first["generation"]
+
+        changed = state.register(
+            {
+                **ticket,
+                "agents": [*ticket["agents"], {"id": "ou_second_agent"}],
+            },
+            clock(),
+        )
+        assert changed["generation"] == first["generation"] + 1
     finally:
         state.close()
 
@@ -955,6 +1017,18 @@ async def test_discovery_cursors_overlap_and_advance_independently(desk):
     queries = [c.args for c in api.tickets_page.call_args_list]
     assert queries[0] == ("create", activated + 60, clock(), 1)
     assert queries[1] == ("update", activated, clock(), 1)
+
+
+@pytest.mark.asyncio
+async def test_empty_discovery_accepts_null_ticket_list(desk):
+    service, api, clock = await desk()
+    clock.advance(120)
+    api.tickets_page.return_value = {"tickets": None, "total": 0}
+
+    await service.sync.discover()
+
+    assert service.store.meta("create_cursor") == clock()
+    assert service.store.meta("update_cursor") == clock()
 
 
 @pytest.mark.asyncio
@@ -1431,7 +1505,13 @@ async def test_real_ticket_message_event_and_native_im_merge_without_duplicate_r
         assert service.store.tickets["t1"]["generation"] == generation
         assert len(service.store.messages("t1")) == 1
         native.assert_awaited_once_with(msg)  # Helpdesk event is monitor-only
+        channel._helpdesk_api.ticket = AsyncMock(
+            return_value={**api.tickets["t1"], "chat_id": "oc_unrelated"}
+        )
         event.event.chat_id = "oc_unrelated"
+        await channel._on_ticket_message(event)
+        assert service.store.tickets["t1"]["chat_id"] == "oc_unrelated"
+        event.event.chat_id = "oc_wrong"
         with pytest.raises(ValueError, match="Conflicting"):
             await channel._on_ticket_message(event)
     finally:
