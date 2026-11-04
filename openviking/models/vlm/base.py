@@ -1017,6 +1017,7 @@ class MultiCredentialVLM(VLMBase):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously with multi-credential failover support."""
         return await self._get_completion_with_failover_async(
@@ -1027,6 +1028,7 @@ class MultiCredentialVLM(VLMBase):
             tool_choice=tool_choice,
             messages=messages,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
         )
 
     def get_vision_completion(

@@ -292,10 +292,11 @@ class VLMProviderAdapter(LLMProvider):
             # An explicit empty list asks VLM backends for a structured response
             # without exposing tools, so per-response usage is preserved.
             response_tools = tools if tools is not None else []
-            # Effort overrides are scoped to the native Ark backend, not compatible APIs.
+            # Only backends with explicit effort support receive the override.
             completion_overrides = (
                 {"reasoning_effort": reasoning_effort}
-                if reasoning_effort is not None and self._vlm.provider == "volcengine"
+                if reasoning_effort is not None
+                and self._vlm.provider in {"openai", "azure", "volcengine"}
                 else {}
             )
             result = await self._vlm.get_completion_async(

@@ -61,6 +61,25 @@ def test_vlm_adapter_uses_litellm_resolved_provider_for_tool_result_media():
     assert provider.supports_tool_result_media() is True
 
 
+@pytest.mark.asyncio
+async def test_vlm_adapter_forwards_reasoning_override_to_openai_backend():
+    vlm = SimpleNamespace(
+        provider="openai",
+        thinking=True,
+        get_completion_async=MagicMock(),
+    )
+    vlm.get_completion_async = pytest.importorskip("unittest.mock").AsyncMock(return_value="ok")
+    provider = VLMProviderAdapter(vlm, default_model="deepseek-flash")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+    )
+
+    assert response.content == "ok"
+    assert vlm.get_completion_async.await_args.kwargs["reasoning_effort"] == "none"
+
+
 def test_vlm_adapter_honors_explicit_tool_result_media_override():
     langfuse = SimpleNamespace()
     openai = VLMProviderAdapter(

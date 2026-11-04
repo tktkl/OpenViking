@@ -57,6 +57,21 @@ class TestOpenAITextCompletionParams:
         assert "max_completion_tokens" not in kwargs
         assert kwargs["temperature"] == 0.3
 
+    def test_per_call_reasoning_effort_can_disable_reasoning(self):
+        vlm = OpenAIVLM(
+            {
+                "api_key": "sk-test",
+                "model": "deepseek-flash",
+                "api_base": "https://example.test/v1",
+                "max_tokens": 512,
+            }
+        )
+        kwargs = vlm._build_text_kwargs(
+            prompt="hi", max_tokens=1024, reasoning_effort="none"
+        )
+        assert kwargs["max_tokens"] == 1024
+        assert kwargs["reasoning_effort"] == "none"
+
     def test_gpt4o_mini_keeps_max_tokens_and_temperature(self):
         vlm = OpenAIVLM(
             {
