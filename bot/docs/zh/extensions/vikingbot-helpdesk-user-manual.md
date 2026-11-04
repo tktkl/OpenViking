@@ -1,8 +1,8 @@
 # VikingBot 会话并发与飞书服务台使用手册
 
-本手册独立维护，适用于 `codex/vikingbot-helpdesk-followup` 分支中的会话并发、服务台主动跟进和 Python 独立关单功能，便于后续合并上游时保留。部署代码应包含 `bd914254f`（Python 独立关单）及 `cbc132779`（授权拒绝后的恢复修复）或包含这些改动的后续提交。普通 PyPI 发行包不保证包含本分支功能。
+本手册独立维护，适用于 `codex/vikingbot-helpdesk-followup` 分支中的会话并发、服务台主动跟进、Web Messenger 工单回复、普通 IM 升级和 Python 独立关单功能，便于后续合并上游时保留。部署代码应包含 Python 独立关单、发送恢复、升级和关单兼容修复。普通 PyPI 发行包不保证包含本分支功能。
 
-已有部署的升级步骤是：更新含上述功能的 VikingBot、保留官方 Lark CLI 的登录态、合并下面的配置，然后重启原有 Gateway。曾使用补丁版 CLI 的部署，把 `helpdesk.cli.executable` 改回官方 CLI；不需要编译 CLI、安装 Go、配置外置关单脚本或迁移 SQLite。
+已有部署的升级步骤是：更新 VikingBot 代码、保留官方 Lark CLI 登录态和 auth-mcp 的 `feishu_helpdesk` Web 会话、合并下面的配置，然后重启 Gateway。不要把 `reply.mode` 设为 `feishu_web` 后只保留 CLI 登录；Web 会话 Cookie 和 CLI 授权是两套独立认证。SQLite 结构只新增可选字段，无须删库迁移。
 
 ## 1. 部署前准备
 
@@ -16,7 +16,10 @@
 | 服务台 ID、服务台 Token | 在服务台管理后台“设置中心 → API 凭证”获取；用于服务台读取、订阅及关单请求头 |
 | CLI 当前用户 | 有目标工单权限的客服、管理员或所有者；能够访问关联群，并具有所需邀请权限 |
 | 应用权限及发布 | 开通服务台读取/订阅权限 `helpdesk:all:readonly`，保留原有机器人消息与成员查询权限；完成应用发布和所需租户审批 |
-| 用户 OAuth 授权 | 关单需要 `helpdesk:all`；发送、读消息、邀请 Bot 及续期还需要下文列出的权限 |
+| 用户 OAuth 授权 | 关单需要 `helpdesk:all`；CLI 读取、邀请 Bot 及续期还需要下文列出的权限 |
+| auth-mcp Web 会话 | `reply.mode="feishu_web"` 需要 `wangoon-auth-mcp` 的 `feishu_helpdesk` prod profile 为 ready，并提供完整原始 Cookie；Cookie 不写日志、不落盘 |
+| 无头浏览器与依赖 | 自动解析 `oc_* → feed_id` 需要 Chromium/Playwright 可执行文件和 `websocket-client`；也可用 `reply.feed_ids` 手工固定映射 |
+| 升级群 Bot 成员关系 | `escalation.sender="bot"` 时当前应用 Bot 必须已在每个升级群中；发送走官方 IM API，不使用 Web Cookie |
 
 开放平台事件接收方式沿用长连接，保留标准 IM 事件 `im.message.receive_v1`。扩展在启动时调用服务台订阅接口，复用同一条长连接接收工单创建、更新及 `helpdesk.ticket_message.created_v1`。无须新建 Webhook 或 cron。
 
@@ -80,7 +83,7 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 
 核对应用、品牌、当前用户及授权权限。`auth status` 检查本地状态，最后一条只读请求验证实际用户授权，并由 CLI 在需要时续期。新增权限时，先开通应用权限并发布，再重新进行用户授权。
 
-欢迎、提醒、关闭说明、IM 查询及续期由官方 CLI 以当前用户执行；Python 子进程读取这个用户的现有加密凭据，只负责固定的服务台关单请求。凭据只在子进程内存使用，不导出 Token、不另存凭据、不自行使用 refresh token 续期。
+工单群的欢迎、提醒和关闭说明在 `reply.mode="feishu_web"` 下使用 auth-mcp 的 Web 会话身份；普通 IM 升级群默认使用应用 Bot 官方 IM API；工单消息读取、回执对账、Bot 入群、授权检查和续期仍由官方 CLI 以当前用户执行。Python 子进程读取该用户的现有加密凭据，只负责固定的服务台关单请求。凭据只在子进程内存使用，不导出 Token、不另存凭据、不自行使用 refresh token 续期。
 
 初版关单仅支持本地 profile 登录。环境 Token、环境应用凭据、自定义 provider 或未知凭据格式会使关单暂缓。macOS 后台进程还必须能读取原有文件主密钥或访问对应 Keychain；建议使用实际服务运行方式完成测试。
 
@@ -108,13 +111,43 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
           "enabled": true,
           "helpdesk_id": "<服务台 ID>",
           "helpdesk_token": "<服务台 Token>",
-          "followup_interval_minutes": 5,
+          "followup_interval_minutes": 3,
           "messages": {
-            "prefix": "【服务台自动消息】",
-            "welcome": "你好，请描述遇到的问题，并补充相关截图或报错信息。",
+            "prefix": "【AI分身自动回复】",
+            "welcome": "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
             "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+            "escalation_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
             "closed_resolved": "问题已解决，工单已关闭。",
             "closed_timeout": "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+          },
+          "reply": {
+            "mode": "feishu_web",
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "feishu_helpdesk",
+            "environment": "prod",
+            "profile": "default",
+            "actor_open_id": "ou_actor_open_id",
+            "gateway_url": "https://internal-api-lark-api.feishu.cn/im/gateway/",
+            "web_url": "https://tenant.feishu.cn/next/messenger/",
+            "feed_ids": {},
+            "auto_resolve_feed_id": true,
+            "browser_executable": "",
+            "feed_resolution_timeout_seconds": 60,
+            "feed_cache_path": "",
+            "cookie_cache_seconds": 60
+          },
+          "escalation": {
+            "enabled": true,
+            "interval_minutes": 30,
+            "sender": "bot",
+            "groups": {
+              "TMS": "oc_tms_escalation_group",
+              "SCM": "oc_business_escalation_group",
+              "SRM": "oc_business_escalation_group",
+              "QMS": "oc_business_escalation_group",
+              "PDM": "oc_business_escalation_group",
+              "PLM": "oc_business_escalation_group"
+            }
           },
           "cli": {
             "executable": "lark-cli",
@@ -130,14 +163,21 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 }
 ```
 
-国际版 Lark 的 `domain` 使用 `https://open.larksuite.com`，CLI profile 品牌也必须一致。服务进程找不到 CLI 时，可将 `executable` 改为官方 CLI 可执行文件的绝对路径。
+国际版 Lark 的 `domain` 使用 `https://open.larksuite.com`，CLI profile 品牌也必须一致。服务进程找不到 CLI 时，可将 `executable` 改为官方 CLI 可执行文件的绝对路径。完整 JSON 示例见 [feishu-helpdesk-config.example.json](feishu-helpdesk-config.example.json)。
 
 | 配置 | 默认值 | 使用说明 |
 | --- | --- | --- |
 | `bot.agents.max_concurrent_sessions` | `1` | 严格正整数；示例 `4` 允许不同会话并发，`1` 保持全局顺序处理 |
 | `helpdesk.enabled` | `false` | 显式设为 `true`，同时提供 ID 和 Token |
-| `helpdesk.followup_interval_minutes` | `5` | 严格正整数，单位分钟；首次提醒、第二次提醒和最终关单等待共用 |
+| `helpdesk.followup_interval_minutes` | `3` | 严格正整数，单位分钟；首次提醒和第二次提醒的间隔 |
+| `helpdesk.escalation.enabled` | `true` | 开关升级；关闭时保留无升级路由的兼容行为 |
+| `helpdesk.escalation.interval_minutes` | `30` | 升级后重复提醒间隔，单位分钟 |
+| `helpdesk.escalation.sender` | `bot` | 升级群发送身份；`bot` 走官方 IM API，`lark_cli` 走 CLI 用户身份，均不使用 Web Messenger |
+| `helpdesk.escalation.groups` | 空 | 系统名到升级群 `oc_*` 的映射；配置后按工单最初选择的系统路由 |
 | `helpdesk.messages` | 示例中的文案 | 可全部省略；欢迎、提醒及关闭说明统一带 `prefix` 和换行 |
+| `helpdesk.reply.mode` | `lark_cli` | 服务台工单群推荐 `feishu_web`；该模式使用 auth-mcp Cookie 和 Web Messenger，不回退到 CLI 发送 |
+| `helpdesk.reply.auto_resolve_feed_id` | `false` | 开启后缓存未命中时启动无头 Chromium 解析 `oc_* → feed_id`；已有 `feed_ids` 时优先使用映射 |
+| `helpdesk.reply.cookie_cache_seconds` | `60` | auth-mcp Cookie 的内存缓存秒数，不落盘 |
 | `helpdesk.cli.executable` | `lark-cli` | 使用官方 CLI；Python 关单模块随 VikingBot 自动启动 |
 | `helpdesk.cli.profile` | 空，使用默认 profile | 建议明确指定 `support`，避免切换默认 profile 后身份变化 |
 | `helpdesk.cli.timeout_seconds` | `30` | 单次操作超时，包含锁等待、脚本、授权准备、最终检查和请求；不是业务静默间隔 |
@@ -146,7 +186,9 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 
 配置修改后重启生效。分钟数不能写成 `0`、小数、布尔值或字符串。连续跟进次数固定为两次，不另设次数配置。
 
-欢迎正文固定为示例中的一句话，不包含时间、不调用模型。第二次面向业务的提醒追加 `second_reminder_suffix`，其中必须且只能包含一次裸 `{minutes}`，由代码替换成配置的分钟数；其他固定文案和前缀不能为空。跟进正文仍由模型结合对话生成。
+欢迎正文固定为示例中的一句话，不包含时间、不调用模型。第二次提醒在配置升级路由时追加 `escalation_reminder_suffix`，无升级路由时追加旧版 `second_reminder_suffix`；两者都必须且只能包含一次裸 `{minutes}`。跟进正文仍由模型结合对话生成。
+
+启用升级后，第二次提醒再等待一个跟进间隔仍无解决，就向对应升级群发送包含客户名、工单号、系统和原工单群可点击链接的通知；之后每 30 分钟重复，直到工单解决或关闭。升级群默认以应用 Bot 身份通过官方 IM API 发送。原工单群继续同步和判断，但不再发送提醒。升级路由启用时，两次提醒后不会因业务静默自动超时关单。
 
 示例 `allow_from: []` 代表不限制用户；已有白名单时保留原值。`thread_require_mention: true` 沿用普通 Agent 回答需要 `@Bot` 的规则，服务台人工活动监测不要求 `@Bot`。
 
@@ -178,7 +220,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 ## 6. 工单发现和自动跟进规则
 
-服务台会主动查询。实时事件负责及时接收变化，启动时及每 60 秒增量查询负责补漏，本地期限调度最多每 10 秒校准一次自然时间。这里的 60 秒查询周期与 5 分钟业务间隔相互独立。
+服务台会主动查询。实时事件负责及时接收变化，启动时及每 60 秒增量查询负责补漏，本地期限调度最多每 10 秒校准一次自然时间。这里的 60 秒查询周期与 3 分钟业务间隔相互独立。
 
 首次启用时持久化接管起点，只接管此后新建且未关闭的工单。首次启用前的历史工单不会批量发送欢迎；已有数据库的部署会继续原有接管记录，并补发现停机期间的新工单。
 
@@ -197,23 +239,24 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 | 时间 | 动作 |
 | --- | --- |
-| 静默满 5 分钟 | 第一次提醒 |
-| 第一次成功发送后再静默 5 分钟 | 第二次提醒 |
-| 第二次成功发送后再静默 5 分钟 | 符合业务无回复条件时关闭 |
+| 静默满 3 分钟 | 第一次提醒 |
+| 第一次成功发送后再静默 3 分钟 | 第二次提醒 |
+| 第二次成功发送后再静默 3 分钟 | 仍未解决时升级到配置的系统群 |
+| 升级通知成功后每 30 分钟 | 升级群重复提醒，直到解决或关闭 |
 
-通常对应第 5、10、15 分钟。排队、网络及状态核对可能使实际执行稍晚；发送失败不增加次数，也不推进关单期限。停机恢复后不会一次补发多轮提醒，下一次等待从本次成功时间重新计算。
+通常对应第 3、6、9 分钟升级。排队、网络及状态核对可能使实际执行稍晚；发送失败不增加次数，也不推进下一期限。停机恢复后不会一次补发多轮提醒，下一次等待从本次成功时间重新计算。
 
 ### 三种场景
 
-| 当前对话情况 | 自动跟进 | 两次成功提醒后 |
+| 当前对话情况 | 自动跟进 | 两次成功提醒后（已配置升级） |
 | --- | --- | --- |
-| 业务已提问题，等待处理方响应、调查或解决 | 提醒产品／研发／测试响应和推进 | 停止本轮催办，工单保持开放 |
-| 等待业务描述问题或补充信息 | 请业务描述问题、补充信息 | 再静默一个配置间隔后可关闭 |
-| 处理方已给结果，等待业务验证或确认 | 请业务验证或确认结果 | 再静默一个配置间隔后可关闭 |
+| 业务已提问题，等待处理方响应、调查或解决 | 提醒产品／研发／测试响应和推进 | 再静默一个间隔后升级，原工单群停止提醒 |
+| 等待业务描述问题或补充信息 | 请业务描述问题、补充信息 | 再静默一个间隔后升级，原工单群停止提醒 |
+| 处理方已给结果，等待业务验证或确认 | 请业务验证或确认结果 | 再静默一个间隔后升级，原工单群停止提醒 |
 
-后两种场景的第二次提醒会明确告知剩余时间及自动关单规则。业务确认，或模型有充分对话依据判断已解决，可以直接关单，不必等待两次提醒。模型失败、来源未核实、仅附件无法判断或信息不足时暂缓关单。
+第二次提醒会明确告知“N 分钟后将升级处理”。业务确认，或模型有充分对话依据判断已解决，会立即关单，不必等待两次提醒或升级。模型失败、来源未核实、仅附件无法判断或信息不足时暂缓关单并继续升级节奏。
 
-已解决关单使用 `solved=2`，业务无回复超时使用 `solved=1`；两者均将服务台工单状态改为 `51`，远端确认关闭后再发送说明。关闭工单不会关闭聊天页面。
+已解决关单使用 `solved=2`。旧版无升级路由的兼容模式才会在 `awaiting_details` / `awaiting_confirmation` 两次提醒后再等待一个间隔，以 `solved=1` 超时关单；`awaiting_handler` 不超时关单。关闭工单不会关闭聊天页面，远端确认关闭后只尝试发送一次关闭说明。
 
 ### 人工消息、并发和旧判断作废
 
@@ -229,12 +272,12 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 首次启用、切换运行账号或升级 CLI 后，先在测试服务台验收。关单会真实修改工单状态。
 
-1. 启动后创建新工单并建立群关联，确认欢迎只发一次，发送者为预期 CLI 用户。
-2. 不描述问题并持续静默，核对默认第 5／10／15 分钟的两次提醒和超时关单；第二次提醒应写明剩余 5 分钟。
-3. 在第二次提醒后发送人工消息，确认原关单期限作废，新一轮从该人工消息重新计时。再用图片或文件验证活动监测。
-4. 测试“等待处理方解决”：两次提醒后保持开放；测试可信的“已解决”沟通，可直接关闭并只发送一次关闭说明。
+1. 启动后创建新工单并建立群关联，确认欢迎只发一次且发送者为 `actor_open_id` 对应的 Web 会话用户；首次解析应写入 feed 缓存，后续不再启动新浏览器。
+2. 不描述问题并持续静默，核对第 3／6／9 分钟的两次提醒和升级；第二次提醒应写明 3 分钟后升级。
+3. 确认 TMS 和其他系统分别进入配置映射的升级群，发送者为应用 Bot；首次通知后每 30 分钟重复，原工单群不再提醒。
+4. 在升级后发送人工消息，确认原工单群仍恢复判断但不恢复提醒；可信“已解决”沟通应立即关单，只发送一次关闭说明。
 5. 在一个会话中等待较慢回答，同时向另一会话提问，确认第二个会话能处理；同会话仍保持顺序。
-6. 停机期间新建工单后重启，确认补接管；已欢迎工单重启后不重复欢迎，也不补发多轮过期提醒。
+6. 停机期间新建工单后重启，确认补接管；已欢迎工单重启后不重复欢迎，也不补发多轮过期提醒或升级通知。
 
 本地模拟测试覆盖了调度、状态机及凭据协议，但不能替代真实服务台、用户权限和 macOS Keychain 的验收。
 
@@ -278,7 +321,9 @@ CLI 升级通常不需要修改源码补丁；必要字段、加密布局或刷�
 | 发送或入群出现 `232011`／`232017` | 检查 CLI 用户是否在关联群、是否有相应邀请权限 |
 | `Helpdesk synchronization failed` | 检查服务台读取权限、Token、网络与限流；未补齐消息时不会依据不完整历史自动关单 |
 | `Helpdesk receipt reconciliation failed` | 检查当前用户的群消息读取权限及网络；人工 IM 交付继续运行 |
-| 两次催办后没有关闭 | 等待处理方解决时会保持开放；还需排除新人工消息、同群活动、发送失败或模型无法判断 |
+| 两次催办后没有关闭 | 当前配置启用升级，本就不会超时关单；检查是否已按 30 分钟节奏升级，以及是否已有可信“已解决”判断 |
+| 升级群没有收到通知 | 检查系统识别、`escalation.groups`、Bot 是否在升级群，以及 outbox 的 `transport=feishu_bot` 和发送日志 |
+| 工单群提示 `feed id` 或 Web 登录失败 | 检查 auth-mcp `feishu_helpdesk` 会话是否 ready、Chromium 是否可执行、`web_url`/`feed_ids` 是否正确 |
 | `Helpdesk automation paused` | 查看暂停原因；发送回执过期或跨轮不确定时暂停该工单自动化，独立后台对账继续运行 |
 | 远端关单可能成功，但没有关闭说明 | 提交后结果不确定时保留 `close_pending` 查询远端，确认归属本次操作后补发；不要手动重放旧请求或清库 |
 

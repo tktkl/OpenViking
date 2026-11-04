@@ -34,6 +34,21 @@
 
 以上提交状态是此次快照，不作为后续判断依据。每次更新前重新检查暂存区、工作区和未跟踪文件，并保存需要保留的改动。
 
+## 2026-11-04 服务台发送与升级批次
+
+`codex/vikingbot-helpdesk-followup` 在当前基线 `1f180bc1a` 之上新增一批尚未合入上游的改动。详细文件级契约、合并顺序和冲突处理见 [主动跟进合并说明](helpdesk-followup-merge.md) 的“2026-11-04 未提交批次”章节。
+
+新增接入面：
+
+- 服务台工单群可将 `reply.mode` 切为 `feishu_web`，通过 auth-mcp 原始 Cookie、Web Messenger feed-id 解析和 protobuf gateway 发送；CLI 保持兼容回退。
+- 普通 IM 升级群默认通过应用 Bot 的官方 `POST /open-apis/im/v1/messages` 发送，可配置为 `lark_cli`，两者都不使用 Web。
+- 服务台状态新增系统识别、升级群、升级开始/最近发送/次数和 outbox transport 字段；旧 SQLite 缺省兼容。
+- 跟进时间线改为工单群 3 分钟提醒、两次后 3 分钟升级、升级群 30 分钟重复；启用升级后不再走业务静默超时关单。
+- 关闭工单与提醒 outbox 解耦；关单失败不会顺延提醒，已升级工单的 resolved 关单失败仍继续重试。
+- VLM 增加 per-call `reasoning_effort` 透传，覆盖 OpenAI/Azure/Volcengine 和 MultiCredential 路径，不改变没有显式 override 的模型默认。
+
+本批不包含 `bot/workspace/SOUL.md`、`openviking/system_assets/manifest.json`、`bot/workspace/skills/*`。合并前重新 fetch upstream，确认 `channels/manager.py`、`channels/feishu.py`、模型参数构造和消息 outbox 接口是否有上游变化。本批相关离线回归为 **464 passed**（服务台 454 + VLM 10）；真实环境已验证工单 Web 发送、升级群 Bot 成员关系和 Bot 发送回执。
+
 ## 七个核心接入点
 
 以下路径均相对仓库根目录；链接指向实际文件。上游触及这些方法、调用点或消息契约时，即使没有文本冲突，也需要人工核对。
@@ -42,7 +57,7 @@
 | --- | --- | --- | --- |
 | [agent/loop.py](../../../vikingbot/agent/loop.py) | 创建并启动/关闭运行时扩展；主队列执行内部通知；续办开始前调用 `before_process`；普通消息和 steer 更新来源上下文 | `AgentLoop` 生命周期、关闭顺序、消息调度、steer、内部事件与用户轮次隔离；避免扩展关闭晚于沙箱释放 | 高 |
 | [agent/context.py](../../../vikingbot/agent/context.py) | `set_message_source()` 将已确认服务台的渠道 metadata 转换为独立 system 来源区块；新消息更新或移除旧来源 | `build_messages()` 参数与调用链、系统消息顺序、上下文压缩；正文不能伪造服务台来源，普通 IM 不继承旧来源 | 中高 |
-| [channels/manager.py](../../../vikingbot/channels/manager.py) | 配置启用时选择服务台子类；发送后调用 `on_delivery`，仅渠道明确返回 `True` 才确认成功 | 渠道创建流程、发送返回值、异常路径；回执异常不能停止公共发送器，普通消息没有回执也能正常发送 | 中高 |
+| [channels/manager.py](../../../vikingbot/channels/manager.py) | 配置启用时选择服务台子类；构建并注入可插拔 reply sender；发送后调用 `on_delivery`，仅渠道明确返回 `True` 才确认成功 | 渠道创建流程、sender 初始化/关闭、发送返回值、异常路径；回执异常不能停止公共发送器，普通消息没有回执也能正常发送 | 高 |
 | [channels/feishu.py](../../../vikingbot/channels/feishu.py) | 将原有 IM 事件注册提取为 `_event_handler_builder()`，允许子类追加工单事件后统一 `build()` | 飞书 SDK 事件构建、长连接启动和回调注册；保留原生 IM 行为，避免复制启动流程或重复注册事件 | 中 |
 | [config/schema.py](../../../vikingbot/config/schema.py) | 增加默认关闭的 `helpdesk` 配置与 `runtime_extensions` 配置；服务台专属字段由扩展模块定义 | 配置解析、默认值、类型导入及已有配置兼容；未启用时不启动扩展任务 | 中低 |
 | [bus/events.py](../../../vikingbot/bus/events.py) | 入站增加 `internal_handler/internal/before_process`，出站增加 `on_delivery`；均有兼容默认值 | 消息构造、复制、序列化与投递方式；这些回调只在进程内使用，不能从用户正文或渠道 metadata 重建 | 中低 |
@@ -53,7 +68,7 @@
 | 新增模块 | 职责 | 与上游的依赖 |
 | --- | --- | --- |
 | [extensions/runtime.py](../../../vikingbot/extensions/runtime.py) | 可信配置指定 `module:factory`，提供 `create_extension(context, options)`、`start()`、`close()` 接口 | 主循环生命周期、工具注册、消息总线、会话与沙箱管理接口 |
-| [extensions/feishu_helpdesk/](../../../vikingbot/extensions/feishu_helpdesk/) | 工单事件订阅、Bot 入群、CLI 授权检查与保活、工单/会话绑定、有限重试；继承原生飞书消息处理和发送 | `FeishuChannel` 的事件注册、启动/停止与消息处理方法，以及飞书 SDK 和 lark-cli 契约 |
+| [extensions/feishu_helpdesk/](../../../vikingbot/extensions/feishu_helpdesk/) | 工单事件订阅、Bot 入群、CLI 授权检查与保活、工单/会话绑定、有限重试、Web 工单回复、普通 IM 升级、回执对账和独立关单；继承原生飞书消息处理 | `FeishuChannel` 生命周期和事件注册、飞书 SDK、lark-cli 契约、官方 IM 发送 API、auth-mcp Cookie、Web Gateway 与 feed-id 解析 |
 | [extensions/background_tasks/](../../../vikingbot/extensions/background_tasks/) | 注册 `background_task`；固定 task/run 监测、绑定原会话、完整结果分页读取、编号分段、回执游标、故障隔离、重启恢复、补充暂存与续办 | `RuntimeContext`、`ToolContext`、原 session 的沙箱文件/执行 API、会话保存、内部队列和发送回执 |
 | [extensions/__init__.py](../../../vikingbot/extensions/__init__.py) | 扩展包入口 | Python 包布局和打包规则 |
 
@@ -68,7 +83,7 @@
 - **来源可信度**：服务台身份由渠道确认的绑定生成，用户正文不能设置；模型侧的业务环境规则由 engineering skill 判断。上游重构上下文时不能把这一来源区块降为普通用户文本，也不能让旧工单来源残留到其他消息。
 - **结果回传**：Codex 最终答复由扩展交给 Bot 渠道发送，普通完成不增加一次模型改写；只有暂存补充需要新的编排轮次。发送游标仅在成功回执持久化后推进。
 - **执行范围**：Bot 的 `exec` 工具实现、MCP 连接实现和沙箱权限逻辑没有因此修改。Codex CLI 的 full access、任务进程管理、认证包装器及共享 skills 在独立的 `agent-skills/wangoon` 仓库维护，不计入此分支的源码差异；升级时仍需核对 runner 协议与双端部署。
-- **认证职责**：业务取证凭据由 `wangoon-auth-mcp` 提供；服务台固定渠道代码的事件订阅及邀请/保活，沿用服务台配置与 lark-cli 授权，详见服务台文档。两条链路不能混为同一份认证缓存。
+- **认证职责**：业务取证凭据由 `wangoon-auth-mcp` 提供；服务台工单群 Web 发送需要 `feishu_helpdesk` 的原始 Cookie，CLI 读取/邀请/保活/关单继续使用 lark-cli 用户授权，普通 IM 升级使用应用 tenant token。三套认证上下文不能混为同一份缓存；Cookie 不落盘，升级群发送不依赖 Web。
 - **持久状态**：扩展 journal、结果分段和 runner 状态使用工作区 `tmp/wangoon/`。部署更新需保留仍需恢复的任务状态；代码合并不应顺带清空该目录或更换其权限、挂载位置。
 
 ## 下一次更新的评估步骤

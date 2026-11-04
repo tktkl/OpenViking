@@ -2,7 +2,7 @@
 
 本扩展让配置式飞书渠道自动加入服务台工单绑定群。入群后，用户在群内 `@Bot`，由原有 `FeishuChannel` 解析消息、调用 Agent 并回复。普通单聊、群聊继续使用同一个渠道，不需要另开一条长连接。
 
-启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。欢迎、两次跟进和关闭说明通过官方 Lark CLI 当前用户发送；关单通过独立 Python 子进程使用同一用户凭据执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
+启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。工单群的欢迎、两次跟进和关闭说明默认使用 `reply.mode="feishu_web"` 的服务台 Web 会话身份发送；普通 IM 升级群默认使用应用 Bot 的官方 IM API。关单通过独立 Python 子进程使用 CLI 当前用户凭据执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
 
 更新官方代码前，按 [bot-main 上游合并影响](upstream-merge-impact.md) 核对核心接入点、扩展依赖及合并后回归。
 
@@ -24,7 +24,7 @@
 
 ## 配置
 
-在 `~/.openviking/ov.conf` 中给已有飞书渠道增加 `helpdesk` 配置。保留现有模型、OpenViking、工具和沙箱配置：
+在 `~/.openviking/ov.conf` 中给已有飞书渠道增加 `helpdesk` 配置。保留现有模型、OpenViking、工具和沙箱配置。完整配置见 [配置示例](feishu-helpdesk-config.example.json)：
 
 ```json
 {
@@ -42,7 +42,36 @@
           "enabled": true,
           "helpdesk_id": "<目标服务台 ID>",
           "helpdesk_token": "<服务台 Token>",
-          "followup_interval_minutes": 5,
+          "followup_interval_minutes": 3,
+          "reply": {
+            "mode": "feishu_web",
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "feishu_helpdesk",
+            "environment": "prod",
+            "profile": "default",
+            "actor_open_id": "ou_actor_open_id",
+            "gateway_url": "https://internal-api-lark-api.feishu.cn/im/gateway/",
+            "web_url": "https://tenant.feishu.cn/next/messenger/",
+            "feed_ids": {},
+            "auto_resolve_feed_id": true,
+            "browser_executable": "",
+            "feed_resolution_timeout_seconds": 60,
+            "feed_cache_path": "",
+            "cookie_cache_seconds": 60
+          },
+          "escalation": {
+            "enabled": true,
+            "interval_minutes": 30,
+            "sender": "bot",
+            "groups": {
+              "TMS": "oc_tms_escalation_group",
+              "SCM": "oc_business_escalation_group",
+              "SRM": "oc_business_escalation_group",
+              "QMS": "oc_business_escalation_group",
+              "PDM": "oc_business_escalation_group",
+              "PLM": "oc_business_escalation_group"
+            }
+          },
           "cli": {
             "executable": "lark-cli",
             "profile": "support",
@@ -60,7 +89,10 @@
 - `helpdesk.enabled` 默认 `false`，不开启时仍创建官方 `FeishuChannel`。
 - `allow_from` 是该飞书渠道的发送者白名单，单聊、普通群和工单群均遵守。上例的 `[]` 表示允许所有用户提问；配置非空列表时，仅列表中的 open_id 可以使用 Bot，其他用户即使在工单群内 `@Bot` 也会被拒绝并记录 `Access denied`。如需开放渠道，在实际生效的 `ov.conf` 中将目标渠道的 `allow_from` 设为 `[]`；本扩展不会自动清空已有名单，也不为工单群绕过名单。命令权限仍按原有 `allow_cmd_from` 和运行模式判断，是否需要 `@Bot` 仍由 `thread_require_mention` 控制。
 - `helpdesk_id`、`helpdesk_token` 来自目标服务台，用于读取、订阅及关单的服务台请求头。
-- `followup_interval_minutes` 默认 `5`，严格正整数，重启生效。提醒次数固定两次；见主动跟进文档。
+- `followup_interval_minutes` 默认 `3`，严格正整数，重启生效。提醒次数固定两次；第二次后仍未解决时按 `escalation.groups` 升级，并在升级群每 `escalation.interval_minutes` 分钟提醒一次。
+- `reply.mode` 默认 `lark_cli`；服务台工单群推荐 `feishu_web`。后者使用 auth-mcp 的完整原始 Web 会话 Cookie、feed-id 缓存和 Web Messenger 网关，Cookie 不写日志、不落盘，持久化文件只包含 `oc_*` 到内部 feed id 的映射。`auto_resolve_feed_id` 需要可用的无头 Chromium/Playwright；可先用 `feed_ids` 手工固定映射。
+- `escalation.sender` 默认 `bot`，升级群通过官方 IM API 以应用 Bot 身份发送；`lark_cli` 使用 CLI 用户身份。两条升级发送路径都不会使用 Web Messenger。
+- 启用升级后，工单群连续两次提醒后再静默 3 分钟即升级，原工单群停止提醒；升级群每 30 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
 - `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。Python 关单模块随 VikingBot 安装，自动使用当前 Python 解释器，不增加脚本路径配置。
 - `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile，并先通过 CLI 完成该 profile 的应用配置。扩展会校验其 App ID 与飞书渠道一致，不匹配就跳过用户操作。
 - 授权的客服用户必须已在目标工单群内，且群设置允许其添加机器人。服务台 Token 和机器人自己的 `tenant_access_token` 不能替代这项用户授权。
@@ -103,7 +135,7 @@ CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的�
 2. 开通服务台读取/事件订阅权限 `helpdesk:all:readonly`；启动时通过服务台专用接口订阅工单创建、更新和 `helpdesk.ticket_message.created_v1`。
 3. 机器人需要成员查询权限，例如 `im:chat.members:read`；邀请用户需要 `im:chat.members:write_only`。应用权限和用户授权均须生效。
 4. 沿用已有飞书 IM 的消息读取、发消息、图片、资源和表情等权限，不因开启扩展扩大工具或发送者权限。
-5. 当前用户的自动发送和关单另需 `im:message.send_as_user`、`im:message`、`helpdesk:all` 及工单访问权限；恢复群消息还受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
+5. 当前用户的关单和 CLI 回执查询需要 `helpdesk:all`、`im:message`、消息读取及工单访问权限；Web Messenger 发送还需要 auth-mcp 的 `feishu_helpdesk` prod 会话处于 ready。恢复群消息仍受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
 
 ## 复用范围与验证
 
@@ -137,14 +169,14 @@ PYTHONPATH=bot python -m pytest -c bot/pytest.ini \
   bot/tests/test_compile_preview_hook_signature.py
 ```
 
-真实环境验收使用测试服务台和测试 profile：核验用户授权、Bot 入群、普通 IM、白名单、话题及媒体，然后按主动跟进文档验证静默时间线、重启补漏和关单条件。自动测试不发送真实飞书消息。
+真实环境验收使用测试服务台和测试 profile：核验用户授权、Bot 入群、普通 IM、白名单、话题、媒体、Web Messenger feed 解析及升级群 Bot 发送，然后按主动跟进文档验证 3／6／9 分钟时间线、30 分钟升级重复、重启补漏和关单条件。自动测试不发送真实飞书消息。
 
 ## 与官方代码的边界
 
 主要服务台实现放在 `bot/vikingbot/extensions/feishu_helpdesk/`。官方代码的接入点包括：
 
 - `config/schema.py`：增加可选配置字段。
-- `channels/manager.py`：按开关选择扩展子类。
+- `channels/manager.py`：按开关选择扩展子类，并注入可插拔 reply sender。
 - `channels/feishu.py`：将原有事件注册提取为可覆盖的方法，未改变消息处理和回复实现。
 - `agent/context.py` 与 `agent/loop.py`：将入站来源白名单传入模型，并在追加消息时刷新；不包含业务环境默认策略。
 

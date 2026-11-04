@@ -1,0 +1,71 @@
+{
+  "bot": {
+    "agents": {
+      "max_concurrent_sessions": 4
+    },
+    "channels": [
+      {
+        "type": "feishu",
+        "enabled": true,
+        "app_id": "cli_your_app",
+        "app_secret": "<应用 App Secret>",
+        "domain": "https://open.feishu.cn",
+        "bot_name": "<机器人显示名>",
+        "allow_from": [],
+        "thread_require_mention": true,
+        "helpdesk": {
+          "enabled": true,
+          "helpdesk_id": "<服务台 ID>",
+          "helpdesk_token": "<服务台 Token>",
+          "followup_interval_minutes": 3,
+          "messages": {
+            "prefix": "【AI分身自动回复】",
+            "welcome": "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
+            "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+            "escalation_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
+            "closed_resolved": "问题已解决，工单已关闭。",
+            "closed_timeout": "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+          },
+          "reply": {
+            "mode": "feishu_web",
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "feishu_helpdesk",
+            "environment": "prod",
+            "profile": "default",
+            "actor_open_id": "ou_actor_open_id",
+            "gateway_url": "https://internal-api-lark-api.feishu.cn/im/gateway/",
+            "web_url": "https://tenant.feishu.cn/next/messenger/",
+            "feed_ids": {
+              "oc_ticket_chat": "internal_feed_id"
+            },
+            "auto_resolve_feed_id": true,
+            "browser_executable": "",
+            "feed_resolution_timeout_seconds": 60,
+            "feed_cache_path": "",
+            "cookie_cache_seconds": 60
+          },
+          "escalation": {
+            "enabled": true,
+            "interval_minutes": 30,
+            "sender": "bot",
+            "groups": {
+              "TMS": "oc_tms_escalation_group",
+              "SCM": "oc_business_escalation_group",
+              "SRM": "oc_business_escalation_group",
+              "QMS": "oc_business_escalation_group",
+              "PDM": "oc_business_escalation_group",
+              "PLM": "oc_business_escalation_group"
+            }
+          },
+          "cli": {
+            "executable": "lark-cli",
+            "profile": "support",
+            "timeout_seconds": 30,
+            "auth_check_interval_seconds": 60,
+            "keepalive_interval_seconds": 1800
+          }
+        }
+      }
+    ]
+  }
+}

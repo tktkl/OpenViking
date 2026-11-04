@@ -1,6 +1,6 @@
 # 服务台主动跟进
 
-VikingBot 使用三条协作链路：同一飞书长连接接收事件，启动及每 60 秒主动增量查询服务台，本地持久化期限到期后将工作送入现有会话调度器。**5 分钟为业务静默间隔，60 秒为补漏周期。**
+VikingBot 使用三条协作链路：同一飞书长连接接收事件，启动及每 60 秒主动增量查询服务台，本地持久化期限到期后将工作送入现有会话调度器。**3 分钟为工单群提醒间隔，30 分钟为升级群重复提醒间隔，60 秒为补漏周期。**
 
 ```mermaid
 flowchart TD
@@ -11,13 +11,13 @@ flowchart TD
     T --> Q[MessageBus内部事件]
     Q --> D[现有会话调度器]
     D --> V[最新状态、消息、轮次校验]
-    V --> A[模型判断、CLI发送、关单]
+    V --> A[模型判断、分层发送、关单]
     A --> DB
 ```
 
 ## 部署配置与身份
 
-在现有 `ov.conf` 中使用 OpenViking 的配置结构：
+完整的可复制示例见 [feishu-helpdesk-config.example.json](feishu-helpdesk-config.example.json)。在现有 `ov.conf` 中使用 OpenViking 的配置结构：
 
 ```json
 {
@@ -32,13 +32,43 @@ flowchart TD
         "enabled": true,
         "helpdesk_id": "<服务台 ID>",
         "helpdesk_token": "<服务台 Token>",
-        "followup_interval_minutes": 5,
+        "followup_interval_minutes": 3,
         "messages": {
-          "prefix": "【服务台自动消息】",
-          "welcome": "你好，请描述遇到的问题，并补充相关截图或报错信息。",
+          "prefix": "【AI分身自动回复】",
+          "welcome": "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
           "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+          "escalation_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
           "closed_resolved": "问题已解决，工单已关闭。",
           "closed_timeout": "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+        },
+        "reply": {
+          "mode": "feishu_web",
+          "auth_mcp_server": "wangoon-auth-mcp",
+          "provider": "feishu_helpdesk",
+          "environment": "prod",
+          "profile": "default",
+          "actor_open_id": "ou_actor_open_id",
+          "gateway_url": "https://internal-api-lark-api.feishu.cn/im/gateway/",
+          "web_url": "https://tenant.feishu.cn/next/messenger/",
+          "feed_ids": {},
+          "auto_resolve_feed_id": true,
+          "browser_executable": "",
+          "feed_resolution_timeout_seconds": 60,
+          "feed_cache_path": "",
+          "cookie_cache_seconds": 60
+        },
+        "escalation": {
+          "enabled": true,
+          "interval_minutes": 30,
+          "sender": "bot",
+          "groups": {
+            "TMS": "oc_tms_escalation_group",
+            "SCM": "oc_business_escalation_group",
+            "SRM": "oc_business_escalation_group",
+            "QMS": "oc_business_escalation_group",
+            "PDM": "oc_business_escalation_group",
+            "PLM": "oc_business_escalation_group"
+          }
         },
         "cli": {
           "executable": "lark-cli",
@@ -50,11 +80,20 @@ flowchart TD
 }
 ```
 
-`followup_interval_minutes` 默认 `5`，为严格正整数，不接受字符串、布尔值、小数和零。首次提醒、第二次提醒及最终关单等待共用此配置，修改后重启生效；连续成功提醒次数固定两次。
+`followup_interval_minutes` 默认 `3`，为严格正整数，不接受字符串、布尔值、小数和零。连续成功提醒次数固定两次；第二次提醒后等待同一间隔，仍未解决则进入升级流程。
 
-`messages` 可全部省略，默认值如上。欢迎、跟进及关闭说明统一为 `prefix`、换行和正文；欢迎及两种关闭说明由配置生成，不调用模型。跟进正文仍结合对话生成，第二次业务提醒追加配置的 `second_reminder_suffix`，其中必须且只能出现一次 `{minutes}`。统一标识和固定文案不能为空，修改后重启生效。已尝试发送的消息保留当时的完整文案和 UUID，对账不受配置改动影响。
+`escalation.groups` 是系统到升级群的配置映射。系统名来自工单首条业务选择，缺失时使用工单技能组字段兜底。TMS、SCM、SRM、QMS、PDM、PLM 当前分别路由到配置中的 TMS 群或业务系统公共群；新增系统只需增加映射，不改代码。升级通知默认以应用 Bot 身份通过官方 IM API 发送，不依赖 Web Cookie 或 feed_id 解析；可通过 `escalation.sender` 切换为 `lark_cli`。通知包含客户名、工单号、系统及原工单群可点击链接，首次发送后每 `escalation.interval_minutes` 分钟重复，直到工单解决或关闭。升级后原工单群继续同步和判断，但不再发送提醒。`escalation.enabled=false` 或 `groups` 为空时保留旧的无升级路由行为。
 
-使用官方 `lark-cli`，无需构建补丁 CLI、安装 Go 或配置额外工具路径。欢迎、提醒、关闭说明、IM 查询和授权续期均显式使用 CLI `--as user`。关单由随包安装的独立 Python 子进程执行：先由 CLI 完成身份、命令策略检查和必要续期，再只读解密该用户的本地凭据，在内存中使用 access token 调用服务台。脚本不导出或另存凭据，不自行使用 refresh token。服务台读取和订阅继续使用应用授权加服务台 Token。
+`messages` 可全部省略，默认值如上。欢迎、提醒及关闭说明统一为 `prefix`、换行和正文；欢迎及两种关闭说明由配置生成，不调用模型。跟进正文仍结合对话生成。配置升级路由时第二次提醒追加 `escalation_reminder_suffix`，否则追加旧版 `second_reminder_suffix`；两者都必须且只能出现一次 `{minutes}`。统一标识和固定文案不能为空，修改后重启生效。已尝试发送的消息保留当时的完整文案和 UUID，对账不受配置改动影响。
+
+发送身份分成两条链：
+
+- 服务台工单群：推荐 `reply.mode="feishu_web"`。服务台工单群不接受普通 CLI 用户 token 稳定模拟人工客服，因此欢迎、提醒、关闭说明和回执 echo 使用 auth-mcp 提供的完整原始 Web 会话 Cookie，经 Web Messenger `/im/gateway/` 发送。Cookie 只在内存中用于请求，不写日志、不落盘；持久缓存只保存 `oc_*` 到内部 feed id 的映射。
+- 普通 IM 升级群：默认 `escalation.sender="bot"`，使用应用 tenant token 调用官方 `POST /open-apis/im/v1/messages`，由当前应用 Bot 发送，不依赖 Web Cookie、feed_id 或浏览器。可切换为 `lark_cli`，但不会回退到 Web。
+
+`reply.mode="lark_cli"` 仍是兼容默认值，适合普通群或支持用户 API 发送的环境。`feishu_web` 使用 `auth_mcp_server`、`provider`、`environment`、`profile` 从 wangoon-auth-mcp 获取 ready 会话，`actor_open_id` 必须是目标工单的处理人。`feed_ids` 可手工配置映射；`auto_resolve_feed_id=true` 时，缓存未命中会通过无头 Chromium、CDP 和 Web Messenger 页面解析群名得到内部 feed id，并写入派生缓存。浏览器页面在后台常驻并在空闲时冻结，避免每个新工单重复启动约 20–30 秒。部署需要 Chromium/Playwright 可执行文件、`websocket-client`、可读取的 auth-mcp 配置和租户 Web Messenger 地址。
+
+官方 `lark-cli` 继续负责工单消息读取、发送回执对账、Bot 入群、授权状态检查、保活以及关单前检查。关单由随包安装的独立 Python 子进程执行：先由 CLI 完成身份、命令策略检查和必要续期，再只读解密该用户的本地凭据，在内存中使用 access token 调用服务台。脚本不导出或另存凭据，不自行使用 refresh token。服务台读取和订阅继续使用应用授权加服务台 Token。
 
 除了既有机器人和成员查询权限，应用需开通 `helpdesk:all:readonly` 读取/订阅权限。当前 CLI 用户需要有目标工单访问权限，以及 `helpdesk:all`、`im:message.send_as_user`、`im:message`、`im:chat.members:write_only`、所需的消息读取权限和 `offline_access`。用户读取群消息还受 `im:message.group_msg:get_as_user` 和群成员关系约束。应用权限与 OAuth 授权都必须生效。例如在运行 Gateway 的系统账号下：
 
@@ -89,15 +128,17 @@ lark-cli --profile support auth login \
 
 欢迎语不包含时间。尚无人工沟通时从欢迎成功发送时间计时；有人工消息后按最后人工沟通时间。新人工消息到接收层立即清零本轮提醒、更新版本并作废旧期限，不等待 Agent 消费。所有话题的文本、图片、文件均计入人工活动。自动欢迎、跟进、关闭说明及系统消息不重置；同一 CLI 用户的手动沟通仍计入。
 
-| 场景 | 跟进内容 | 两次成功跟进后 |
+| 场景 | 跟进内容 | 两次成功跟进后且配置升级路由 |
 | --- | --- | --- |
-| 等待处理方响应、调查或解决 | 请产品／研发／测试响应并推进实际问题 | 停止本轮催办，保持开放 |
-| 等待业务描述或补充 | 请业务描述问题或补充信息 | 再静默一个间隔后关单 |
-| 等待业务验证或确认 | 请业务验证或确认结果 | 再静默一个间隔后关单 |
+| 等待处理方响应、调查或解决 | 请产品／研发／测试响应并推进实际问题 | 再静默一个间隔后升级 |
+| 等待业务描述或补充 | 请业务描述问题或补充信息 | 再静默一个间隔后升级 |
+| 等待业务验证或确认 | 请业务验证或确认结果 | 再静默一个间隔后升级 |
 
-默认时间线为静默满 5 分钟第一次提醒，成功后再等 5 分钟第二次提醒，第二次成功后再等 5 分钟才可超时关单。失败不增加次数、不推进关单期限。第二次面向业务的提醒由代码追加配置中的 `N分钟后将自动关闭本工单` 规则，模型不得编造期限。
+默认时间线：静默满 3 分钟第一次提醒，成功后再等 3 分钟第二次提醒，第二次成功后再等 3 分钟仍未解决则升级。升级群首次通知成功后，每 30 分钟重复一次，直到工单判断为已解决或远端关闭。升级后原工单群继续同步消息和判断，但不再发送提醒。发送失败不增加提醒次数，也不推进下一期限。
 
-人工沟通触发及时判断。业务确认，或模型引用可信人工消息、包含最新消息且有充分事实证明已解决时，可直接关单，`solved=2`。业务无回复关单仅适用于上表两种等待业务场景，必须已成功提醒两次且再静默一个间隔，`solved=1`。等待处理方解决期间不会因业务静默关单。
+人工沟通触发及时判断。业务确认，或模型引用可信人工消息、包含最新消息且有充分事实证明已解决时，立即关单，`solved=2`，不等待提醒或升级间隔。关单成功后发送一次关闭说明；发送失败只把该通知标记为死信，不回滚关闭状态、不重新打开工单。
+
+仅当 `escalation.enabled=false` 或 `escalation.groups` 为空时保留旧兼容行为：`awaiting_details` / `awaiting_confirmation` 在两次提醒后再静默一个间隔，以 `solved=1` 超时关单；`awaiting_handler` 仍保持开放。当前推荐配置启用升级路由，因此不会因为业务静默自动关单。
 
 判断使用独立无工具输入，受 `session_context_token_budget` 限制，不加载 Agent 的完整历史和工具结果。身份不明、仅附件无法判断、信息不足或模型错误时暂缓关单。文案结合对话，不虚构进展、负责人或完成时间。关单修改服务台工单状态，不关闭聊天页面；远端确认关闭后再发说明。
 
@@ -115,7 +156,7 @@ Python 最多发送一次 `PUT /open-apis/helpdesk/v1/tickets/{ticket_id}`，同
 
 状态位于 `{storage_workspace}/bot/helpdesk/<应用与服务台的SHA256>/state.sqlite3`，SQLite WAL 和单实例文件锁保护，目录及数据库限制本机权限。记录启用时间、独立查询游标、绑定、消息别名、轮次、欢迎时间、人工活动、次数、期限依据及 outbox，不保存 OAuth 或服务台凭据。
 
-发送前持久化 UUID、目标群、完整文案和当前 CLI 用户。同轮回执丢失时在 CLI 一小时消息幂等窗口内以同 UUID 重试；取得 CLI 锁并完成授权后再次检查有效期。本次 CLI 调用还受剩余幂等时间限制，覆盖进程启动、CLI 内部续期及网络等待；配置较长的 `timeout_seconds` 不会延长此期限。超过 3500 秒仍不确定，或旧轮提醒回执不确定且已有新人工沟通时，仅暂停该工单的自动发送和关单，保存 `paused` / `pause_reason` 并记录 `Helpdesk automation paused`。发送使用 CLI 原生 API 保留飞书的毫秒时间，幂等重试沿用原消息的发送时间；缺少有效时间的回执不推进提醒次数或期限，等待对账。后台对账继续以 CLI 用户身份分页查询目标群历史，按用户、目标群、完整文案及发送时间窗口确认回执，不重新发送已过期动作。全部不确定发送确认后自动解除回执原因导致的暂停；旧轮回执不增加新轮次数。查询失败或未确认时保持自动化暂停，人工消息仍正常处理；必要时人工核对远端消息和本地 outbox，不能删除数据库冒充首次启用。
+发送前持久化 UUID、目标群、transport、完整文案和发送 actor。工单群的 `feishu_web` 回执可能是内部数字消息 ID，Helpdesk 稍后还会返回 `om_*` echo；两者通过精确文案、目标群、actor 和尝试时间窗口关联，不能仅凭发送人相同就视为自动消息。升级群的 `feishu_bot` 使用应用身份，回执对账同样不把升级群讨论写回工单消息。同轮不确定回执在幂等窗口内沿用原 UUID；超出 3500 秒时工单发送暂停等待对账，升级发送标记死信并在下一周期使用新 UUID，互不阻塞。全部不确定发送确认后自动解除回执原因导致的暂停；旧轮回执不增加新轮次数。查询失败或未确认时保持自动化暂停，人工消息仍正常处理；必要时人工核对远端消息和本地 outbox，不能删除数据库冒充首次启用。
 
 首次尝试若被明确拒绝，例如缺少发送权限、参数错误或限流，不留下待对账状态，修复权限后可在后续调度或重启后恢复。若此前已有超时或响应丢失，后续一次明确拒绝不能证明此前未发送，仍保留原发送时间和 UUID 对账。未知服务端错误、无效响应及可能发生在发送后的 CLI 输出策略错误均按结果不确定处理。
 
@@ -131,6 +172,9 @@ CLI 自身消息可能先产生回调、后返回发送回执。接收层依据�
 PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
   bot/tests/test_helpdesk_delivery.py \
   bot/tests/test_helpdesk_followup.py \
+  bot/tests/test_helpdesk_escalation.py \
+  bot/tests/test_helpdesk_feed_resolver.py \
+  bot/tests/test_helpdesk_web_reply.py \
   bot/tests/test_helpdesk_followup_concurrency.py \
   bot/tests/test_feishu_helpdesk.py \
   bot/tests/test_feishu_helpdesk_api.py \
@@ -145,11 +189,12 @@ PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
   bot/tests/test_background_task_segments.py -q
 ```
 
-部署前在测试服务台核验真实长连接、Token、当前用户访问权限、5／10／15 分钟时间线及停机补漏。上游接入点和验证记录见 [合并说明](helpdesk-followup-merge.md)。
+部署前在测试服务台核验真实长连接、Token、当前用户访问权限、3／6／9 分钟提醒与升级时间线、升级群 30 分钟重复提醒、已解决立即关单和停机补漏。上游接入点和验证记录见 [合并说明](helpdesk-followup-merge.md)。
 
 ## API 依据
 
 - [工单查询](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/list.md)、[详情](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/get.md)
 - [消息查询](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket-message/list.md)、[消息事件](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket-message/events/created.md)
 - [订阅](https://open.feishu.cn/document/server-docs/helpdesk-v1/event/subscribe.md)、[用户关单](https://open.feishu.cn/document/server-docs/helpdesk-v1/ticket-management/ticket/update.md)、[IM 详情](https://open.feishu.cn/document/server-docs/im-v1/message/get.md)
+- [Bot 发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create.md)、[群信息](https://open.feishu.cn/document/server-docs/group/chat/get.md)
 - [IM 群历史与回执对账](https://open.feishu.cn/document/server-docs/im-v1/message/list.md)
