@@ -43,7 +43,7 @@
 - 服务台工单群可将 `reply.mode` 切为 `feishu_web`，通过 auth-mcp 原始 Cookie、Web Messenger feed-id 解析和 protobuf gateway 发送；CLI 保持兼容回退。
 - 普通 IM 升级群默认通过应用 Bot 的官方 `POST /open-apis/im/v1/messages` 发送，可配置为 `lark_cli`，两者都不使用 Web。
 - 服务台状态新增系统识别、升级群、升级开始/最近发送/次数和 outbox transport 字段；旧 SQLite 缺省兼容。
-- 跟进时间线改为工单群 3 分钟提醒、两次后 3 分钟升级、升级群 30 分钟重复；启用升级后不再走业务静默超时关单。
+- 跟进时间线改为工单群 5 分钟提醒、两次后 5 分钟升级、升级群 30 分钟重复；启用升级后不再走业务静默超时关单。
 - 关闭工单与提醒 outbox 解耦；关单失败不会顺延提醒，已升级工单的 resolved 关单失败仍继续重试。
 - VLM 增加 per-call `reasoning_effort` 透传，覆盖 OpenAI/Azure/Volcengine 和 MultiCredential 路径，不改变没有显式 override 的模型默认。
 

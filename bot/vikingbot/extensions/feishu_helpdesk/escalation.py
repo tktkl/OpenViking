@@ -127,7 +127,7 @@ def render_escalation(
     link = ticket_group_link(chat_id)
     return (
         "【升级提醒】\n"
-        f"{subject}（{ticket_id}）已连续 2 次跟进仍未解决，现已升级。\n"
+        f"{subject}（{ticket_id}）经首次催办后仍未解决，现已升级。\n"
         f"原工单群：{link}\n"
         "请相关同学尽快处理。问题彻底解决前，"
         f"本群每 {interval_minutes} 分钟提醒一次。"

@@ -216,7 +216,7 @@ def test_interval_is_a_strict_positive_integer(value):
 
 
 def test_interval_defaults_to_three_minutes():
-    assert FeishuChannelConfig().helpdesk.followup_interval_minutes == 3
+    assert FeishuChannelConfig().helpdesk.followup_interval_minutes == 5
 
 
 @pytest.mark.asyncio
@@ -228,7 +228,7 @@ def test_interval_defaults_to_three_minutes():
         ("awaiting_handler", False),
     ],
 )
-async def test_five_ten_fifteen_minute_timeline(desk, scenario, should_close):
+async def test_five_minute_reminder_then_timeout_close(desk, scenario, should_close):
     service, api, clock = await initialized(desk)
     service.judge.judge.return_value = Decision(scenario, "请跟进当前问题。")
     human(service, clock)
@@ -241,21 +241,17 @@ async def test_five_ten_fifteen_minute_timeline(desk, scenario, should_close):
     assert len(api.cli.sends) == 2
     clock.advance(300)
     await drain(service)
-    assert len(api.cli.sends) == 3
-    if should_close:
-        assert "5分钟后将自动关闭" in api.cli.sends[-1][1]
-    else:
-        assert "自动关闭" not in api.cli.sends[-1][1]
-    clock.advance(300)
-    await drain(service)
     assert bool(api.cli.closes) == should_close
     if should_close:
+        assert len(api.cli.sends) == 3
         assert api.cli.closes[0][1]["solved"] == 1
-        assert api.cli.sends[-1][1].endswith("工单已关闭。")
+        assert "因催办后仍未收到业务补充或确认，工单已关闭。" in api.cli.sends[-1][1]
     else:
+        assert len(api.cli.sends) == 2
+        assert "自动关闭" not in api.cli.sends[-1][1]
         clock.advance(3600)
         await drain(service)
-        assert len(api.cli.sends) == 3
+        assert len(api.cli.sends) == 2
 
 
 @pytest.mark.asyncio
@@ -269,7 +265,7 @@ async def test_send_success_time_controls_next_deadline_no_catchup(desk):
     assert len(api.cli.sends) == 2
     clock.advance(1)
     await drain(service)
-    assert "7分钟后将自动关闭" in api.cli.sends[-1][1]
+    assert "因催办后仍未收到业务补充或确认，工单已关闭。" in api.cli.sends[-1][1]
 
 
 @pytest.mark.asyncio
@@ -501,10 +497,8 @@ async def test_raw_cli_retry_keeps_original_send_time_for_next_reminder(desk):
     item = service.store.tickets["t1"]
     assert item["count"] == 1 and item["last_send"] == original_send
     assert requests[0] == requests[1]  # Retry preserves the UUID and exact content.
-    clock.advance(240)
-    await drain(service)
-    assert service.store.tickets["t1"]["count"] == 2
-    assert len(receipts) == 2
+    assert service.store.tickets["t1"]["count"] == 1
+    assert len(receipts) == 1
     assert "5分钟后将自动关闭" in json.loads(requests[-1]["content"])["text"]
 
 
@@ -1410,9 +1404,8 @@ async def test_close_cancellation_only_keeps_pending_after_final_guard(desk, aft
 async def test_timeout_close_rechecks_wall_clock_after_authorization_preparation(desk):
     service, api, clock = await initialized(desk)
     service.judge.judge.return_value = Decision("awaiting_details", "请补充问题。")
-    for _ in range(2):
-        clock.advance(300)
-        await drain(service)
+    clock.advance(300)
+    await drain(service)
     clock.advance(300)
 
     async def clock_changed():
@@ -1998,7 +1991,7 @@ async def test_dead_letter_stops_receipt_reconciliation(desk):
 
 
 @pytest.mark.asyncio
-async def test_close_failure_does_not_block_due_second_reminder(desk):
+async def test_close_failure_does_not_block_due_first_reminder(desk):
     service, api, clock = await initialized(desk)
     service.judge.judge = AsyncMock(
         side_effect=[

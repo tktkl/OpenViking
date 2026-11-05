@@ -25,14 +25,14 @@
           "enabled": true,
           "helpdesk_id": "<服务台 ID>",
           "helpdesk_token": "<服务台 Token>",
-          "followup_interval_minutes": 3,
+          "followup_interval_minutes": 5,
           "messages": {
             "prefix": "【AI分身自动回复】",
             "welcome": "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
             "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
             "escalation_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
             "closed_resolved": "问题已解决，工单已关闭。",
-            "closed_timeout": "因两次提醒后仍未收到业务补充或确认，工单已关闭。"
+            "closed_timeout": "因催办后仍未收到业务补充或确认，工单已关闭。"
           },
           "reply": {
             "mode": "feishu_web",

@@ -47,7 +47,7 @@ SCOPE_ESCALATION = {
 
 def test_escalation_defaults_and_group_keys_are_normalized():
     config = FeishuChannelConfig().helpdesk
-    assert config.followup_interval_minutes == 3
+    assert config.followup_interval_minutes == 5
     assert config.escalation.interval_minutes == 30
     assert config.escalation.groups == {}
 
@@ -164,13 +164,13 @@ def test_escalation_text_uses_customer_name_and_clickable_ticket_group():
     ],
 )
 async def test_system_to_group_routing(desk, system, expected):
-    service, _, _ = await desk(minutes=3, escalation=ESCALATION)
+    service, _, _ = await desk(minutes=5, escalation=ESCALATION)
     assert service._escalation_target(system) == expected
 
 
 @pytest.mark.asyncio
 async def test_followup_scope_pauses_outside_group_and_resumes_when_switched_back(desk):
-    service, api, clock = await desk(minutes=3, escalation=SCOPE_ESCALATION)
+    service, api, clock = await desk(minutes=5, escalation=SCOPE_ESCALATION)
     add_ticket(service, api, clock)
     api.tickets["t1"]["actual_agent_group"] = "TMS技能组"
     service.register(api.tickets["t1"], authoritative=True)
@@ -217,7 +217,7 @@ async def test_followup_scope_pauses_outside_group_and_resumes_when_switched_bac
 
 @pytest.mark.asyncio
 async def test_three_minute_reminders_skip_welcome_outside_followup_scope(desk):
-    service, api, clock = await desk(minutes=3, escalation=SCOPE_ESCALATION)
+    service, api, clock = await desk(minutes=5, escalation=SCOPE_ESCALATION)
     add_ticket(service, api, clock)
     api.tickets["t1"]["actual_agent_group"] = "财务技能组"
     service.register(api.tickets["t1"], authoritative=True)
@@ -229,22 +229,19 @@ async def test_three_minute_reminders_skip_welcome_outside_followup_scope(desk):
 
 
 @pytest.mark.asyncio
-async def test_two_three_minute_reminders_then_thirty_minute_escalation(desk):
-    service, api, clock = await initialized(desk, minutes=3, escalation=ESCALATION)
+async def test_one_five_minute_reminder_then_thirty_minute_escalation(desk):
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
     human(service, clock, text="产品信息人工客服（PDM）")
     await drain(service)
 
-    clock.advance(180)
-    await drain(service)
-    assert service.store.tickets["t1"]["count"] == 1
-    clock.advance(180)
+    clock.advance(300)
     await drain(service)
     item = service.store.tickets["t1"]
-    assert item["count"] == 2 and item["escalation_started_at"] is None
-    assert "3分钟后将升级处理" in api.cli.sends[-1][1]
+    assert item["count"] == 1 and item["escalation_started_at"] is None
+    assert "5分钟后将升级处理" in api.cli.sends[-1][1]
 
-    clock.advance(179)
+    clock.advance(299)
     await drain(service)
     assert item["escalation_started_at"] is None
     clock.advance(1)
@@ -261,7 +258,7 @@ async def test_two_three_minute_reminders_then_thirty_minute_escalation(desk):
     assert "openChatId=oc_ticket" in api.cli.sends[-1][1]
     assert "本群每 30 分钟提醒一次" in api.cli.sends[-1][1]
     ticket_sends = [send for send in api.cli.sends if send[0] == "oc_ticket"]
-    assert len(ticket_sends) == 3
+    assert len(ticket_sends) == 2
 
     clock.advance(1799)
     await drain(service)
@@ -276,14 +273,14 @@ async def test_two_three_minute_reminders_then_thirty_minute_escalation(desk):
 
 @pytest.mark.asyncio
 async def test_ticket_group_stays_silent_but_escalation_continues_after_reply(desk):
-    service, api, clock = await initialized(desk, minutes=3, escalation=ESCALATION)
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
     human(service, clock, text="物流管理人工客服（TMS）")
     await drain(service)
     service.store.save(
         service.store.tickets["t1"],
-        count=2,
-        last_send=clock() - 180,
+        count=1,
+        last_send=clock() - 300,
         scenario="awaiting_handler",
         evaluated_generation=service.store.tickets["t1"]["generation"],
     )
@@ -305,7 +302,7 @@ async def test_ticket_group_stays_silent_but_escalation_continues_after_reply(de
 
 @pytest.mark.asyncio
 async def test_resolution_stops_escalation_and_restart_does_not_duplicate(desk, tmp_path):
-    service, api, clock = await desk(minutes=3, path=tmp_path, escalation=ESCALATION)
+    service, api, clock = await desk(minutes=5, path=tmp_path, escalation=ESCALATION)
     add_ticket(service, api, clock)
     await service.reconcile()
     await drain(service)
@@ -314,8 +311,8 @@ async def test_resolution_stops_escalation_and_restart_does_not_duplicate(desk, 
     await drain(service)
     service.store.save(
         service.store.tickets["t1"],
-        count=2,
-        last_send=clock() - 180,
+        count=1,
+        last_send=clock() - 300,
         scenario="awaiting_handler",
         evaluated_generation=service.store.tickets["t1"]["generation"],
     )
@@ -325,7 +322,7 @@ async def test_resolution_stops_escalation_and_restart_does_not_duplicate(desk, 
 
     await service.close()
     restarted, _, _ = await desk(
-        minutes=3,
+        minutes=5,
         path=tmp_path,
         clock=clock,
         api=api,
@@ -349,12 +346,12 @@ async def test_resolution_stops_escalation_and_restart_does_not_duplicate(desk, 
 
 @pytest.mark.asyncio
 async def test_configured_escalation_without_detected_system_does_not_close(desk):
-    service, api, clock = await initialized(desk, minutes=3, escalation=ESCALATION)
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     item = service.store.tickets["t1"]
     service.store.save(
         item,
-        count=2,
-        last_send=clock() - 180,
+        count=1,
+        last_send=clock() - 300,
         scenario="awaiting_handler",
         evaluated_generation=item["generation"],
     )
@@ -369,14 +366,14 @@ async def test_configured_escalation_without_detected_system_does_not_close(desk
 
 @pytest.mark.asyncio
 async def test_escalated_ticket_retries_failed_resolved_close(desk):
-    service, api, clock = await initialized(desk, minutes=3, escalation=ESCALATION)
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
     human(service, clock, text="物流管理人工客服（TMS）")
     await drain(service)
     service.store.save(
         service.store.tickets["t1"],
-        count=2,
-        last_send=clock() - 180,
+        count=1,
+        last_send=clock() - 300,
         scenario="awaiting_handler",
         evaluated_generation=service.store.tickets["t1"]["generation"],
     )

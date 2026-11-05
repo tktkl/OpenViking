@@ -433,7 +433,7 @@ class HelpdeskFollowup:
             return False
         if not self._escalated(item):
             return (
-                item["count"] >= 2
+                item["count"] >= 1
                 and item["last_send"] is not None
                 and self.clock() >= item["last_send"] + self.interval
             )
@@ -450,7 +450,7 @@ class HelpdeskFollowup:
         if self._escalated(item):
             base = item.get("escalation_last_sent") or item.get("escalation_started_at")
             return max(0.1, base + self.escalation_interval - self.clock()) if base else 0.1
-        if item["count"] >= 2 and item["last_send"] is not None:
+        if item["count"] >= 1 and item["last_send"] is not None:
             return max(0.1, item["last_send"] + self.interval - self.clock())
         return None
 
@@ -470,7 +470,7 @@ class HelpdeskFollowup:
             return escalation_wait <= 0.1
         base = item["last_send"] or item["last_human"] or item["welcome_at"]
         return self.clock() >= base + self.interval and (
-            item["count"] < 2 or item["scenario"] in BUSINESS_WAIT
+            item["count"] < 1 or item["scenario"] in BUSINESS_WAIT
         )
 
     async def tick(self):
@@ -513,7 +513,7 @@ class HelpdeskFollowup:
                 escalation_wait = self._escalation_wait(item)
                 if escalation_wait is not None:
                     delays.append(escalation_wait)
-                elif item["count"] < 2 or item["scenario"] in BUSINESS_WAIT:
+                elif item["count"] < 1 or item["scenario"] in BUSINESS_WAIT:
                     base = item["last_send"] or item["last_human"] or item["welcome_at"]
                     if base is not None:
                         delays.append(max(0.1, base + self.interval - self.clock()))
@@ -720,11 +720,9 @@ class HelpdeskFollowup:
         base = item["last_send"] or item["last_human"] or item["welcome_at"]
         if self.clock() < base + self.interval:
             return
-        if item["count"] < 2:
+        if item["count"] < 1:
             text = decision.followup
-            if item["count"] == 1 and (
-                decision.scenario in BUSINESS_WAIT or self._escalation_configured()
-            ):
+            if decision.scenario in BUSINESS_WAIT or self._escalation_configured():
                 minutes = self.config.helpdesk.followup_interval_minutes
                 suffix = (
                     self.config.helpdesk.messages.escalation_reminder_suffix
@@ -732,11 +730,11 @@ class HelpdeskFollowup:
                     else self.config.helpdesk.messages.second_reminder_suffix
                 )
                 text += "\n" + suffix.format(minutes=minutes)
-            receipt = await self._send(item, f"reminder:{generation}:{item['count'] + 1}", text)
+            receipt = await self._send(item, f"reminder:{generation}:1", text)
             current = self.store.tickets[ticket_id]
             if current["generation"] == generation:
                 self.store.save(
-                    current, count=item["count"] + 1, last_send=receipt["sent_at"], retry_at=0
+                    current, count=1, last_send=receipt["sent_at"], retry_at=0
                 )
         elif self._escalation_configured():
             await self._maybe_escalate(item, generation)
@@ -744,7 +742,7 @@ class HelpdeskFollowup:
             # Backward-compatible behavior when no escalation routes exist.
             try:
                 await self._close(
-                    item, solved=1, reason="两次提醒后业务仍未补充或确认，等待回复超时"
+                    item, solved=1, reason="催办后业务仍未补充或确认，等待回复超时"
                 )
             except StaleAction:
                 raise
@@ -951,7 +949,7 @@ class HelpdeskFollowup:
 
         def check_timeout(current):
             if solved == 1 and (
-                current["count"] != 2
+                current["count"] != 1
                 or current["scenario"] not in BUSINESS_WAIT
                 or current["last_send"] is None
                 or self.clock() < current["last_send"] + self.interval

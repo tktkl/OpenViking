@@ -27,7 +27,7 @@ class HelpdeskMessagesConfig(BaseModel):
     )
     closed_resolved: str = Field(default="问题已解决，工单已关闭。", min_length=1, max_length=1000)
     closed_timeout: str = Field(
-        default="因两次提醒后仍未收到业务补充或确认，工单已关闭。", min_length=1, max_length=1000
+        default="因催办后仍未收到业务补充或确认，工单已关闭。", min_length=1, max_length=1000
     )
 
     @field_validator("prefix", "welcome", "closed_resolved", "closed_timeout")
@@ -147,7 +147,7 @@ class FeishuHelpdeskConfig(BaseModel):
     enabled: bool = False
     helpdesk_id: str = ""
     helpdesk_token: str = Field(default="", repr=False)
-    followup_interval_minutes: int = Field(default=3, gt=0, strict=True)
+    followup_interval_minutes: int = Field(default=5, gt=0, strict=True)
     messages: HelpdeskMessagesConfig = Field(default_factory=HelpdeskMessagesConfig)
     cli: LarkCLIConfig = Field(default_factory=LarkCLIConfig)
     reply: FeishuHelpdeskReplyConfig = Field(default_factory=FeishuHelpdeskReplyConfig)

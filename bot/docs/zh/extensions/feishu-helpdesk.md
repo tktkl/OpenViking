@@ -2,7 +2,7 @@
 
 本扩展让配置式飞书渠道自动加入服务台工单绑定群。入群后，用户在群内 `@Bot`，由原有 `FeishuChannel` 解析消息、调用 Agent 并回复。普通单聊、群聊继续使用同一个渠道，不需要另开一条长连接。
 
-启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。工单群的欢迎、两次跟进和关闭说明默认使用 `reply.mode="feishu_web"` 的服务台 Web 会话身份发送；普通 IM 升级群默认使用应用 Bot 的官方 IM API。关单通过独立 Python 子进程使用 CLI 当前用户凭据执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
+启用服务台后，同时运行事件监测、每 60 秒主动补漏和持久化到期调度。工单群的欢迎、一次跟进和关闭说明默认使用 `reply.mode="feishu_web"` 的服务台 Web 会话身份发送；普通 IM 升级群默认使用应用 Bot 的官方 IM API。关单通过独立 Python 子进程使用 CLI 当前用户凭据执行；部署与状态机详见 [服务台主动跟进](feishu-helpdesk-followup.md)。
 
 更新官方代码前，按 [bot-main 上游合并影响](upstream-merge-impact.md) 核对核心接入点、扩展依赖及合并后回归。
 
@@ -50,7 +50,7 @@
           "enabled": true,
           "helpdesk_id": "<目标服务台 ID>",
           "helpdesk_token": "<服务台 Token>",
-          "followup_interval_minutes": 3,
+          "followup_interval_minutes": 5,
           "reply": {
             "mode": "feishu_web",
             "auth_mcp_server": "wangoon-auth-mcp",
@@ -107,10 +107,10 @@
 - 服务台收到带图片的实时消息时，会把同一消息内的全部图片一次性交给视觉模型生成摘要并写回工单状态；自动跟进判断使用该摘要，避免每轮重复读图。图片原文件仍保留在本地缓存中，供人工回复时重新读取。
 - `allow_from` 是该飞书渠道的发送者白名单，单聊、普通群和工单群均遵守。上例的 `[]` 表示允许所有用户提问；配置非空列表时，仅列表中的 open_id 可以使用 Bot，其他用户即使在工单群内 `@Bot` 也会被拒绝并记录 `Access denied`。如需开放渠道，在实际生效的 `ov.conf` 中将目标渠道的 `allow_from` 设为 `[]`；本扩展不会自动清空已有名单，也不为工单群绕过名单。命令权限仍按原有 `allow_cmd_from` 和运行模式判断，是否需要 `@Bot` 仍由 `thread_require_mention` 控制。
 - `helpdesk_id`、`helpdesk_token` 来自目标服务台，用于读取、订阅及关单的服务台请求头。
-- `followup_interval_minutes` 默认 `3`，严格正整数，重启生效。提醒次数固定两次；第二次后仍未解决时按 `escalation.groups` 升级，并在升级群每 `escalation.interval_minutes` 分钟提醒一次。
+- `followup_interval_minutes` 默认 `5`，严格正整数，重启生效。提醒次数固定一次；首次提醒后仍未解决时按 `escalation.groups` 升级，并在升级群每 `escalation.interval_minutes` 分钟提醒一次。
 - `reply.mode` 默认 `lark_cli`；服务台工单群推荐 `feishu_web`。后者使用 auth-mcp 的完整原始 Web 会话 Cookie、feed-id 缓存和 Web Messenger 网关，Cookie 不写日志、不落盘，持久化文件只包含 `oc_*` 到内部 feed id 的映射。`auto_resolve_feed_id` 需要可用的无头 Chromium/Playwright；可先用 `feed_ids` 手工固定映射。
 - `escalation.sender` 默认 `bot`，升级群通过官方 IM API 以应用 Bot 身份发送；`lark_cli` 使用 CLI 用户身份。两条升级发送路径都不会使用 Web Messenger。
-- 启用升级后，工单群连续两次提醒后再静默 3 分钟即升级，原工单群停止提醒；升级群每 30 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
+- 启用升级后，工单群首次提醒后再静默 5 分钟即升级，原工单群停止提醒；升级群每 30 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
 - `followup_skill_groups` 把当前工单技能组映射到一个或多个系统，再复用 `escalation.groups` 解析升级群。只有当前技能组命中该映射才继续欢迎、提醒和判断；未命中时暂停自动跟进并尝试一次 Bot 退群，失败只记录不重试。技能组从范围外切回范围内时自动恢复入群和跟进。转接消息本身不会停止跟进，“原客服已退出会话”也不作为退出条件。
 - `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。Python 关单模块随 VikingBot 安装，自动使用当前 Python 解释器，不增加脚本路径配置。
 - `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile，并先通过 CLI 完成该 profile 的应用配置。扩展会校验其 App ID 与飞书渠道一致，不匹配就跳过用户操作。
@@ -188,7 +188,7 @@ PYTHONPATH=bot python -m pytest -c bot/pytest.ini \
   bot/tests/test_compile_preview_hook_signature.py
 ```
 
-真实环境验收使用测试服务台和测试 profile：核验用户授权、Bot 入群、普通 IM、白名单、话题、媒体、Web Messenger feed 解析及升级群 Bot 发送，然后按主动跟进文档验证 3／6／9 分钟时间线、30 分钟升级重复、重启补漏和关单条件。自动测试不发送真实飞书消息。
+真实环境验收使用测试服务台和测试 profile：核验用户授权、Bot 入群、普通 IM、白名单、话题、媒体、Web Messenger feed 解析及升级群 Bot 发送，然后按主动跟进文档验证 5／10 分钟时间线、30 分钟升级重复、重启补漏和关单条件。自动测试不发送真实飞书消息。
 
 ## 与官方代码的边界
 
