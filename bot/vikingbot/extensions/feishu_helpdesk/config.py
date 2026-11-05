@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from vikingbot.extensions.feishu_helpdesk.escalation import normalize_system
+from vikingbot.extensions.feishu_helpdesk.escalation import normalize_skill_group, normalize_system
 
 WELCOME = "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。"
 
@@ -100,6 +100,7 @@ class FeishuHelpdeskEscalationConfig(BaseModel):
     interval_minutes: int = Field(default=30, gt=0, strict=True)
     sender: Literal["bot", "lark_cli"] = "bot"
     groups: dict[str, str] = Field(default_factory=dict)
+    followup_skill_groups: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("groups")
     @classmethod
@@ -113,6 +114,33 @@ class FeishuHelpdeskEscalationConfig(BaseModel):
                 raise ValueError("escalation group system names are case-insensitive duplicates")
             groups[name] = target
         return groups
+
+    @model_validator(mode="after")
+    def validate_followup_skill_groups(self):
+        scope = {}
+        seen = set()
+        for group, systems in self.followup_skill_groups.items():
+            label = str(group).strip()
+            name = normalize_skill_group(label)
+            if not name:
+                raise ValueError("followup skill groups require non-empty names")
+            if name in seen:
+                raise ValueError("followup skill groups are case-insensitive duplicates")
+            seen.add(name)
+            if not isinstance(systems, list) or not systems:
+                raise ValueError("followup skill groups require a non-empty system list")
+            normalized_systems = []
+            for system in systems:
+                system_name = normalize_system(system)
+                if system_name not in self.groups:
+                    raise ValueError(
+                        f"followup skill group {group!r} references unconfigured system {system!r}"
+                    )
+                if system_name not in normalized_systems:
+                    normalized_systems.append(system_name)
+            scope[label] = normalized_systems
+        self.followup_skill_groups = scope
+        return self
 
 
 class FeishuHelpdeskConfig(BaseModel):

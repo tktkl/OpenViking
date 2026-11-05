@@ -19,6 +19,15 @@ def normalize_system(value: object) -> str:
     return normalized
 
 
+def normalize_skill_group(value: object) -> str:
+    """Normalize configured and runtime skill-group labels for exact matching."""
+    compact = re.sub(r"\s+", "", str(value or "").strip())
+    # The JSON loader expands all-uppercase dictionary keys such as TMS into
+    # T_M_S. Collapse those separators for skill-group labels as well.
+    compact = re.sub(r"(?<=[A-Za-z/])_(?=[A-Za-z])", "", compact)
+    return compact.casefold().replace("（", "(").replace("）", ")")
+
+
 def _field_text(value: object) -> str:
     if isinstance(value, str):
         return value
@@ -73,6 +82,27 @@ def detect_system(ticket: dict, messages: list[dict], systems: list[str] | tuple
     return _match_system(_field_text(ticket.get("hit_agent_groups")), normalized)
 
 
+def detect_skill_group(ticket: dict, groups: list[str] | tuple[str, ...]) -> str:
+    """Return the configured skill group currently assigned to the ticket."""
+    configured = {
+        normalize_skill_group(group): str(group)
+        for group in groups
+        if normalize_skill_group(group)
+    }
+    if not configured:
+        return ""
+    candidates = [ticket.get("actual_agent_group")]
+    hit_groups = ticket.get("hit_agent_groups")
+    if isinstance(hit_groups, list):
+        candidates.extend(
+            group.get("name") if isinstance(group, dict) else group for group in hit_groups
+        )
+    for candidate in candidates:
+        if normalize_skill_group(candidate) in configured:
+            return str(candidate).strip()
+    return ""
+
+
 def ticket_subject(guest: object, system: str) -> str:
     """Return a short, non-empty human label without leaking unrelated fields."""
     name = ""
@@ -105,7 +135,9 @@ def render_escalation(
 
 
 __all__ = [
+    "detect_skill_group",
     "detect_system",
+    "normalize_skill_group",
     "normalize_system",
     "render_escalation",
     "ticket_group_link",

@@ -152,6 +152,7 @@ class BaseChannel(ABC):
         sender_name: str | None = None,
         need_reply: bool = True,
         media: list[str] | None = None,
+        media_refs: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """
@@ -186,6 +187,7 @@ class BaseChannel(ABC):
             need_reply=need_reply,
             content=content,
             media=media or [],
+            media_refs=media_refs or [],
             metadata=metadata or {},
         )
 

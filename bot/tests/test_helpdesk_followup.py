@@ -1888,6 +1888,51 @@ async def test_judge_trusts_human_relay_sender_as_processing_side():
 
 
 @pytest.mark.asyncio
+async def test_judge_receives_combined_multi_image_summary():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_handler",
+                        "evidence_ids": ["om_images"],
+                        "reason": "业务已提供两张问题截图",
+                        "followup": "请处理方排查批量下载失败原因。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "vision-model")
+    await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": []},
+        [
+            {
+                "im_id": "om_images",
+                "human": True,
+                "sender": "ou_guest",
+                "kind": "post",
+                "text": "批量下载失败",
+                "image_summary": "图1：失败任务列表；图2：下载超时提示",
+                "time": 1,
+            }
+        ],
+    )
+
+    prompt_messages = json.loads(provider.chat.await_args.kwargs["messages"][1]["content"])
+    assert prompt_messages == [
+        {
+            "id": "om_images",
+            "role": "guest",
+            "kind": "post",
+            "text": "批量下载失败",
+            "image_summary": "图1：失败任务列表；图2：下载超时提示",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_judge_accepts_awaiting_details_despite_unrelated_latest_chatter():
     provider = SimpleNamespace(
         chat=AsyncMock(

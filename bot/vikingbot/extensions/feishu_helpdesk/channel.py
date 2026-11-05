@@ -16,6 +16,7 @@ from vikingbot.extensions.feishu_helpdesk.api import HelpdeskAPI, HelpdeskAPIErr
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
 from vikingbot.extensions.feishu_helpdesk.decision import message_text
 from vikingbot.extensions.feishu_helpdesk.followup import HelpdeskFollowup
+from vikingbot.extensions.feishu_helpdesk.media import summarize_images
 from vikingbot.extensions.feishu_helpdesk.state import timestamp
 
 CLOSED_STATUSES = {50, 51, 52}
@@ -101,6 +102,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
                 pass
         self._helpdesk_ready = False
         self._join_tasks: dict[str, asyncio.Task] = {}
+        self._media_summary_keys: set[str] = set()
         self._ticket_chats: OrderedDict[str, str] = OrderedDict()
         self._followup = None
         self._followup_deps = {
@@ -108,6 +110,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             "model": model,
             "session_busy": session_busy,
             "reply_sender": reply_sender,
+            "on_leave_chat": self._helpdesk_api.leave_chat,
         }
 
     def _event_handler_builder(self):
@@ -192,6 +195,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             await self._followup.close()
         self._helpdesk_tasks.clear()
         self._join_tasks.clear()
+        self._media_summary_keys.clear()
         self._ticket_chats.clear()
         if self._resolver_task is not None:
             self._resolver_task.cancel()
@@ -274,7 +278,8 @@ class FeishuHelpdeskChannel(FeishuChannel):
         return bool(
             item
             and item.get("paused")
-            and item.get("pause_reason") == "actor_not_assigned"
+            and item.get("pause_reason")
+            in {"actor_not_assigned", "outside_followup_scope"}
         )
 
     async def _restore_ticket(self, item):
@@ -457,4 +462,69 @@ class FeishuHelpdeskChannel(FeishuChannel):
         if ticket_id:
             metadata["helpdesk_ticket_id"] = ticket_id
             metadata["helpdesk_id"] = self.config.helpdesk.helpdesk_id
+            content = args[2] if len(args) > 2 else kwargs.get("content", "")
+            self._observe_ticket_media(
+                ticket_id,
+                metadata,
+                kwargs.get("media_refs") or [],
+                content=content,
+            )
         return await super()._handle_message(*args, metadata=metadata, **kwargs)
+
+    def _observe_ticket_media(self, ticket_id, metadata, media_refs, *, content=""):
+        if not media_refs or self._followup is None or not self._followup.running:
+            return
+        message_id = str(metadata.get("message_id") or "")
+        if not message_id:
+            return
+        record = {"im_id": message_id, "media_refs": media_refs}
+        self._followup.observe(ticket_id, record)
+        self._followup.dirty(ticket_id)
+
+        existing = next(
+            (
+                message
+                for message in self._followup.store.messages(ticket_id)
+                if message.get("im_id") == message_id
+            ),
+            {},
+        )
+        if existing.get("image_summary"):
+            return
+        key = f"{ticket_id}:{message_id}"
+        if key in self._media_summary_keys:
+            return
+        self._media_summary_keys.add(key)
+        paths = [
+            ref.get("cache_path")
+            for ref in media_refs
+            if isinstance(ref, dict) and isinstance(ref.get("cache_path"), str)
+        ]
+        if not paths:
+            self._media_summary_keys.discard(key)
+            return
+        task = asyncio.create_task(
+            self._summarize_ticket_media(ticket_id, message_id, paths, content=content),
+            name=f"helpdesk-image-summary:{message_id}",
+        )
+        self._helpdesk_tasks.add(task)
+        task.add_done_callback(partial(self._media_summary_done, key=key))
+
+    def _media_summary_done(self, task, *, key):
+        self._media_summary_keys.discard(key)
+        self._ticket_done(task)
+
+    async def _summarize_ticket_media(self, ticket_id, message_id, paths, *, content=""):
+        if self._followup is None or not self._followup.running:
+            return
+        summary = await summarize_images(
+            paths,
+            provider=self._followup.judge.provider,
+            model=self._followup.judge.model,
+            context=str(content or ""),
+        )
+        self._followup.observe(
+            ticket_id,
+            {"im_id": message_id, "image_summary": summary},
+        )
+        self._followup.dirty(ticket_id)

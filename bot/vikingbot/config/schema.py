@@ -120,6 +120,17 @@ class TelegramChannelConfig(BaseChannelConfig):
         return self.token.split(":")[0] if ":" in self.token else self.token
 
 
+class FeishuMediaWindowConfig(BaseModel):
+    """Bounded recent-media context for Feishu group conversations."""
+
+    enabled: bool = True
+    max_images: int = Field(default=4, ge=1)
+    max_age_minutes: int = Field(default=10, ge=1)
+    max_messages: int = Field(default=20, ge=1)
+    same_sender_only: bool = True
+    include_reply_parent: bool = True
+
+
 class FeishuChannelConfig(BaseChannelConfig):
     """Feishu/Lark channel configuration (multi-channel support)."""
 
@@ -141,6 +152,7 @@ class FeishuChannelConfig(BaseChannelConfig):
         default=True,
         description="群聊是否需要@才响应：默认True=普通群和话题群的所有消息都必须@才响应；False=普通群无需@，话题群仅首条消息无需@，非DEBUG模式下后续回复必须@",
     )
+    media_window: FeishuMediaWindowConfig = Field(default_factory=FeishuMediaWindowConfig)
 
     def channel_id(self) -> str:
         # Use app_id directly as the ID

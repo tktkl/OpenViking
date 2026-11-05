@@ -21,6 +21,7 @@ from vikingbot.config.schema import BotMode, FeishuChannelConfig
 from vikingbot.extensions.feishu_helpdesk.api import HelpdeskAPI, HelpdeskAPIError
 from vikingbot.extensions.feishu_helpdesk.channel import FeishuHelpdeskChannel
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
+from vikingbot.extensions.feishu_helpdesk.media import summarize_images
 
 
 @pytest.fixture
@@ -129,6 +130,59 @@ async def test_wrong_application_event_is_ignored(channel):
     event.header.app_id = "cli_other"
     await channel._on_ticket(event)
     channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multi_image_summary_is_stored_once(channel, monkeypatch):
+    observe = Mock()
+    channel._followup = SimpleNamespace(
+        running=True,
+        observe=observe,
+        dirty=Mock(),
+        close=AsyncMock(),
+        judge=SimpleNamespace(provider=object(), model="vision-model"),
+        store=SimpleNamespace(messages=lambda ticket_id: [{"im_id": "om_images"}]),
+    )
+    summarize = AsyncMock(return_value="图1：失败列表；图2：下载超时提示")
+    monkeypatch.setattr("vikingbot.extensions.feishu_helpdesk.channel.summarize_images", summarize)
+    refs = [
+        {"message_id": "om_images", "image_key": "img_1", "cache_path": "/tmp/one.png"},
+        {"message_id": "om_images", "image_key": "img_2", "cache_path": "/tmp/two.png"},
+    ]
+
+    channel._observe_ticket_media("ticket_1", {"message_id": "om_images"}, refs)
+    await asyncio.gather(*tuple(channel._helpdesk_tasks))
+
+    summarize.assert_awaited_once_with(
+        ["/tmp/one.png", "/tmp/two.png"],
+        provider=channel._followup.judge.provider,
+        model="vision-model",
+        context="",
+    )
+    assert observe.call_args_list[-1].args == (
+        "ticket_1",
+        {"im_id": "om_images", "image_summary": "图1：失败列表；图2：下载超时提示"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_summary_passes_every_image_without_size_filter(tmp_path):
+    large = tmp_path / "large.png"
+    large.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * (10 * 1024 * 1024))
+    small = tmp_path / "small.png"
+    small.write_bytes(b"\x89PNG\r\n\x1a\nsmall")
+    provider = SimpleNamespace(
+        chat=AsyncMock(return_value=SimpleNamespace(content="图1：大图；图2：小图"))
+    )
+
+    summary = await summarize_images(
+        [str(large), str(small)], provider=provider, model="vision-model"
+    )
+
+    assert summary == "图1：大图；图2：小图"
+    content = provider.chat.await_args.kwargs["messages"][0]["content"]
+    assert len(content) == 3
+    assert all(part["type"] == "image_url" for part in content[1:])
 
 
 @pytest.mark.asyncio
@@ -702,6 +756,18 @@ async def test_helpdesk_im_keeps_media_mentions_topics_and_reply_anchor(
     assert incoming.metadata["helpdesk_ticket_id"] == "ticket_1"
     assert incoming.metadata["helpdesk_id"] == "desk_1"
     assert incoming.media == (["/tmp/received.png"] if message_type in ("image", "post") else [])
+    if message_type in ("image", "post"):
+        assert incoming.media_refs == [
+            {
+                "source": "feishu_im",
+                "message_id": "om_user",
+                "image_key": "img_user",
+                "index": 0,
+                "cache_path": "/tmp/received.png",
+            }
+        ]
+    else:
+        assert incoming.media_refs == []
     assert "@_user_1" not in incoming.content
     channel._add_reaction.assert_awaited_once_with("om_user", "MeMeMe")
 

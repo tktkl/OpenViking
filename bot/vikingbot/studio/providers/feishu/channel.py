@@ -43,6 +43,7 @@ class StudioFeishuChannel(FeishuChannel):
         sender_name=None,
         need_reply=True,
         media=None,
+        media_refs=None,
         metadata=None,
     ):
         if not self._running or not self.is_allowed(sender_id):
@@ -112,6 +113,7 @@ class StudioFeishuChannel(FeishuChannel):
                 content=content,
                 need_reply=need_reply,
                 media=media or [],
+                media_refs=media_refs or [],
                 metadata=metadata,
                 openviking_connection=self.openviking_connection,
             )

@@ -1,11 +1,14 @@
 """Escalation routing, timing, and self-healing behavior."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 from pydantic import ValidationError
 from vikingbot.config.schema import FeishuChannelConfig
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
 from vikingbot.extensions.feishu_helpdesk.decision import Decision
 from vikingbot.extensions.feishu_helpdesk.escalation import (
+    detect_skill_group,
     detect_system,
     normalize_system,
     render_escalation,
@@ -26,6 +29,18 @@ ESCALATION = {
         "qms": COMMON_GROUP,
         "pdm": COMMON_GROUP,
         "plm": COMMON_GROUP,
+    },
+}
+
+SCOPE_ESCALATION = {
+    **ESCALATION,
+    "followup_skill_groups": {
+        "TMS技能组": ["TMS"],
+        "PDM技能组": ["PDM"],
+        "PDM英文技能组": ["PDM"],
+        "QMS/SCM英文版技能组": ["SCM", "QMS"],
+        "供应链业务线": ["SCM", "QMS", "SRM", "PDM", "PLM"],
+        "紧急故障（大供应链）": ["SCM", "QMS", "SRM", "PDM", "PLM"],
     },
 }
 
@@ -58,6 +73,45 @@ def test_escalation_rejects_invalid_group_targets(field):
     groups = {"PDM": COMMON_GROUP, "TMS": "not-a-chat"} if field == "groups" else {"": COMMON_GROUP}
     with pytest.raises(ValidationError):
         FeishuChannelConfig(helpdesk={"escalation": {"groups": groups}})
+
+
+def test_skill_group_scope_reuses_escalation_groups():
+    configured = FeishuChannelConfig(
+        helpdesk={"escalation": SCOPE_ESCALATION}
+    ).helpdesk.escalation
+    assert configured.followup_skill_groups["供应链业务线"] == [
+        "SCM",
+        "QMS",
+        "SRM",
+        "PDM",
+        "PLM",
+    ]
+    assert (
+        detect_skill_group(
+            {"actual_agent_group": "供应链业务线"},
+            list(configured.followup_skill_groups),
+        )
+        == "供应链业务线"
+    )
+    assert (
+        detect_skill_group(
+            {"hit_agent_groups": [{"name": "紧急故障（大供应链）"}]},
+            list(configured.followup_skill_groups),
+        )
+        == "紧急故障（大供应链）"
+    )
+
+
+def test_skill_group_scope_rejects_unconfigured_system():
+    with pytest.raises(ValidationError):
+        FeishuChannelConfig(
+            helpdesk={
+                "escalation": {
+                    **ESCALATION,
+                    "followup_skill_groups": {"供应链业务线": ["WMS"]},
+                }
+            }
+        )
 
 
 def test_system_detection_uses_initial_human_choice_not_bot_option_list():
@@ -112,6 +166,66 @@ def test_escalation_text_uses_customer_name_and_clickable_ticket_group():
 async def test_system_to_group_routing(desk, system, expected):
     service, _, _ = await desk(minutes=3, escalation=ESCALATION)
     assert service._escalation_target(system) == expected
+
+
+@pytest.mark.asyncio
+async def test_followup_scope_pauses_outside_group_and_resumes_when_switched_back(desk):
+    service, api, clock = await desk(minutes=3, escalation=SCOPE_ESCALATION)
+    add_ticket(service, api, clock)
+    api.tickets["t1"]["actual_agent_group"] = "TMS技能组"
+    service.register(api.tickets["t1"], authoritative=True)
+    item = service.store.tickets["t1"]
+    assert item["followup_skill_group"] == "TMS技能组"
+    assert item["followup_systems"] == ["TMS"]
+    assert item["paused"] is False
+
+    service.on_leave_chat = AsyncMock(return_value=True)
+    clock.advance(1)
+    api.tickets["t1"].update(
+        actual_agent_group="财务技能组",
+        hit_agent_groups=[{"name": "财务技能组"}],
+        updated_at=int(clock() * 1000),
+    )
+    service.register(api.tickets["t1"], authoritative=True)
+    item = service.store.tickets["t1"]
+    assert item["paused"] is True
+    assert item["pause_reason"] == "outside_followup_scope"
+    assert item["scope_exit_pending"] is True
+
+    await service.reconcile(ids=["t1"])
+    await drain(service)
+    service.on_leave_chat.assert_awaited_once_with("oc_ticket")
+    item = service.store.tickets["t1"]
+    assert item["scope_exit_pending"] is False
+    assert item["scope_exit_attempted"] is True
+    assert not api.cli.sends
+
+    clock.advance(1)
+    api.tickets["t1"].update(
+        actual_agent_group="供应链业务线",
+        hit_agent_groups=[{"name": "供应链业务线"}],
+        updated_at=int(clock() * 1000),
+    )
+    service.register(api.tickets["t1"], authoritative=True)
+    item = service.store.tickets["t1"]
+    assert item["paused"] is False
+    assert item["pause_reason"] == ""
+    assert item["followup_systems"] == ["SCM", "QMS", "SRM", "PDM", "PLM"]
+    assert item["escalation_chat_id"] == COMMON_GROUP
+    assert item["scope_exit_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_three_minute_reminders_skip_welcome_outside_followup_scope(desk):
+    service, api, clock = await desk(minutes=3, escalation=SCOPE_ESCALATION)
+    add_ticket(service, api, clock)
+    api.tickets["t1"]["actual_agent_group"] = "财务技能组"
+    service.register(api.tickets["t1"], authoritative=True)
+    service.on_leave_chat = AsyncMock(return_value=True)
+    await service.reconcile(ids=["t1"])
+    await drain(service)
+    assert not api.cli.sends
+    assert service.store.tickets["t1"]["pause_reason"] == "outside_followup_scope"
 
 
 @pytest.mark.asyncio

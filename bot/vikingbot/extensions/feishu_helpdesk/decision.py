@@ -46,10 +46,19 @@ def _coalesce_echoed_messages(messages):
             result.append(dict(message))
             continue
         candidate = result[duplicate_index]
-        if str(message.get("im_id") or "").startswith("om_") and not str(
-            candidate.get("im_id") or ""
-        ).startswith("om_"):
-            result[duplicate_index] = dict(message)
+        current_im = str(message.get("im_id") or "")
+        candidate_im = str(candidate.get("im_id") or "")
+        # Prefer the IM echo as the stable evidence identifier, while retaining
+        # image metadata that may only exist on the ticket-side copy.
+        if current_im.startswith("om_") and not candidate_im.startswith("om_"):
+            base, extra = message, candidate
+        else:
+            base, extra = candidate, message
+        merged = {**extra, **base}
+        for key in ("image_summary", "media_refs"):
+            if not merged.get(key):
+                merged[key] = extra.get(key)
+        result[duplicate_index] = merged
     return result
 
 
@@ -183,6 +192,11 @@ class ConversationJudge:
                 "kind": msg.get("kind", "unknown"),
                 "text": truncate_text_to_token_budget(msg.get("text", ""), self.budget // 2),
             }
+            image_summary = str(msg.get("image_summary") or "").strip()
+            if image_summary:
+                entry["image_summary"] = truncate_text_to_token_budget(
+                    image_summary, self.budget // 2
+                )
             if estimate_serialized_tokens([entry, *prepared]) > record_budget:
                 break
             prepared.insert(0, entry)

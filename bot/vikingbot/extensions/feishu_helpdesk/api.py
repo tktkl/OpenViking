@@ -217,6 +217,12 @@ class HelpdeskAPI:
             raise HelpdeskAPIError("verify bot membership", "invalid_response")
         return member
 
+    async def leave_chat(self, chat_id: str) -> bool:
+        """Remove this bot via the authorized user CLI identity."""
+        if not chat_id.startswith("oc_"):
+            raise HelpdeskAPIError("leave chat", "invalid_chat_id")
+        return await self.cli.leave_bot(chat_id)
+
     async def ensure_in_chat(self, chat_id: str) -> bool:
         if await self.is_in_chat(chat_id):
             return True

@@ -38,6 +38,14 @@
         "bot_name": "<机器人显示名>",
         "allow_from": [],
         "thread_require_mention": true,
+        "media_window": {
+          "enabled": true,
+          "max_images": 4,
+          "max_age_minutes": 10,
+          "max_messages": 20,
+          "same_sender_only": true,
+          "include_reply_parent": true
+        },
         "helpdesk": {
           "enabled": true,
           "helpdesk_id": "<目标服务台 ID>",
@@ -70,6 +78,14 @@
               "QMS": "oc_business_escalation_group",
               "PDM": "oc_business_escalation_group",
               "PLM": "oc_business_escalation_group"
+            },
+            "followup_skill_groups": {
+              "TMS技能组": ["TMS"],
+              "PDM技能组": ["PDM"],
+              "PDM英文技能组": ["PDM"],
+              "QMS/SCM英文版技能组": ["SCM", "QMS"],
+              "供应链业务线": ["SCM", "QMS", "SRM", "PDM", "PLM"],
+              "紧急故障（大供应链）": ["SCM", "QMS", "SRM", "PDM", "PLM"]
             }
           },
           "cli": {
@@ -87,12 +103,15 @@
 ```
 
 - `helpdesk.enabled` 默认 `false`，不开启时仍创建官方 `FeishuChannel`。
+- `media_window` 控制群聊图片上下文：非 @ 的图片消息仍会保存图片引用；后续 @Bot 时，会在当前图片、被引用父消息和同发送者最近消息中选取图片附加到当前轮。只限制图片数量、时间和消息条数，不限制单张图片大小。历史仍只保存文字，不会把图片重复注入每一轮请求。
+- 服务台收到带图片的实时消息时，会把同一消息内的全部图片一次性交给视觉模型生成摘要并写回工单状态；自动跟进判断使用该摘要，避免每轮重复读图。图片原文件仍保留在本地缓存中，供人工回复时重新读取。
 - `allow_from` 是该飞书渠道的发送者白名单，单聊、普通群和工单群均遵守。上例的 `[]` 表示允许所有用户提问；配置非空列表时，仅列表中的 open_id 可以使用 Bot，其他用户即使在工单群内 `@Bot` 也会被拒绝并记录 `Access denied`。如需开放渠道，在实际生效的 `ov.conf` 中将目标渠道的 `allow_from` 设为 `[]`；本扩展不会自动清空已有名单，也不为工单群绕过名单。命令权限仍按原有 `allow_cmd_from` 和运行模式判断，是否需要 `@Bot` 仍由 `thread_require_mention` 控制。
 - `helpdesk_id`、`helpdesk_token` 来自目标服务台，用于读取、订阅及关单的服务台请求头。
 - `followup_interval_minutes` 默认 `3`，严格正整数，重启生效。提醒次数固定两次；第二次后仍未解决时按 `escalation.groups` 升级，并在升级群每 `escalation.interval_minutes` 分钟提醒一次。
 - `reply.mode` 默认 `lark_cli`；服务台工单群推荐 `feishu_web`。后者使用 auth-mcp 的完整原始 Web 会话 Cookie、feed-id 缓存和 Web Messenger 网关，Cookie 不写日志、不落盘，持久化文件只包含 `oc_*` 到内部 feed id 的映射。`auto_resolve_feed_id` 需要可用的无头 Chromium/Playwright；可先用 `feed_ids` 手工固定映射。
 - `escalation.sender` 默认 `bot`，升级群通过官方 IM API 以应用 Bot 身份发送；`lark_cli` 使用 CLI 用户身份。两条升级发送路径都不会使用 Web Messenger。
 - 启用升级后，工单群连续两次提醒后再静默 3 分钟即升级，原工单群停止提醒；升级群每 30 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
+- `followup_skill_groups` 把当前工单技能组映射到一个或多个系统，再复用 `escalation.groups` 解析升级群。只有当前技能组命中该映射才继续欢迎、提醒和判断；未命中时暂停自动跟进并尝试一次 Bot 退群，失败只记录不重试。技能组从范围外切回范围内时自动恢复入群和跟进。转接消息本身不会停止跟进，“原客服已退出会话”也不作为退出条件。
 - `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。Python 关单模块随 VikingBot 安装，自动使用当前 Python 解释器，不增加脚本路径配置。
 - `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile，并先通过 CLI 完成该 profile 的应用配置。扩展会校验其 App ID 与飞书渠道一致，不匹配就跳过用户操作。
 - 授权的客服用户必须已在目标工单群内，且群设置允许其添加机器人。服务台 Token 和机器人自己的 `tenant_access_token` 不能替代这项用户授权。

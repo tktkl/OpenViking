@@ -133,6 +133,13 @@ class HelpdeskState:
                 "close_pending": None,
                 "notice_pending": False,
                 "paused": False,
+                "pause_reason": "",
+                "followup_skill_group": "",
+                "followup_systems": [],
+                "scope_exit_pending": False,
+                "scope_exit_attempted": False,
+                "left_chat_at": None,
+                "leave_chat_error": "",
                 "escalation_system": "",
                 "escalation_chat_id": "",
                 "escalation_started_at": None,
@@ -187,12 +194,22 @@ class HelpdeskState:
                 close_pending=None,
                 notice_pending=False,
                 retry_at=0,
+                followup_skill_group="",
+                followup_systems=[],
+                scope_exit_pending=False,
+                scope_exit_attempted=False,
+                left_chat_at=None,
+                leave_chat_error="",
                 escalation_system="",
                 escalation_chat_id="",
                 escalation_started_at=None,
                 escalation_last_sent=None,
                 escalation_count=0,
             )
+        old_group_state = (
+            old.get("actual_agent_group"),
+            old.get("hit_agent_groups"),
+        )
         for key in (
             "guest",
             "agents",
@@ -204,6 +221,19 @@ class HelpdeskState:
         ):
             if key in ticket:
                 values[key] = ticket[key]
+        new_group_state = (
+            ticket.get("actual_agent_group", old.get("actual_agent_group")),
+            ticket.get("hit_agent_groups", old.get("hit_agent_groups")),
+        )
+        if new_group_state != old_group_state:
+            # Skill-group ownership is authoritative for follow-up scope.
+            # Recompute it whenever Feishu changes the current assignment.
+            values.update(
+                followup_skill_group="",
+                followup_systems=[],
+                escalation_system="",
+                escalation_chat_id="",
+            )
         candidate = {**old, **values}
         if status != old["status"] or _identity_signature(candidate) != _identity_signature(old):
             values["generation"] = old["generation"] + 1
@@ -326,7 +356,10 @@ class HelpdeskState:
         elif (
             merged.get("human") is not False
             and not merged.get("pending_provenance")
-            and any(merged.get(k) != old.get(k) for k in ("text", "human", "sender", "kind"))
+            and any(
+                merged.get(k) != old.get(k)
+                for k in ("text", "human", "sender", "kind", "image_summary")
+            )
         ):
             # Unknown provenance and edited content also invalidate a decision,
             # without pretending that a system message was human activity.

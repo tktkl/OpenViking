@@ -23,7 +23,9 @@ from vikingbot.extensions.feishu_helpdesk.decision import (
 )
 from vikingbot.extensions.feishu_helpdesk.delivery import HelpdeskDelivery
 from vikingbot.extensions.feishu_helpdesk.escalation import (
+    detect_skill_group,
     detect_system,
+    normalize_skill_group,
     normalize_system,
     render_escalation,
 )
@@ -53,11 +55,13 @@ class HelpdeskFollowup:
         on_sync=None,
         activated_at=None,
         reply_sender=None,
+        on_leave_chat=None,
     ):
         self.config, self.bus, self.api, self.clock = config, bus, api, clock
         self.interval = config.helpdesk.followup_interval_minutes * 60
         self.escalation_interval = config.helpdesk.escalation.interval_minutes * 60
         self.reply_sender = reply_sender
+        self.on_leave_chat = on_leave_chat
         identity = hashlib.sha256(
             f"{config.app_id}:{config.helpdesk.helpdesk_id}".encode()
         ).hexdigest()
@@ -87,6 +91,114 @@ class HelpdeskFollowup:
             item = self.store.tickets.get(out.get("ticket"))
             if item and item.get("paused") and item.get("pause_reason") == "actor_not_assigned":
                 self.store.delete_outbox(key)
+
+    def _followup_scope_configured(self):
+        return bool(self.config.helpdesk.escalation.followup_skill_groups)
+
+    def _scope_target(self, systems):
+        targets = []
+        for system in systems:
+            target = self._escalation_target(system)
+            if target and target not in targets:
+                targets.append(target)
+        return targets[0] if len(targets) == 1 else ""
+
+    def _apply_followup_scope(self, item):
+        """Pause outside the configured skill groups; transfers only trigger re-evaluation."""
+        if not self._followup_scope_configured() or item["status"] in CLOSED:
+            return item
+        scope = self.config.helpdesk.escalation.followup_skill_groups
+        group = detect_skill_group(item, list(scope))
+        systems = (
+            next(
+                (
+                    list(system_list)
+                    for configured, system_list in scope.items()
+                    if normalize_skill_group(configured) == normalize_skill_group(group)
+                ),
+                [],
+            )
+            if group
+            else []
+        )
+        target = self._scope_target(systems) if systems else ""
+        can_send = getattr(self.reply_sender, "can_send", None)
+        actor_available = can_send is None or can_send(item)
+        if group and systems and target and actor_available:
+            changes = {
+                "followup_skill_group": group,
+                "followup_systems": systems,
+                "escalation_system": systems[0],
+                "escalation_chat_id": target,
+                "scope_exit_pending": False,
+                "scope_exit_attempted": False,
+                "left_chat_at": None,
+                "leave_chat_error": "",
+                "retry_at": 0,
+            }
+            if item.get("paused") and item.get("pause_reason") in (
+                "outside_followup_scope",
+                "actor_not_assigned",
+            ):
+                changes.update(paused=False, pause_reason="")
+            return self.store.save(item, **changes)
+        if group and systems and target and not actor_available:
+            return self.store.save(
+                item,
+                followup_skill_group=group,
+                followup_systems=systems,
+                escalation_system=systems[0],
+                escalation_chat_id=target,
+                paused=True,
+                pause_reason="actor_not_assigned",
+                scope_exit_pending=False,
+                retry_at=0,
+            )
+        if group and systems and not target:
+            logger.warning(
+                "Helpdesk follow-up scope invalid: ticket={}, group={}, reason=ambiguous_or_missing_route",
+                item["id"],
+                group,
+            )
+        return self.store.save(
+            item,
+            followup_skill_group=group,
+            followup_systems=systems,
+            escalation_system="",
+            escalation_chat_id="",
+            paused=True,
+            pause_reason="outside_followup_scope",
+            scope_exit_pending=not item.get("scope_exit_attempted"),
+            retry_at=0,
+        )
+
+    async def _leave_out_of_scope_ticket(self, item):
+        if item.get("scope_exit_attempted"):
+            return self.store.save(item, scope_exit_pending=False, retry_at=0)
+        item = self.store.save(item, scope_exit_attempted=True, scope_exit_pending=True)
+        for key, out in list(self.store.outboxes()):
+            if out.get("ticket") == item["id"] and not out.get("message_id"):
+                self.store.delete_outbox(key)
+        error = ""
+        try:
+            if self.on_leave_chat is None:
+                raise RuntimeError("leave-chat callback unavailable")
+            if item.get("chat_id"):
+                await self.on_leave_chat(item["chat_id"])
+        except Exception as exc:
+            error = type(exc).__name__
+            logger.warning(
+                "Helpdesk out-of-scope leave failed: ticket={}, error={}",
+                item["id"],
+                error,
+            )
+        return self.store.save(
+            item,
+            scope_exit_pending=False,
+            left_chat_at=self.clock() if not error else item.get("left_chat_at"),
+            leave_chat_error=error,
+            retry_at=0,
+        )
 
     def _retire_attempted_closed_notices(self):
         """Closed notices are informational: never retry an attempted delivery."""
@@ -138,6 +250,9 @@ class HelpdeskFollowup:
         self._purge_unassigned_outboxes()
         self._reclassify_numeric_messages()
         self._retire_attempted_closed_notices()
+        for ticket in list(self.store.tickets.values()):
+            if ticket["status"] not in CLOSED:
+                self._apply_followup_scope(ticket)
         if background:
             self._tasks = {
                 asyncio.create_task(self._monitor(), name="helpdesk-reconcile"),
@@ -165,6 +280,7 @@ class HelpdeskFollowup:
             ticket, self.clock(), chat_id=chat_id, authoritative=authoritative
         )
         if item is not None:
+            item = self._apply_followup_scope(item)
             self._wakeup.set()
         return item
 
@@ -339,10 +455,12 @@ class HelpdeskFollowup:
         return None
 
     def _due(self, item):
-        if item["paused"] or self.clock() < item["retry_at"]:
-            return False
         if item["status"] in CLOSED:
             return item["notice_pending"] or item["close_pending"] is not None
+        if item.get("scope_exit_pending"):
+            return True
+        if item["paused"] or self.clock() < item["retry_at"]:
+            return False
         if item["welcome_at"] is None or item["close_pending"] is not None:
             return True
         if item["evaluated_generation"] != item["generation"] or item["scenario"] == "resolved":
@@ -416,7 +534,10 @@ class HelpdeskFollowup:
             current = self.store.tickets[ticket_id]
             valid = (
                 current["generation"] == generation
-                and not current["paused"]
+                and (
+                    not current["paused"]
+                    or current.get("scope_exit_pending") is True
+                )
                 and (
                     current["status"] not in CLOSED
                     or current["notice_pending"]
@@ -492,6 +613,9 @@ class HelpdeskFollowup:
     async def _execute(self, ticket_id, generation):
         await self.sync.ticket(ticket_id)
         item = self.store.tickets[ticket_id]
+        if item.get("scope_exit_pending"):
+            await self._leave_out_of_scope_ticket(item)
+            return
         if item["status"] in CLOSED:
             await self._recover_close(item)
             item = self.store.tickets[ticket_id]

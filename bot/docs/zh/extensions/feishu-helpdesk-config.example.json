@@ -13,6 +13,14 @@
         "bot_name": "<机器人显示名>",
         "allow_from": [],
         "thread_require_mention": true,
+        "media_window": {
+          "enabled": true,
+          "max_images": 4,
+          "max_age_minutes": 10,
+          "max_messages": 20,
+          "same_sender_only": true,
+          "include_reply_parent": true
+        },
         "helpdesk": {
           "enabled": true,
           "helpdesk_id": "<服务台 ID>",
@@ -55,6 +63,14 @@
               "QMS": "oc_business_escalation_group",
               "PDM": "oc_business_escalation_group",
               "PLM": "oc_business_escalation_group"
+            },
+            "followup_skill_groups": {
+              "TMS技能组": ["TMS"],
+              "PDM技能组": ["PDM"],
+              "PDM英文技能组": ["PDM"],
+              "QMS/SCM英文版技能组": ["SCM", "QMS"],
+              "供应链业务线": ["SCM", "QMS", "SRM", "PDM", "PLM"],
+              "紧急故障（大供应链）": ["SCM", "QMS", "SRM", "PDM", "PLM"]
             }
           },
           "cli": {

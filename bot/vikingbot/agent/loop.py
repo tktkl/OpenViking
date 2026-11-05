@@ -19,6 +19,7 @@ from loguru import logger
 
 from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
 from vikingbot.agent.context import ContextBuilder
+from vikingbot.agent.media_window import select_recent_media, session_media_fields
 from vikingbot.agent.memory import MemoryStore
 from vikingbot.agent.remote_skills import SkillRuntimeContext
 from vikingbot.agent.session_dispatcher import SessionDispatcher
@@ -1505,7 +1506,7 @@ class AgentLoop:
             prepared_messages = await message_context.build_messages(
                 history=[],
                 current_message=msg.content,
-                media=msg.media if msg.media else None,
+                media=self._select_turn_media(session, msg) or None,
                 session_key=msg.session_key,
                 ov_tools_enable=ov_tools_enable,
                 profile_user_list=profile_user_list,
@@ -1605,7 +1606,12 @@ class AgentLoop:
         session_key = msg.session_key
         skip_heartbeat = session_key.type == "cli"
         session = self.sessions.get_or_create(session_key, skip_heartbeat=skip_heartbeat)
-        session.add_message("user", msg.content, sender_id=msg.sender_id)
+        session.add_message(
+            "user",
+            msg.content,
+            sender_id=msg.sender_id,
+            **session_media_fields(msg),
+        )
         active = self._active_turns.get(session_key)
         accepted_steers: list[_AcceptedSteer] = []
         if active is not None:
@@ -1619,6 +1625,7 @@ class AgentLoop:
                     "user",
                     steer_msg.content,
                     sender_id=steer_msg.sender_id,
+                    **session_media_fields(steer_msg),
                 )
         await self.sessions.save(session)
         for steer in accepted_steers:
@@ -2654,6 +2661,9 @@ class AgentLoop:
             # For CLI/direct sessions, skip heartbeat by default
             skip_heartbeat = session_key.type == "cli"
             session = self.sessions.get_or_create(session_key, skip_heartbeat=skip_heartbeat)
+            # Resolve media before a pre-turn OpenViking commit can compact the
+            # local raw-message tail that still contains the image references.
+            turn_media = self._select_turn_media(session, msg)
 
             ov_tools_enable = self._get_ov_tools_enable(session_key)
             disabled_tools = msg.metadata.get("disabled_tools", []) if msg.metadata else []
@@ -2785,13 +2795,23 @@ class AgentLoop:
             if self.config.mode == BotMode.DEBUG:
                 # In debug mode, only record message to session, no processing or reply
                 await self._evaluate_previous_response_outcome(session, msg)
-                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                session.add_message(
+                    "user",
+                    msg.content,
+                    sender_id=msg.sender_id,
+                    **session_media_fields(msg),
+                )
                 await self.sessions.save(session)
                 return None
 
             if not msg.need_reply:
                 await self._evaluate_previous_response_outcome(session, msg)
-                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                session.add_message(
+                    "user",
+                    msg.content,
+                    sender_id=msg.sender_id,
+                    **session_media_fields(msg),
+                )
                 await self.sessions.save(session)
                 return OutboundMessage(
                     session_key=msg.session_key,
@@ -2870,7 +2890,7 @@ class AgentLoop:
             messages = await message_context.build_messages(
                 history=history,
                 current_message=msg.content,
-                media=msg.media if msg.media else None,
+                media=turn_media or None,
                 session_key=msg.session_key,
                 ov_tools_enable=ov_tools_enable,
                 profile_user_list=profile_user_list,
@@ -2961,7 +2981,12 @@ class AgentLoop:
                         exp_uris=newly_recalled_exp_uris,
                         experience_reminder=True,
                     )
-                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                session.add_message(
+                    "user",
+                    msg.content,
+                    sender_id=msg.sender_id,
+                    **session_media_fields(msg),
+                )
                 self._append_active_turn_history(session, active_turn_history)
                 session.add_message(
                     "assistant",
@@ -3118,6 +3143,16 @@ class AgentLoop:
             Channel config object if found, None otherwise
         """
         return self.config.channels_config.get_channel_by_key(session_key.channel_key())
+
+    def _select_turn_media(
+        self, session: Session, message: InboundMessage
+    ) -> list[str | dict[str, Any]]:
+        """Attach bounded recent images to the current turn without changing history."""
+        channel_config = self._get_channel_config(message.session_key)
+        media_window = getattr(channel_config, "media_window", None)
+        if media_window is None:
+            return list(message.media)
+        return select_recent_media(session, message, media_window)
 
     @staticmethod
     def _normalize_id_list(value: Any) -> list[str]:

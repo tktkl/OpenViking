@@ -751,10 +751,11 @@ class FeishuChannel(BaseChannel):
 
     async def _parse_message_content(
         self, message: Any, msg_type: str, message_id: str
-    ) -> tuple[str, list[str]]:
-        """Parse message content and extract media files."""
+    ) -> tuple[str, list[str], list[dict[str, Any]]]:
+        """Parse message content and extract media files with stable source references."""
         content = ""
         media = []
+        media_refs: list[dict[str, Any]] = []
 
         if msg_type == "text":
             try:
@@ -798,7 +799,21 @@ class FeishuChannel(BaseChannel):
                         self._download_and_save_image(img_key, message_id) for img_key in image_keys
                     ]
                     results = await asyncio.gather(*download_tasks)
-                    media = [path for path in results if path is not None]
+                    for index, (image_key, path) in enumerate(
+                        zip(image_keys, results, strict=False)
+                    ):
+                        if path is None:
+                            continue
+                        media.append(path)
+                        media_refs.append(
+                            {
+                                "source": "feishu_im",
+                                "message_id": message_id,
+                                "image_key": image_key,
+                                "index": index,
+                                "cache_path": path,
+                            }
+                        )
 
             except Exception as e:
                 logger.warning(f"Failed to process {msg_type} message: {e}")
@@ -807,7 +822,7 @@ class FeishuChannel(BaseChannel):
         else:
             content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
-        return content, media
+        return content, media, media_refs
 
     async def _check_should_process(
         self, chat_type: str, chat_id: str, message: Any, is_mentioned: bool
@@ -1001,7 +1016,9 @@ class FeishuChannel(BaseChannel):
             msg_type = message.message_type
 
             # 4. 解析消息内容和媒体
-            content, media = await self._parse_message_content(message, msg_type, message_id)
+            content, media, media_refs = await self._parse_message_content(
+                message, msg_type, message_id
+            )
             if not content:
                 return
 
@@ -1083,6 +1100,7 @@ class FeishuChannel(BaseChannel):
                 chat_id=final_chat_id,
                 content=content,
                 media=media if media else None,
+                media_refs=media_refs if media_refs else None,
                 need_reply=should_process,
                 metadata={
                     "message_id": message_id,
@@ -1093,6 +1111,7 @@ class FeishuChannel(BaseChannel):
                     "chat_mode": chat_mode,
                     "topic_title": topic_title if isinstance(topic_title, str) else "",
                     "sender_id": sender_id,
+                    "media_refs": media_refs,
                 },
             )
 

@@ -96,6 +96,38 @@ async def test_bot_text_uses_official_im_api_with_tenant_identity():
 
 
 @pytest.mark.asyncio
+async def test_leave_chat_uses_the_authorized_user_cli():
+    api = make_api(lambda request: httpx.Response(500))
+    api.cli.leave_bot = AsyncMock(return_value=True)
+    try:
+        assert await api.leave_chat("oc_ticket") is True
+        api.cli.leave_bot.assert_awaited_once_with("oc_ticket")
+    finally:
+        await api.close()
+
+
+@pytest.mark.asyncio
+async def test_cli_leave_bot_uses_user_identity_and_explicit_confirmation():
+    adapter = LarkCLIAdapter(
+        FeishuHelpdeskConfig().cli,
+        "cli_bot",
+        domain="https://open.feishu.cn",
+    )
+    adapter._authorization = AsyncMock(return_value={"openId": "ou_agent"})
+    adapter._command = AsyncMock(return_value={"ok": True})
+    assert await adapter.leave_bot("oc_ticket") is True
+    args = adapter._command.await_args.args
+    assert args[:4] == ("im", "chat.members", "delete", "--chat-id")
+    assert "oc_ticket" in args
+    assert ("--member-id-type", "app_id") == (
+        args[args.index("--member-id-type")],
+        args[args.index("--member-id-type") + 1],
+    )
+    assert json.loads(args[args.index("--data") + 1]) == {"id_list": ["cli_bot"]}
+    assert "--yes" in args
+
+
+@pytest.mark.asyncio
 async def test_read_time_filters_use_milliseconds_for_tickets_and_seconds_for_messages(monkeypatch):
     api = make_api(lambda request: httpx.Response(500))
     api._read = AsyncMock(return_value={"tickets": [], "messages": [], "total": 0})

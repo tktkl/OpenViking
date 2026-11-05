@@ -508,6 +508,39 @@ class LarkCLIAdapter:
                 self._authorization_failed(user)
                 return None
 
+    async def leave_bot(self, chat_id: str) -> bool:
+        """Remove this bot from a ticket group using the configured user identity."""
+        if not str(chat_id).startswith("oc_"):
+            raise LarkCLIError("invalid chat id", rejected=True)
+        async with self._lock:
+            user = await self._authorization()
+            if user is None:
+                raise LarkCLIError("no usable user authorization", authentication=True)
+            try:
+                result = await self._command(
+                    "im",
+                    "chat.members",
+                    "delete",
+                    "--chat-id",
+                    chat_id,
+                    "--member-id-type",
+                    "app_id",
+                    "--data",
+                    json.dumps({"id_list": [self.app_id]}),
+                    "--as",
+                    "user",
+                    "--format",
+                    "json",
+                    "--yes",
+                )
+            except LarkCLIError as error:
+                if error.authentication:
+                    self._authorization_failed(user)
+                raise
+        if result.get("ok") is not True:
+            raise LarkCLIError("leave chat returned invalid response")
+        return True
+
     async def keepalive_once(self):
         async with self._lock:
             user = None

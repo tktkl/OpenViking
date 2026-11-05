@@ -40,6 +40,7 @@ class InboundMessage:
     sender_name: str | None = None
     need_reply: bool = True
     media: list[str | dict[str, Any]] = field(default_factory=list)  # Paths or image_url parts
+    media_refs: list[dict[str, Any]] = field(default_factory=list)  # Durable source references
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     openviking_connection: dict[str, Any] | None = None  # Internal OpenViking identity
     # In-process runtime event, never reconstructed from channel metadata or user text.
