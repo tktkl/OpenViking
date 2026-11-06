@@ -16,9 +16,8 @@
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
 | `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，当前默认 5；`reply` 选择工单群发送身份；`escalation` 配置系统映射、45 分钟间隔和 Bot/CLI 发送；`messages` 统一标识和文案，时间模板校验 |
-| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；普通用户操作显式 CLI `--as user`；关单启动当前 Python，准备后再做最终回调；共享锁、总预算、stdin、进程组取消和脱敏 |
-| `extensions/feishu_helpdesk/close_helper.py` | 固定关单 API，版本 1 的 ready/commit/abort 协议；CLI 策略与身份检查、续期先于刷新锁；一次 PUT、不重放不确定提交 |
-| `extensions/feishu_helpdesk/cli_credentials.py` | 集中适配 CLI 目录、工作区、profile、AES-GCM 和刷新锁；只读解密 access token，不创建密钥、不使用 refresh token |
+| `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；普通用户操作显式 CLI `--as user`；用户 token 由 auth-mcp 注入；关单在一次 PUT 前执行业务最终检查；共享锁、总预算、进程组取消和脱敏 |
+| 已删除 | `close_helper.py` 和 `cli_credentials.py` 已移除；不再读取本地加密凭据或维护独立刷新锁 |
 
 本次没有修改 `bus/events.py`、`bus/queue.py`、原生 `channels/feishu.py` 或 `channels/openapi.py`。内部事件继续使用并发分支已有的 `before_process` / `internal_handler`。不增加发送 API 并发，不改变共享文件、工具、MCP 或沙箱权限。
 
@@ -26,11 +25,11 @@
 
 ## Python 关单与 CLI 兼容边界
 
-关单现已改为独立 Python 子进程，删除旧 CLI 补丁和构建脚本，`helpdesk.cli.executable` 使用官方 `lark-cli`。无需 Go、私有 CLI 或独立工具路径。适配契约以 CLI 提交 `4e2cbea94e33913378ce515f0fccfb9b1f2f2bb9` 为参考，按字段和加密布局判断兼容性；未来格式变化仅需修改凭据适配模块。原有 SQLite 无须迁移。
+关单现在直接通过官方 `lark-cli api PUT` 执行，`helpdesk.cli.executable` 仍使用官方 `lark-cli`。用户 token 由 auth-mcp 的 `lark-cli` provider 注入；不再启动 Python 关单子进程，不读取本地加密凭据、Keychain 或 refresh token。原有 SQLite 无须迁移。
 
 上游合并须保留准备和提交之间的最终检查：`ready` 之后由 Bot 读取最新状态和消息，在当前轮次、关闭轮次、同群忙碌检查通过后持久化待确认操作，再立即 `commit`。刷新锁内不能调用 CLI；最新消息检查使用应用接口并跳过 CLI 来源核实。超时从共享 CLI 锁等待开始计算，取消回收脚本整个进程组。CLI 继续独占 OAuth 刷新和凭据写入；仅 Python 子进程只读解密 access token，不导出、不另存、不自建续期链路。
 
-`commit` 后结果不确定时保留 `close_pending`；远端仍开放也不重放旧 PUT，通过状态及备注确认后才补发关闭说明。凭据不兼容只影响关单，不暂停人工消息和回执对账。平台、目录和升级说明见 [CLI 凭据兼容](../../../compat/lark-cli/README.md)。
+PUT 结果不确定时保留 `close_pending`；远端仍开放也不重放旧 PUT，通过状态及备注确认后才补发关闭说明。auth-mcp 领取失败只影响需要用户身份的 CLI 操作，不暂停人工消息和回执对账。
 
 ## 持久化与回退
 
@@ -112,7 +111,7 @@
 
 应进入本批次的文件共 34 个：
 
-- 服务台扩展生产代码 14 个：`api.py`、`channel.py`、`cli.py`、`close_helper.py`、`config.py`、`decision.py`、`delivery.py`、`followup.py`、`state.py`、`sync.py`、`manager.py`，新增 `escalation.py`、`feed_resolver.py`、`reply.py`。
+- 服务台扩展生产代码 13 个：`api.py`、`channel.py`、`cli.py`、`config.py`、`decision.py`、`delivery.py`、`escalation.py`、`feed_resolver.py`、`followup.py`、`media.py`、`reply.py`、`state.py`、`sync.py`。
 - VLM 生产代码 3 个：`providers/vlm_adapter.py`、`openviking/models/vlm/base.py`、`openviking/models/vlm/backends/openai_vlm.py`。
 - 测试 11 个：服务台跟进、升级、发送、feed 解析、API、关单 helper/协议、Provider thinking 与 VLM reasoning。
 - 文档与示例 6 个：本文件、上游合并影响、主动跟进说明、渠道说明、用户手册及完整 JSON 示例。
@@ -135,7 +134,7 @@
 | `extensions/feishu_helpdesk/state.py` | 增加升级字段；持久化技能组字段；支持删除/死信 outbox；自动消息可用 `im_message_id` 识别 | 旧 SQLite 自动兼容，新增字段均可缺省；人工消息不重置升级状态；重开后重置升级轮次 | 不要新增破坏性 schema migration；旧库启动必须成功 |
 | `extensions/feishu_helpdesk/sync.py` | 对 Helpdesk 数字内部消息按 guest/agent/system 分类 | 数字消息 ID 不能永久保持 `human=None`；未知来源仍然阻塞判断；系统消息不冒充人工 | 上游若改消息字段，可按新字段分类，但不能退化为“所有非 om_ 都未知” |
 | `extensions/feishu_helpdesk/decision.py` | JSON 提取/重试、echo 合并、人工来源要求、转人工场景提示词 | 只解析第一个平衡 JSON；模型异常按可重试解析错误处理；判断必须引用真实人工消息；业务仅选分类时判 `awaiting_details` | 上游若更新 prompt，保留 resolved 证据、最新消息和人类/处理方身份约束 |
-| `extensions/feishu_helpdesk/cli.py`、`close_helper.py` | 兼容新版 CLI identity envelope；原生关单 2xx + `code=0` 且 `data` 缺失；输出受限诊断 | 同时接受旧 `as/appId/userOpenId` 与新 `identity/data.context`；不得泄露凭据；成功关单不因 `data=null` 误判，未知响应仍保留 `close_pending` | CLI 格式变化只应影响关单诊断/确认，不应暂停人工消息和升级 |
+| `extensions/feishu_helpdesk/cli.py` | 从 auth-mcp 领取用户 token；以环境变量注入官方 CLI；关单使用一次 PUT；输出受限诊断 | 不读取本地凭据或 Keychain；auth-mcp refresh 失败才回退 `lark-qr`；不得泄露 token；未知关单响应仍保留 `close_pending` | CLI 命令或 auth-mcp 返回格式变化只应影响用户身份操作，不应暂停人工消息和升级 |
 | `providers/vlm_adapter.py`、`openviking/models/vlm/{base.py,backends/openai_vlm.py}` | 把 per-call `reasoning_effort` 传给 OpenAI/Azure/Volcengine 后端；MultiCredential 透传 | 没有显式 override 时不改变已有模型默认；非支持后端不注入该参数；视觉路径不受影响 | 上游若重构模型参数对象，保留显式 override 的逐层透传 |
 | 测试与文档 | 新增升级、Web sender、feed resolver、Bot IM 发送、关单兼容和 VLM 测试；更新部署与配置示例 | 测试不得依赖真实 Cookie、真实群或付费模型；部署文档必须区分工单群 Web 身份与升级群 Bot 身份 | 文档合并后重新核对命令、默认值和示例 JSON |
 
@@ -182,7 +181,7 @@ bot/workspace/skills/*
 
 部署前按 [服务台使用手册](vikingbot-helpdesk-user-manual.md) 的完整 JSON 示例更新配置。工单群 Web 发送与升级群 Bot 发送是独立认证：auth-mcp Web 会话失效时只有工单群发送失败，升级群 Bot 和人工长连接仍可工作；Bot 不在升级群时只有升级发送失败，不应暂停工单群判断。升级和提醒 outbox 都有独立 transport，排查时先看 `state.sqlite3` 的 `transport`、`chat_id`、`message_id` 和升级字段。
 
-回退时保留 state SQLite、feed-id 缓存和 CLI/auth-mcp 登录态。关闭升级只改 `escalation.enabled=false`；关闭 Web 工单发送改回 `reply.mode="lark_cli"`，不要在旧 outbox 未结算时删除数据库。升级状态字段可按缺省值恢复，但不要清空历史 outbox，否则会丢失幂等和回执证据。
+回退时保留 state SQLite、feed-id 缓存和 auth-mcp 状态。关闭升级只改 `escalation.enabled=false`；关闭 Web 工单发送改回 `reply.mode="lark_cli"`，不要在旧 outbox 未结算时删除数据库。升级状态字段可按缺省值恢复，但不要清空历史 outbox，否则会丢失幂等和回执证据。
 
 ### 验证快照
 
@@ -200,8 +199,6 @@ cd bot
   tests/test_feishu_helpdesk.py \
   tests/test_feishu_helpdesk_api.py \
   tests/test_feishu_helpdesk_cli.py \
-  tests/test_helpdesk_cli_credentials.py \
-  tests/test_helpdesk_close_helper.py \
   tests/test_helpdesk_close_protocol.py \
   tests/test_bot_provider_thinking.py
 cd ..

@@ -69,8 +69,11 @@ class LarkCLIConfig(BaseModel):
     executable: str = Field(default="lark-cli", min_length=1)
     profile: str = ""
     timeout_seconds: float = Field(default=30, gt=0)
-    auth_check_interval_seconds: float = Field(default=60, gt=0)
-    keepalive_interval_seconds: float = Field(default=1800, gt=0)
+    auth_mcp_server: str = Field(default="wangoon-auth-mcp", min_length=1)
+    provider: str = Field(default="lark-cli", min_length=1)
+    environment: str = Field(default="prod", min_length=1)
+    auth_profile: str = Field(default="default", min_length=1)
+    token_cache_seconds: float = Field(default=60, ge=0)
 
 
 class FeishuHelpdeskReplyConfig(BaseModel):
@@ -78,7 +81,7 @@ class FeishuHelpdeskReplyConfig(BaseModel):
 
     mode: Literal["lark_cli", "feishu_web"] = "lark_cli"
     auth_mcp_server: str = "wangoon-auth-mcp"
-    provider: str = "feishu_helpdesk"
+    provider: str = "lark-qr"
     environment: str = "prod"
     profile: str = "default"
     actor_open_id: str = ""

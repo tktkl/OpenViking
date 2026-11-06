@@ -1,4 +1,4 @@
-"""CLI identity gates, idle renewal and subprocess cleanup without live Feishu calls."""
+"""lark-cli execution and auth-mcp token handoff without live Feishu calls."""
 
 import asyncio
 import json
@@ -10,27 +10,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 from loguru import logger
+
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter, LarkCLIError
 from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
 
-def authorization(**user_fields):
-    return {
-        "appId": "cli_bot",
-        "identities": {
-            "user": {
-                "status": "ready",
-                "available": True,
-                "tokenStatus": "valid",
-                "openId": "ou_agent",
-                "grantedAt": "2026-10-23T00:00:00Z",
-                "expiresAt": "2026-10-23T02:00:00Z",
-                "refreshExpiresAt": "2026-10-30T00:00:00Z",
-                "scope": "offline_access im:chat.members:write_only",
-                **user_fields,
-            }
-        },
+def auth_access_value(*, token="user-token", identity="ou_agent", expires_at=None, state="ready"):
+    value = {
+        "state": state,
+        "identity": identity,
+        "access": {"headers": {"Authorization": f"Bearer {token}"}},
     }
+    if expires_at is not None:
+        value["expires_at"] = expires_at
+    return value
 
 
 def success(data=None):
@@ -40,19 +33,16 @@ def success(data=None):
 @pytest.fixture
 def cli():
     adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
-    adapter._command = AsyncMock(
-        side_effect=lambda *args: authorization() if args[0] == "auth" else success()
-    )
+    adapter._auth_access = AsyncMock(return_value=auth_access_value())
+    adapter._command = AsyncMock(return_value=success())
     return adapter
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("created", ["1800000000123", 1800000000123])
 async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, created):
-    cli._command.side_effect = lambda *args: (
-        authorization()
-        if args[0] == "auth"
-        else success({"message_id": "om_sent", "create_time": created})
+    cli._command.side_effect = lambda *args, **kwargs: success(
+        {"message_id": "om_sent", "create_time": created}
     )
     before = AsyncMock(return_value=None)
     receipt = await cli.send_text("oc_ticket", "提醒", "stable-uuid", before_call=before)
@@ -71,26 +61,26 @@ async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, c
         "uuid": "stable-uuid",
     }
     assert args[-4:] == ("--as", "user", "--format", "json")
+    assert cli._command.call_args.kwargs["auth"]["access_token"] == "user-token"
 
 
 @pytest.mark.asyncio
-async def test_close_delegates_to_python_and_keeps_official_cli_for_auth(cli):
-    cli._close_helper = AsyncMock(return_value={})
-    await cli.close_ticket("t1", "private-desk-header", {"status": 51, "solved": 1})
-    cli._command.assert_awaited_once_with("auth", "status", "--json")
-    assert cli._close_helper.await_args.args[:4] == (
-        "t1",
-        "private-desk-header",
-        {"status": 51, "solved": 1},
-        "ou_agent",
+async def test_close_uses_auth_mcp_token_and_one_put(cli):
+    before = AsyncMock(return_value=10)
+    result = await cli.close_ticket(
+        "t1", "private-desk-header", {"status": 51, "solved": 1}, before_call=before
     )
+    assert result == {}
+    before.assert_awaited_once_with("ou_agent")
+    args = cli._command.call_args.args
+    assert args[:3] == ("api", "PUT", "/open-apis/helpdesk/v1/tickets/t1")
+    assert json.loads(args[args.index("--data") + 1]) == {"status": 51, "solved": 1}
+    assert cli._command.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_receipt_reconciliation_reads_raw_user_history_with_seconds_and_pagination(cli):
-    cli._command.side_effect = lambda *args: (
-        authorization() if args[0] == "auth" else success({"items": [], "has_more": False})
-    )
+    cli._command.return_value = success({"items": [], "has_more": False})
     await cli.chat_messages("oc_ticket", 1800000000.123, 1800000060.456, "next")
     args = cli._command.call_args.args
     assert args[:4] == ("api", "GET", "/open-apis/im/v1/messages", "--params")
@@ -125,106 +115,74 @@ async def test_send_guard_runs_after_cli_lock_and_auth(cli):
     await holding
     with pytest.raises(RuntimeError, match="stale"):
         await sending
-    assert cli._command.await_count == 1  # auth only, no stale external send
+    assert cli._auth_access.await_count == 1
+    assert cli._command.await_count == 0
 
 
 @pytest.mark.asyncio
 async def test_im_detail_requires_exact_native_message_id(cli):
-    cli._command.side_effect = lambda *args: (
-        authorization()
-        if args[0] == "auth"
-        else success(
-            {
-                "items": [{"message_id": "om_other", "chat_id": "oc_other"}],
-            }
-        )
-    )
+    cli._command.return_value = success({"items": [{"message_id": "om_other", "chat_id": "oc_other"}]})
     with pytest.raises(LarkCLIError):
         await cli.message("om_expected")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fields",
-    [
-        {"status": "missing", "available": False, "tokenStatus": ""},
-        {"status": "not_configured", "available": False},
-        {"tokenStatus": "expired"},
-        {"openId": ""},
-        {"status": "ready", "tokenStatus": "ready"},  # No built-in OAuth login.
-    ],
-)
-async def test_unusable_login_never_executes_user_api_or_invitation(cli, fields):
-    cli._command.return_value = authorization(**fields)
-    cli._command.side_effect = None
-    messages = []
-    sink = logger.add(lambda message: messages.append(str(message)))
-    try:
-        for _ in range(3):
-            await cli.keepalive_once()
-            assert await cli.invite_bot("oc_ticket") is None
-    finally:
-        logger.remove(sink)
-    assert len(cli._command.call_args_list) == 6
-    assert all(call.args == ("auth", "status", "--json") for call in cli._command.call_args_list)
-    assert len(messages) == 1
-
-
-@pytest.mark.asyncio
-async def test_wrong_application_skips_all_user_operations(cli):
-    cli._command.side_effect = None
-    cli._command.return_value = {**authorization(), "appId": "cli_other"}
-    await cli.keepalive_once()
-    assert await cli.invite_bot("oc_ticket") is None
-    assert all(call.args[0] == "auth" for call in cli._command.call_args_list)
-
-
-@pytest.mark.asyncio
-async def test_unavailable_local_auth_skips_ticket_invites_without_repeated_errors(cli):
-    cli._command.side_effect = LarkCLIError("command failed")
+async def test_auth_mcp_not_ready_skips_user_command_and_logs_once(cli):
+    cli._auth_access.return_value = auth_access_value(state="waiting_scan")
     messages = []
     sink = logger.add(lambda message: messages.append(str(message)))
     try:
         for _ in range(3):
             assert await cli.invite_bot("oc_ticket") is None
-            await cli.keepalive_once()
     finally:
         logger.remove(sink)
+    assert cli._command.await_count == 0
     assert len(messages) == 1
-    assert all(call.args[0] == "auth" for call in cli._command.call_args_list)
 
 
 @pytest.mark.asyncio
-async def test_transient_local_status_failure_can_be_retried_by_admission(cli):
-    cli._command.side_effect = LarkCLIError("timed out", retryable=True)
+async def test_auth_mcp_transient_failure_is_retryable(cli):
+    cli._auth_access.side_effect = LarkCLIError("auth MCP request failed", retryable=True)
     with pytest.raises(LarkCLIError) as failure:
         await cli.invite_bot("oc_ticket")
     assert failure.value.retryable
-    assert cli._command.call_args.args == ("auth", "status", "--json")
+    assert cli._command.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_keepalive_calls_real_user_endpoint_only_when_due(cli):
-    await cli.keepalive_once()
-    await cli.keepalive_once()
-    calls = [call.args for call in cli._command.call_args_list]
-    assert calls == [
-        ("auth", "status", "--json"),
-        ("api", "GET", "/open-apis/authen/v1/user_info", "--as", "user", "--format", "json"),
-        ("auth", "status", "--json"),
+async def test_auth_mcp_token_is_cached_between_operations(cli):
+    await cli.invite_bot("oc_first")
+    await cli.invite_bot("oc_second")
+    assert cli._auth_access.await_count == 1
+    assert cli._command.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_near_expiry_token_is_replaced_before_call(cli):
+    cli._auth_access.side_effect = [
+        auth_access_value(token="expired", expires_at=time.time() - 1),
+        auth_access_value(token="fresh", expires_at=time.time() + 3600),
     ]
+    await cli.invite_bot("oc_ticket")
+    assert cli._auth_access.await_count == 2
+    assert cli._command.call_args.kwargs["auth"]["access_token"] == "fresh"
 
 
 @pytest.mark.asyncio
-async def test_refreshable_login_is_renewed_without_waiting_for_regular_interval(cli):
-    cli._next_keepalive = time.monotonic() + 1800
-    cli._command.side_effect = lambda *args: (
-        authorization(status="needs_refresh", tokenStatus="needs_refresh")
-        if args[0] == "auth"
-        else success()
-    )
-    await cli.keepalive_once()
-    assert cli._command.call_args.args[0] == "api"
+async def test_cli_authentication_failure_refreshes_once_and_retries(cli):
+    calls = 0
+
+    def command(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LarkCLIError("command failed", code=20037, authentication=True)
+        return success({"ok": True})
+
+    cli._command.side_effect = command
+    await cli.invite_bot("oc_ticket")
+    assert calls == 2
+    assert cli._auth_access.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -240,140 +198,53 @@ async def test_invitation_uses_typed_command_and_explicit_user_identity(cli):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["keepalive", "invite"])
-async def test_revoked_authorization_is_not_retried_until_credentials_change(cli, operation):
-    user_status = authorization()
-
-    def command(*args):
-        if args[0] == "auth":
-            return user_status
-        raise LarkCLIError("command failed", code=20037, authentication=True)
-
-    cli._command.side_effect = command
-    if operation == "invite":
-        assert await cli.invite_bot("oc_ticket") is None
-    else:
-        await cli.keepalive_once()
-    await cli.keepalive_once()
-    assert await cli.invite_bot("oc_ticket") is None
-    assert sum(call.args[0] != "auth" for call in cli._command.call_args_list) == 1
-
-    user_status = authorization(grantedAt="2026-10-23T01:00:00Z")
-    cli._command.side_effect = lambda *args: user_status if args[0] == "auth" else success()
-    await cli.keepalive_once()
-    assert cli._command.call_args.args[0] == "api"
-
-
-@pytest.mark.asyncio
-async def test_transient_failures_back_off_and_recover(cli):
-    def command(*args):
-        if args[0] == "auth":
-            return authorization(status="needs_refresh", tokenStatus="needs_refresh")
-        raise LarkCLIError("command failed", code=503)
-
-    cli._command.side_effect = command
-    await cli.keepalive_once()
-    first_retry = cli._retry_at
-    await cli.keepalive_once()
-    assert sum(call.args[0] == "api" for call in cli._command.call_args_list) == 1
-    assert first_retry > time.monotonic()
-    cli._retry_at = 0
-    await cli.keepalive_once()
-    assert cli._retry_at > time.monotonic() + 50
-    cli._command.side_effect = lambda *args: authorization() if args[0] == "auth" else success()
-    cli._retry_at = 0
-    await cli.keepalive_once()
-    assert cli._failures == 0
-    assert cli._next_keepalive > time.monotonic()
-
-
-@pytest.mark.asyncio
-async def test_background_detects_new_login_without_restart_and_stops_cleanly():
-    cli = LarkCLIAdapter(LarkCLIConfig(auth_check_interval_seconds=0.01), "cli_bot")
-    inspected = asyncio.Event()
-    kept_alive = asyncio.Event()
-    logged_in = False
-
-    def command(*args):
-        if args[0] == "auth":
-            inspected.set()
-            return (
-                authorization() if logged_in else authorization(available=False, status="missing")
-            )
-        kept_alive.set()
-        return success()
-
-    cli._command = AsyncMock(side_effect=command)
-    cli.start()
-    running_task = cli._keepalive_task
-    cli.start()
-    assert cli._keepalive_task is running_task
-    try:
-        await asyncio.wait_for(inspected.wait(), timeout=1)
-        assert not kept_alive.is_set()
-        logged_in = True
-        await asyncio.wait_for(kept_alive.wait(), timeout=1)
-    finally:
-        await cli.close()
-    assert running_task.done()
-    assert cli._keepalive_task is None
-    await cli.close()
-
-
-@pytest.mark.asyncio
-async def test_invite_and_keepalive_share_one_operation_lock(cli):
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def command(*args):
-        if args[0] == "auth":
-            return authorization()
-        if args[0] == "api":
-            entered.set()
-            await release.wait()
-        return success()
-
-    cli._command.side_effect = command
-    keepalive = asyncio.create_task(cli.keepalive_once())
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    invitation = asyncio.create_task(cli.invite_bot("oc_ticket"))
-    await asyncio.sleep(0)
-    assert not any(call.args[0] == "im" for call in cli._command.call_args_list)
-    release.set()
-    await asyncio.gather(keepalive, invitation)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response",
     [{"code": 0, "data": {}}, {"ok": True, "identity": "bot", "data": {}}, success([])],
 )
 async def test_invalid_success_envelope_cannot_be_treated_as_user_invitation(cli, response):
-    cli._command.side_effect = lambda *args: authorization() if args[0] == "auth" else response
+    cli._command.return_value = response
     with pytest.raises(LarkCLIError, match="invalid user"):
         await cli.invite_bot("oc_ticket")
 
 
+def test_keepalive_api_is_removed():
+    cli = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    assert not hasattr(cli, "keepalive_once")
+    assert not hasattr(cli, "start")
+    assert not hasattr(cli, "_keepalive_task")
+
+
 @pytest.mark.asyncio
-async def test_subprocess_uses_profile_without_shell_and_suppresses_notifiers(monkeypatch):
+async def test_subprocess_uses_auth_mcp_token_and_suppresses_notifiers(monkeypatch):
     process = SimpleNamespace(
-        returncode=0, communicate=AsyncMock(return_value=(b'{"appId":"cli_bot"}', b""))
+        returncode=0,
+        communicate=AsyncMock(return_value=(json.dumps(success()).encode(), b"")),
     )
     spawn = AsyncMock(return_value=process)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     cli = LarkCLIAdapter(
         LarkCLIConfig(executable="/path with spaces/lark-cli", profile="support"), "cli_bot"
     )
-    assert await cli._command("auth", "status", "--json") == {"appId": "cli_bot"}
+    result = await cli._command(
+        "api", "GET", "/open-apis/authen/v1/user_info",
+        auth={"access_token": "external-token"},
+    )
+    assert result["ok"] is True
     assert spawn.call_args.args == (
         "/path with spaces/lark-cli",
         "--profile",
         "support",
-        "auth",
-        "status",
-        "--json",
+        "api",
+        "GET",
+        "/open-apis/authen/v1/user_info",
     )
     assert spawn.call_args.kwargs["stdin"] == asyncio.subprocess.DEVNULL
-    assert spawn.call_args.kwargs["env"]["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] == "1"
+    env = spawn.call_args.kwargs["env"]
+    assert env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] == "1"
+    assert env["LARKSUITE_CLI_APP_ID"] == "cli_bot"
+    assert env["LARKSUITE_CLI_USER_ACCESS_TOKEN"] == "external-token"
+    assert "LARKSUITE_CLI_APP_SECRET" not in env
 
 
 @pytest.mark.asyncio
@@ -438,7 +309,7 @@ async def test_cli_failure_metadata_controls_admission_retry(monkeypatch, error,
         ({"type": "authentication", "code": 20037}, True),
         ({"type": "validation"}, True),
         ({"type": "network", "retryable": True}, False),
-        ({"type": "policy"}, False),  # CLI output policy can run after the API succeeds.
+        ({"type": "policy"}, False),
         ({"type": "api", "code": 500}, False),
         ({"type": "internal"}, False),
         ({}, False),
@@ -459,12 +330,11 @@ async def test_only_known_cli_refusals_disprove_a_send(monkeypatch, error, rejec
 
 
 @pytest.mark.asyncio
-async def test_missing_cli_is_a_quiet_retryable_state(monkeypatch):
+async def test_missing_cli_returns_fixed_error(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=FileNotFoundError))
     cli = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
-    await cli.keepalive_once()
-    assert cli._notice == "cli_error"
-    assert cli._retry_at > time.monotonic()
+    with pytest.raises(LarkCLIError, match="not installed"):
+        await cli._command("api", "GET", "/open-apis/authen/v1/user_info")
 
 
 @pytest.mark.asyncio

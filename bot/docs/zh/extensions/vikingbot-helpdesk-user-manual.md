@@ -1,8 +1,8 @@
 # VikingBot 会话并发与飞书服务台使用手册
 
-本手册独立维护，适用于 `codex/vikingbot-helpdesk-followup` 分支中的会话并发、服务台主动跟进、Web Messenger 工单回复、普通 IM 升级和 Python 独立关单功能，便于后续合并上游时保留。部署代码应包含 Python 独立关单、发送恢复、升级和关单兼容修复。普通 PyPI 发行包不保证包含本分支功能。
+本手册独立维护，适用于 `codex/vikingbot-helpdesk-followup` 分支中的会话并发、服务台主动跟进、Web Messenger 工单回复、普通 IM 升级和基于 auth-mcp token 的用户操作。部署代码应包含发送恢复、升级和统一认证修复。普通 PyPI 发行包不保证包含本分支功能。
 
-已有部署的升级步骤是：更新 VikingBot 代码、保留官方 Lark CLI 登录态和 auth-mcp 的 `feishu_helpdesk` Web 会话、合并下面的配置，然后重启 Gateway。不要把 `reply.mode` 设为 `feishu_web` 后只保留 CLI 登录；Web 会话 Cookie 和 CLI 授权是两套独立认证。SQLite 结构只新增可选字段，无须删库迁移。
+已有部署的升级步骤是：更新 VikingBot 代码、确保 auth-mcp 的 `lark-qr` 和 `lark-cli` provider ready、合并下面的配置，然后重启 Gateway。Web 回复读取 `lark-qr` Cookie；CLI 用户操作读取 `lark-cli` token。两者由同一个 `lark-qr` 源派生，但凭据和有效期独立。SQLite 结构只新增可选字段，无须删库迁移。
 
 ## 1. 部署前准备
 
@@ -14,10 +14,10 @@
 | --- | --- |
 | 飞书企业自建应用的 App ID、App Secret | 与现有 VikingBot 飞书渠道及 CLI profile 使用同一个应用，启用机器人能力 |
 | 服务台 ID、服务台 Token | 在服务台管理后台“设置中心 → API 凭证”获取；用于服务台读取、订阅及关单请求头 |
-| CLI 当前用户 | 有目标工单权限的客服、管理员或所有者；能够访问关联群，并具有所需邀请权限 |
+| 飞书当前用户 | 有目标工单权限的客服、管理员或所有者；由唯一 `lark-qr` 扫码确认，能够访问关联群，并具有所需邀请权限 |
 | 应用权限及发布 | 开通服务台读取/订阅权限 `helpdesk:all:readonly`，保留原有机器人消息与成员查询权限；完成应用发布和所需租户审批 |
 | 用户 OAuth 授权 | 关单需要 `helpdesk:all`；CLI 读取、邀请 Bot 及续期还需要下文列出的权限 |
-| auth-mcp Web 会话 | `reply.mode="feishu_web"` 需要 `wangoon-auth-mcp` 的 `feishu_helpdesk` prod profile 为 ready，并提供完整原始 Cookie；Cookie 不写日志、不落盘 |
+| auth-mcp 会话 | 唯一扫码源 `wangoon-auth-mcp` 的 `lark-qr` prod profile 为 ready；`reply.mode="feishu_web"` 使用其 Cookie，`lark-cli` provider 使用同一来源派生的用户 token |
 | 无头浏览器与依赖 | 自动解析 `oc_* → feed_id` 需要 Chromium/Playwright 可执行文件和 `websocket-client`；也可用 `reply.feed_ids` 手工固定映射 |
 | 升级群 Bot 成员关系 | `escalation.sender="bot"` 时当前应用 Bot 必须已在每个升级群中；发送走官方 IM API，不使用 Web Cookie |
 
@@ -36,13 +36,6 @@ git log -1 --oneline
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[bot]"
-python -m vikingbot.extensions.feishu_helpdesk.close_helper --version
-```
-
-最后一条命令只检查随包安装的 Python 关单模块，不读取用户凭据。预期返回：
-
-```json
-{"protocol_version": 1, "implementation": "python"}
 ```
 
 未安装官方 CLI 时，可按官方方式安装：
@@ -53,39 +46,38 @@ npx @larksuite/cli@latest install
 
 后续升级已有部署时，在该部署 checkout 中更新代码并重新执行安装命令。不要在保留其他未提交工作的 `bot-main` 工作区切分支或覆盖文件。
 
-## 3. 配置官方 CLI 的客服身份
+## 3. 配置 lark-cli 与统一认证
 
-**以下命令必须在 Gateway 的运行账号下执行，并使用相同的 HOME、CLI 目录及工作区环境。** 交互终端登录成功，不代表 systemd、容器或其他系统账号能读取同一份登录态。
+VikingBot 仍使用官方 `lark-cli` 作为命令执行器，但不再维护本地用户授权和保活。用户 token 由 `wangoon-auth-mcp` 的 `provider=lark-cli` 提供；该 provider 优先 refresh，refresh 失败后才复用唯一扫码源 `provider=lark-qr` 自动授权。
 
-先查看已有 profile：
+先确保运行账号能找到官方 CLI，并且 CLI profile、App ID、品牌与 VikingBot 渠道一致：
 
 ```bash
 lark-cli profile list
+lark-cli profile show support
 ```
 
-已有与渠道相同应用的 profile 可以复用。下面统一以 `support` 为例；还没有时运行：
+如果还没有专用 profile，可使用 `lark-cli config init --name support` 创建；不需要再执行 `lark-cli auth login`，也不需要持久化本机用户 access token。VikingBot 调用 CLI 时会注入：
 
-```bash
-lark-cli config init --name support
+```text
+LARKSUITE_CLI_APP_ID=<渠道应用 App ID>
+LARKSUITE_CLI_USER_ACCESS_TOKEN=<auth-mcp 返回的用户 token>
 ```
 
-在向导中选择“手动输入应用凭证”，填写 VikingBot 渠道已有的 App ID、App Secret 和对应品牌。不要为服务台另外创建一个应用。
+统一认证链路：
 
-检查 profile，并以有工单权限的客服用户完成授权：
+1. `auth_access_get(provider="lark-qr", environment="prod")`：唯一扫码入口。二维码必须是真实 `qrlogin.token`，`token:null` 占位码不会投递。
+2. `auth_access_get(provider="lark-cli", environment="prod")`：使用 `lark-qr` 自动授权，得到独立 lark-cli token。
+3. VikingBot 工单消息读取、回执对账、Bot 入群和关单前检查都使用该 token；token 刷新由 auth-mcp 负责。
+4. 关单直接通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行，最终的 `before_call` 业务检查仍在一次 PUT 前完成，不读取本地加密凭据。
 
-```bash
-lark-cli --profile support config show
-lark-cli --profile support auth login \
-  --scope "offline_access helpdesk:all im:message.send_as_user im:message im:chat.members:write_only im:message:readonly im:message.group_msg:get_as_user"
-lark-cli --profile support auth status --json
-lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --format json
-```
+因此部署只需要：
 
-核对应用、品牌、当前用户及授权权限。`auth status` 检查本地状态，最后一条只读请求验证实际用户授权，并由 CLI 在需要时续期。新增权限时，先开通应用权限并发布，再重新进行用户授权。
+- 可执行的官方 `lark-cli` 和正确的 profile/app 配置
+- `tools.mcp_servers` 中存在 `wangoon-auth-mcp`
+- `lark-qr` 和 `lark-cli` provider ready
 
-工单群的欢迎、提醒和关闭说明在 `reply.mode="feishu_web"` 下使用 auth-mcp 的 Web 会话身份；普通 IM 升级群默认使用应用 Bot 官方 IM API；工单消息读取、回执对账、Bot 入群、授权检查和续期仍由官方 CLI 以当前用户执行。Python 子进程读取该用户的现有加密凭据，只负责固定的服务台关单请求。凭据只在子进程内存使用，不导出 Token、不另存凭据、不自行使用 refresh token 续期。
-
-初版关单仅支持本地 profile 登录。环境 Token、环境应用凭据、自定义 provider 或未知凭据格式会使关单暂缓。macOS 后台进程还必须能读取原有文件主密钥或访问对应 Keychain；建议使用实际服务运行方式完成测试。
+不再需要 Python `close_helper`、`cli_credentials`、本地 refresh token 读取或后台保活任务。用户授权被撤销时，auth-mcp 会在 refresh 失败后重新走 `lark-qr`；若源会话也失效，只需要重新扫这一张码。
 
 ## 4. 合并到现有 `ov.conf`
 
@@ -123,7 +115,7 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
           "reply": {
             "mode": "feishu_web",
             "auth_mcp_server": "wangoon-auth-mcp",
-            "provider": "feishu_helpdesk",
+            "provider": "lark-qr",
             "environment": "prod",
             "profile": "default",
             "actor_open_id": "ou_actor_open_id",
@@ -153,8 +145,11 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
             "executable": "lark-cli",
             "profile": "support",
             "timeout_seconds": 30,
-            "auth_check_interval_seconds": 60,
-            "keepalive_interval_seconds": 1800
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "lark-cli",
+            "environment": "prod",
+            "auth_profile": "default",
+            "token_cache_seconds": 60
           }
         }
       }
@@ -175,14 +170,17 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 | `helpdesk.escalation.sender` | `bot` | 升级群发送身份；`bot` 走官方 IM API，`lark_cli` 走 CLI 用户身份，均不使用 Web Messenger |
 | `helpdesk.escalation.groups` | 空 | 系统名到升级群 `oc_*` 的映射；配置后按工单最初选择的系统路由 |
 | `helpdesk.messages` | 示例中的文案 | 可全部省略；欢迎、提醒及关闭说明统一带 `prefix` 和换行 |
-| `helpdesk.reply.mode` | `lark_cli` | 服务台工单群推荐 `feishu_web`；该模式使用 auth-mcp Cookie 和 Web Messenger，不回退到 CLI 发送 |
+| `helpdesk.reply.mode` | `lark_cli` | 服务台工单群推荐 `feishu_web`；该模式使用 auth-mcp 的 `lark-qr` Cookie 和 Web Messenger，不回退到 CLI 发送 |
 | `helpdesk.reply.auto_resolve_feed_id` | `false` | 开启后缓存未命中时启动无头 Chromium 解析 `oc_* → feed_id`；已有 `feed_ids` 时优先使用映射 |
 | `helpdesk.reply.cookie_cache_seconds` | `60` | auth-mcp Cookie 的内存缓存秒数，不落盘 |
-| `helpdesk.cli.executable` | `lark-cli` | 使用官方 CLI；Python 关单模块随 VikingBot 自动启动 |
+| `helpdesk.cli.executable` | `lark-cli` | 使用官方 CLI；用户 token 由 auth-mcp 注入 |
 | `helpdesk.cli.profile` | 空，使用默认 profile | 建议明确指定 `support`，避免切换默认 profile 后身份变化 |
-| `helpdesk.cli.timeout_seconds` | `30` | 单次操作超时，包含锁等待、脚本、授权准备、最终检查和请求；不是业务静默间隔 |
-| `helpdesk.cli.auth_check_interval_seconds` | `60` | 用户授权状态检查间隔，单位秒 |
-| `helpdesk.cli.keepalive_interval_seconds` | `1800` | 通过 CLI 进行用户授权保活的间隔，单位秒 |
+| `helpdesk.cli.timeout_seconds` | `30` | 单次操作超时，包含锁等待、auth-mcp 领取、最终检查和请求；不是业务静默间隔 |
+| `helpdesk.cli.auth_mcp_server` | `wangoon-auth-mcp` | 从 bot MCP 配置中查找认证服务 |
+| `helpdesk.cli.provider` | `lark-cli` | auth-mcp 的派生 provider |
+| `helpdesk.cli.environment` | `prod` | auth-mcp 环境 |
+| `helpdesk.cli.auth_profile` | `default` | auth-mcp profile，不是 CLI profile |
+| `helpdesk.cli.token_cache_seconds` | `60` | 用户 token 的内存缓存秒数 |
 
 配置修改后重启生效。分钟数不能写成 `0`、小数、布尔值或字符串。连续跟进次数固定为两次，不另设次数配置。
 
@@ -213,7 +211,7 @@ openviking-server --config /path/to/ov.conf --with-bot
 ```text
 Agent loop started (max concurrent sessions: 4)
 Feishu Helpdesk ready
-Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by lark-cli
+Feishu Helpdesk CLI: authorization loaded from auth MCP
 ```
 
 `ready` 表示初始化成功，完整关单能力仍需测试工单验证。若出现 `Feishu Helpdesk unavailable; native IM remains active`，普通 IM 可以继续使用，但服务台扩展没有初始化成功；修复配置、权限或网络后重启。
@@ -278,7 +276,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 5. 在一个会话中等待较慢回答，同时向另一会话提问，确认第二个会话能处理；同会话仍保持顺序。
 6. 停机期间新建工单后重启，确认补接管；已欢迎工单重启后不重复欢迎，也不补发多轮过期提醒或升级通知。
 
-本地模拟测试覆盖了调度、状态机及凭据协议，但不能替代真实服务台、用户权限和 macOS Keychain 的验收。
+本地模拟测试覆盖了调度、状态机和 auth-mcp token 交接，但不能替代真实服务台、用户权限和飞书授权页的验收。
 
 ## 8. 持久化、升级与回退
 
@@ -292,17 +290,16 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 升级前先停服务，再备份配置及整个服务台状态目录，包括 SQLite WAL 等文件。不要只复制运行中的 `state.sqlite3`，也不要删除数据库排障或让多个实例同时写同一个目录。改变存储目录会丢失原目录中的接管、欢迎和回执恢复信息。
 
-CLI 也必须保留以下目录和解密材料：
+CLI 仍需要以下配置，但不再持久化本地用户 access token：
 
 | 内容 | 位置 |
 | --- | --- |
-| profile、工作区配置及刷新锁 | `$LARKSUITE_CLI_CONFIG_DIR`，未设置时为 `~/.lark-cli`；包含实际使用的工作区子目录 |
-| Linux 加密凭据及主密钥 | `$LARKSUITE_CLI_DATA_DIR/lark-cli`，未设置时为 `~/.local/share/lark-cli`，包括既有 `master.key` |
-| macOS 加密凭据 | `~/Library/Application Support/lark-cli`，优先使用既有 `master.key.file`，否则只读访问 Keychain 的 `lark-cli / master.key` |
+| profile、品牌和 app 配置 | `$LARKSUITE_CLI_CONFIG_DIR`，未设置时为 `~/.lark-cli` |
+| auth-mcp 凭据 | `~/.local/state/wangoon-auth-mcp/auth.db`，目录 `0700`、文件 `0600`；包含各 provider 独立凭据 |
 
-容器应持久化 Bot 存储、CLI 配置及完整加密凭据目录，并保持运行账号、目录环境和既有解密材料一致；只挂载 `config.json` 不够。macOS Keychain 访问失败时不会自动创建主密钥或降级存储方式。
+容器应持久化 Bot 存储、CLI 配置和 auth-mcp 状态目录，并保持运行账号一致；只挂载 `config.json` 不够。
 
-CLI 升级通常不需要修改源码补丁；必要字段、加密布局或刷新锁约定变化仍可能需要更新 Python 凭据适配模块。格式不兼容时暂缓关单，人工消息、欢迎、提醒和回执对账继续运行。
+CLI 升级通常不需要修改源码补丁；只要命令、JSON envelope 和 auth-mcp token 注入方式兼容即可。auth-mcp `lark-cli` 验活或 refresh 失败会回到 `lark-qr` 自动授权，不影响人工消息、欢迎、提醒和回执对账。
 
 将 `max_concurrent_sessions` 改为 `1` 并重启可恢复全局顺序处理。若要关闭服务台自动化，将 `helpdesk.enabled` 改为 `false` 并重启，保留数据库以便后续恢复；原生飞书 IM 沿用原配置。
 
@@ -312,17 +309,17 @@ CLI 升级通常不需要修改源码补丁；必要字段、加密布局或刷�
 | --- | --- |
 | `Feishu Helpdesk unavailable; native IM remains active` | 核对应用与服务台 ID、Token、读取/订阅权限、长连接及网络；修复后重启 |
 | 启动正常，但历史工单没有欢迎 | 首次启用前的工单不接管；使用启用后新建的测试工单，检查是否仍待群绑定 |
-| CLI 登录过，但服务进程提示 `no usable user login` | 核对服务系统账号、HOME、profile、工作区及持久化目录；在相同环境下登录 |
-| `App ID does not match this bot; user operations paused` | 让 CLI profile 使用与渠道相同的应用，再以正确客服用户授权 |
+| CLI 用户操作提示未授权 | 领取 auth-mcp `lark-cli`；若返回 `waiting_scan`，只扫最新一张 `lark-qr` |
+| `App ID does not match this bot; user operations paused` | 让 CLI profile 和 auth-mcp `lark-cli` 使用与渠道相同的应用 |
 | `CLI user has not authorized helpdesk:all` 或明确权限拒绝 | 开通并发布应用权限，再重新 OAuth 授权；核对用户实际有目标工单权限 |
-| `compatible local CLI credentials` 相关不兼容错误 | 使用本地 profile 登录；核对是否用了环境凭据、自定义 provider 或 CLI 存储格式已变化 |
-| `CLI Keychain master key is unavailable` | 检查服务账号及 Keychain 访问；不要新建密钥替换原有密钥 |
+| `auth MCP lark-cli is waiting_scan` | 打开最新 `lark-qr` 二维码完成飞书登录；不要扫历史二维码 |
+| `source_authorization_failed` | 检查 `lark-qr` 源会话；重新领取 `lark-qr` 后重试 |
 | 发送或入群出现 `232011`／`232017` | 检查 CLI 用户是否在关联群、是否有相应邀请权限 |
 | `Helpdesk synchronization failed` | 检查服务台读取权限、Token、网络与限流；未补齐消息时不会依据不完整历史自动关单 |
 | `Helpdesk receipt reconciliation failed` | 检查当前用户的群消息读取权限及网络；人工 IM 交付继续运行 |
 | 首次催办后没有关闭 | 当前配置启用升级，本就不会超时关单；检查是否已按 45 分钟节奏升级，以及是否已有可信“已解决”判断 |
 | 升级群没有收到通知 | 检查系统识别、`escalation.groups`、Bot 是否在升级群，以及 outbox 的 `transport=feishu_bot` 和发送日志 |
-| 工单群提示 `feed id` 或 Web 登录失败 | 检查 auth-mcp `feishu_helpdesk` 会话是否 ready、Chromium 是否可执行、`web_url`/`feed_ids` 是否正确 |
+| 工单群提示 `feed id` 或 Web 登录失败 | 检查 auth-mcp 的 `lark-qr` 是否 ready、二维码是否包含非空 `qrlogin.token`、Chromium 是否可执行、`web_url`/`feed_ids` 是否正确 |
 | `Helpdesk automation paused` | 查看暂停原因；发送回执过期或跨轮不确定时暂停该工单自动化，独立后台对账继续运行 |
 | 远端关单可能成功，但没有关闭说明 | 提交后结果不确定时保留 `close_pending` 查询远端，确认归属本次操作后补发；不要手动重放旧请求或清库 |
 

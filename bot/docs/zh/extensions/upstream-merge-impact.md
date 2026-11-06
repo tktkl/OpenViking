@@ -21,7 +21,7 @@
 | Fork 远端 | `origin`：`https://github.com/tktkl/OpenViking.git` |
 | 本地上游引用 | `upstream/main`：`05c516dc6` |
 | 本地 HEAD | `544e6fffb`，已合并上述上游提交 |
-| 额外功能提交 | `7f020f97e` 服务台渠道与 CLI 保活；`d7bd92a56` 可信服务台上下文 |
+| 额外功能提交 | `7f020f97e` 服务台渠道与用户身份集成；`d7bd92a56` 可信服务台上下文 |
 
 此次只核对了本地上游引用，没有拉取远端新提交。后续评估必须先取得新的上游基线，不能将上述提交号当作官方最新版本。
 
@@ -68,7 +68,7 @@
 | 新增模块 | 职责 | 与上游的依赖 |
 | --- | --- | --- |
 | [extensions/runtime.py](../../../vikingbot/extensions/runtime.py) | 可信配置指定 `module:factory`，提供 `create_extension(context, options)`、`start()`、`close()` 接口 | 主循环生命周期、工具注册、消息总线、会话与沙箱管理接口 |
-| [extensions/feishu_helpdesk/](../../../vikingbot/extensions/feishu_helpdesk/) | 工单事件订阅、Bot 入群、CLI 授权检查与保活、工单/会话绑定、有限重试、Web 工单回复、普通 IM 升级、回执对账和独立关单；继承原生飞书消息处理 | `FeishuChannel` 生命周期和事件注册、飞书 SDK、lark-cli 契约、官方 IM 发送 API、auth-mcp Cookie、Web Gateway 与 feed-id 解析 |
+| [extensions/feishu_helpdesk/](../../../vikingbot/extensions/feishu_helpdesk/) | 工单事件订阅、Bot 入群、auth-mcp token 注入、工单/会话绑定、有限重试、Web 工单回复、普通 IM 升级、回执对账和一次 PUT 关单；继承原生飞书消息处理 | `FeishuChannel` 生命周期和事件注册、飞书 SDK、lark-cli 契约、官方 IM 发送 API、auth-mcp Cookie、Web Gateway 与 feed-id 解析 |
 | [extensions/background_tasks/](../../../vikingbot/extensions/background_tasks/) | 注册 `background_task`；固定 task/run 监测、绑定原会话、完整结果分页读取、编号分段、回执游标、故障隔离、重启恢复、补充暂存与续办 | `RuntimeContext`、`ToolContext`、原 session 的沙箱文件/执行 API、会话保存、内部队列和发送回执 |
 | [extensions/__init__.py](../../../vikingbot/extensions/__init__.py) | 扩展包入口 | Python 包布局和打包规则 |
 
@@ -83,7 +83,7 @@
 - **来源可信度**：服务台身份由渠道确认的绑定生成，用户正文不能设置；模型侧的业务环境规则由 engineering skill 判断。上游重构上下文时不能把这一来源区块降为普通用户文本，也不能让旧工单来源残留到其他消息。
 - **结果回传**：Codex 最终答复由扩展交给 Bot 渠道发送，普通完成不增加一次模型改写；只有暂存补充需要新的编排轮次。发送游标仅在成功回执持久化后推进。
 - **执行范围**：Bot 的 `exec` 工具实现、MCP 连接实现和沙箱权限逻辑没有因此修改。Codex CLI 的 full access、任务进程管理、认证包装器及共享 skills 在独立的 `agent-skills/wangoon` 仓库维护，不计入此分支的源码差异；升级时仍需核对 runner 协议与双端部署。
-- **认证职责**：业务取证凭据由 `wangoon-auth-mcp` 提供；服务台工单群 Web 发送需要 `feishu_helpdesk` 的原始 Cookie，CLI 读取/邀请/保活/关单继续使用 lark-cli 用户授权，普通 IM 升级使用应用 tenant token。三套认证上下文不能混为同一份缓存；Cookie 不落盘，升级群发送不依赖 Web。
+- **认证职责**：业务取证凭据由 `wangoon-auth-mcp` 提供；服务台工单群 Web 发送使用唯一扫码源 `lark-qr` 的原始 Cookie，CLI 读取/邀请/关单使用同一来源派生的独立 `lark-cli` token，普通 IM 升级使用应用 tenant token。三套认证上下文不能混为同一份缓存；Cookie 不落盘，升级群发送不依赖 Web。
 - **持久状态**：扩展 journal、结果分段和 runner 状态使用工作区 `tmp/wangoon/`。部署更新需保留仍需恢复的任务状态；代码合并不应顺带清空该目录或更换其权限、挂载位置。
 
 ## 下一次更新的评估步骤

@@ -113,8 +113,14 @@ async def test_cli_leave_bot_uses_user_identity_and_explicit_confirmation():
         "cli_bot",
         domain="https://open.feishu.cn",
     )
-    adapter._authorization = AsyncMock(return_value={"openId": "ou_agent"})
-    adapter._command = AsyncMock(return_value={"ok": True})
+    adapter._auth_access = AsyncMock(return_value={
+        "state": "ready",
+        "identity": "ou_agent",
+        "access": {"headers": {"Authorization": "Bearer user-token"}},
+    })
+    adapter._command = AsyncMock(
+        return_value={"ok": True, "identity": "user", "data": {}}
+    )
     assert await adapter.leave_bot("oc_ticket") is True
     args = adapter._command.await_args.args
     assert args[:4] == ("im", "chat.members", "delete", "--chat-id")
@@ -327,14 +333,13 @@ async def test_forbidden_is_not_retried_and_diagnostics_do_not_echo_credentials(
 
 
 @pytest.mark.asyncio
-async def test_api_starts_keepalive_and_closes_it_before_http():
+async def test_api_closes_cli_before_http_and_has_no_keepalive_start():
     api = make_api(lambda request: httpx.Response(200, json={"code": 0}))
 
     async def close_cli():
         assert not api.http.is_closed
 
     api.cli.close.side_effect = close_cli
-    api.start()
-    api.cli.start.assert_called_once()
+    assert not hasattr(api, "start")
     await api.close()
     assert api.http.is_closed

@@ -8,19 +8,19 @@
 
 ## 工作流程
 
-1. 普通飞书 IM 按原路径启动；独立后台任务读取机器人 `open_id`，使用服务台凭据订阅工单创建、更新和消息事件，成功后启动状态恢复、主动补漏及 CLI 保活。
+1. 普通飞书 IM 按原路径启动；独立后台任务读取机器人 `open_id`，使用服务台凭据订阅工单创建、更新和消息事件，成功后启动状态恢复、主动补漏及 auth-mcp 用户凭据领取。
 2. `helpdesk.ticket.created_v1` 直接读取 `event.chat_id`；`helpdesk.ticket.updated_v1` 读取 `event.object.chat_id`。创建时没有绑定群就等待后续更新，不扫描群列表。
 3. 对配置的服务台、当前应用和未关闭工单，先以机器人身份检查是否已在群内。
 4. 未入群时，检查 lark-cli 的本地用户登录态；有可用授权才通过 `im chat.members create --as user` 邀请当前应用，再用机器人身份验证成员状态。未登录时跳过邀请，不记录为已入群。接口返回成功、待审批或部分成功均不能代替成员验证。
 5. Agent 提问仍只处理标准 `im.message.receive_v1`，复用原有回复链路。工单消息事件仅归并监测状态，不重复触发回答；按工单消息 ID 和 IM ID 去重。
 
-网络超时、连接故障、限流和明确可重试的服务端临时错误会在同一个入群任务内重试。邀请返回 `232011`（执行邀请的用户尚未在群内）也会在此流程内重试，等待客服入群；该规则不改变 CLI 认证和保活的错误分类。最多尝试 6 次，间隔为 2、5、10、30、60 秒，无需等待新的工单事件。累计退避等待 107 秒，不含接口请求耗时；这不是无限等待，不能保证覆盖客服晚 5 分钟入群的情况。同群并发事件共享该任务；每次尝试先检查 Bot 是否已在群内，避免响应超时后重复邀请。`232017` 等邀请权限不足、授权失效、待审批和未登录不新增自动重试。关单或停止渠道会取消请求及退避等待；重试耗尽后记录失败，后续工单更新事件仍可再次触发入群。
+网络超时、连接故障、限流和明确可重试的服务端临时错误会在同一个入群任务内重试。邀请返回 `232011`（执行邀请的用户尚未在群内）也会在此流程内重试，等待客服入群；该规则不改变 auth-mcp/CLI 错误分类。最多尝试 6 次，间隔为 2、5、10、30、60 秒，无需等待新的工单事件。累计退避等待 107 秒，不含接口请求耗时；这不是无限等待，不能保证覆盖客服晚 5 分钟入群的情况。同群并发事件共享该任务；每次尝试先检查 Bot 是否已在群内，避免响应超时后重复邀请。`232017` 等邀请权限不足、授权失效、待审批和未登录不新增自动重试。关单或停止渠道会取消请求及退避等待；重试耗尽后记录失败，后续工单更新事件仍可再次触发入群。
 
 机器人身份查询 `is_in_chat` 时，飞书可能以 HTTP 400 / `232006` 表示 Bot 不在群内。此组合按“未入群”处理并继续邀请，不单独记录 ERROR；其他错误码、HTTP 状态以及其他接口返回的 `232006` 仍按异常处理。入群重试 WARN 和工单最终失败 ERROR 带有 `ticket_id`、`chat_id`、错误类型及可用的错误码和 HTTP 状态；重试日志另带尝试次数和等待时间，不输出凭据或原始响应。
 
 服务台的机器人阶段未必有可加入的群。只有可信事件或工单消息对应的 IM 详情确认 `chat_id` 后才能加入，通常发生在转人工时。工单已关闭（状态 50/51/52）不触发邀请。关闭工单后，尚未完成回写的入群任务不能恢复旧关联；停止渠道会清空内存关联缓存，持久化状态供重启同步恢复。
 
-服务台身份查询或订阅缓慢、超时、权限不足时，不阻塞或停止普通飞书 IM。初始化尚未成功时不处理工单事件；失败会明确记录 `Feishu Helpdesk unavailable; native IM remains active`，不视为服务台可用，也不绕过服务台权限。修复服务台配置、网络或权限后重启渠道重新初始化；不在后台无限重试。停止渠道会取消未完成的初始化、工单和保活任务。
+服务台身份查询或订阅缓慢、超时、权限不足时，不阻塞或停止普通飞书 IM。初始化尚未成功时不处理工单事件；失败会明确记录 `Feishu Helpdesk unavailable; native IM remains active`，不视为服务台可用，也不绕过服务台权限。修复服务台配置、网络或权限后重启渠道重新初始化；不在后台无限重试。停止渠道会取消未完成的初始化、工单任务和 HTTP client。
 
 ## 配置
 
@@ -54,7 +54,7 @@
           "reply": {
             "mode": "feishu_web",
             "auth_mcp_server": "wangoon-auth-mcp",
-            "provider": "feishu_helpdesk",
+            "provider": "lark-qr",
             "environment": "prod",
             "profile": "default",
             "actor_open_id": "ou_actor_open_id",
@@ -92,8 +92,11 @@
             "executable": "lark-cli",
             "profile": "support",
             "timeout_seconds": 30,
-            "auth_check_interval_seconds": 60,
-            "keepalive_interval_seconds": 1800
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "lark-cli",
+            "environment": "prod",
+            "auth_profile": "default",
+            "token_cache_seconds": 60
           }
         }
       }
@@ -112,41 +115,34 @@
 - `escalation.sender` 默认 `bot`，升级群通过官方 IM API 以应用 Bot 身份发送；`lark_cli` 使用 CLI 用户身份。两条升级发送路径都不会使用 Web Messenger。
 - 启用升级后，工单群首次提醒后再静默 5 分钟即升级，原工单群停止提醒；升级群每 45 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
 - `followup_skill_groups` 把当前工单技能组映射到一个或多个系统，再复用 `escalation.groups` 解析升级群。只有当前技能组命中该映射才继续欢迎、提醒和判断；未命中时暂停自动跟进并尝试一次 Bot 退群，失败只记录不重试。技能组从范围外切回范围内时自动恢复入群和跟进。转接消息本身不会停止跟进，“原客服已退出会话”也不作为退出条件。
-- `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。Python 关单模块随 VikingBot 安装，自动使用当前 Python 解释器，不增加脚本路径配置。
-- `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile，并先通过 CLI 完成该 profile 的应用配置。扩展会校验其 App ID 与飞书渠道一致，不匹配就跳过用户操作。
+- `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。
+- `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile；该 profile 仍需配置与飞书渠道一致的 App ID 和品牌。
+- `cli.auth_mcp_server` 默认 `wangoon-auth-mcp`，从 bot 的 `tools.mcp_servers` 中查找认证服务。`cli.provider` 默认 `lark-cli`，`cli.environment` 默认 `prod`，`cli.auth_profile` 默认 `default`。
+- 扩展不再执行 `lark-cli auth status`、本地 OAuth 登录或后台保活。每次用户操作先向 auth-mcp 领取 `lark-cli` token，并通过 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_USER_ACCESS_TOKEN` 注入 CLI；token 在内存中缓存 `cli.token_cache_seconds` 秒。
+- auth-mcp 自身优先使用 `lark-cli` refresh token；refresh 失败后才复用唯一扫码源 `lark-qr`。用户只需要在 `lark-qr` 源会话失效时扫一张码，其他 provider 自动授权。
+- 关单通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行；最终 `before_call` 业务检查在 PUT 前完成。不再启动 `close_helper`，也不读取 lark-cli 本地加密凭据、Keychain 或 refresh token。
 - 授权的客服用户必须已在目标工单群内，且群设置允许其添加机器人。服务台 Token 和机器人自己的 `tenant_access_token` 不能替代这项用户授权。
-- 用户 OAuth 应授权 `im:chat.members:write_only` 和 `offline_access`；完整跟进/关单权限见主动跟进文档。凭据适配按 lark-cli 1.0.66 的命令、JSON、AES-GCM 存储及刷新锁契约验证，后续版本按格式兼容性判断，不因版本号不同就拦截。未知格式仅拒绝关单，人工消息和回执对账继续运行。
-- 扩展不再使用早期版本的 `user_access_token`、`user_refresh_token`、`oauth_token_url` 配置或 `oauth.json` 缓存；改由 CLI 登录，不复制旧 refresh token，避免两个程序轮换同一凭据。
+- 用户 OAuth 继续使用冻结权限。完整跟进/关单至少需要 `helpdesk:all`、`im:message`、消息读取、`im:chat.members:write_only` 和邀请 Bot 所需权限；Web Messenger 发送只需要 `lark-qr` Cookie，不使用 lark-cli token。
+- 扩展不再读取早期版本的 `user_access_token`、`user_refresh_token`、`oauth_token_url` 或 `oauth.json`；这些配置已无运行作用。
 - 一组应用凭据启动一个配置式飞书渠道实例。不要同时在 Studio 新建同一应用的另一条长连接；Studio 的应用接入向导目前不配置本扩展。
 
-修改后按现有方式重启 `vikingbot gateway` 或 `openviking-server --with-bot`。常规用户操作和续期继续交给官方 CLI；只有独立 Python 关单子进程只读解密 CLI 当前本地 profile 的 access token，凭据仅在内存中使用，不读取 Hermes 登录缓存，不自行续期或另存 Token。支持 Linux 文件主密钥和 macOS 既有文件主密钥/只读 Keychain；环境 Token、自定义 provider 和未知格式暂不支持关单。部署需保留同一系统账号的 CLI 配置及凭据目录，详情见 [兼容说明](../../../compat/lark-cli/README.md)。
+统一认证链路是：
 
-## CLI 授权和后台保活
-
-在飞书应用后台开通上述用户权限，并在“安全设置”开启“刷新 user_access_token”；没有该开关时按飞书文档默认开启。变更后发布应用配置，再使用运行 Gateway 的系统账号、同一份 CLI profile 扫码授权，例如：
-
-```bash
-lark-cli --profile support auth login --scope "offline_access im:chat.members:write_only"
+```text
+lark-qr 扫码一次
+  → auth-mcp 保存飞书 Web Cookie
+  → lark-cli 自动授权并保存独立 token
+  → VikingBot 通过环境变量把 token 交给官方 CLI
+  → token 过期先 refresh，refresh 失败才回到 lark-qr
 ```
 
-后台任务随服务台渠道启动、停止，行为如下：
+`lark-qr` 二维码必须包含真实 `qrlogin.token`。服务会解码校验；`token:null` 占位码会被丢弃并继续等待，不会投递到飞书。若看到 `token null`，说明是旧码或占位码，应使用最新一张。
 
-1. 默认每 60 秒执行 `auth status --json`，**不带 `--verify`**，只检查本地登录。未登录、refresh token 已过期、App ID 不匹配时，不执行用户 API；相同状态只提示一次。
-2. 本地必须有用户 `openId`、`available: true`，且状态为 `ready` / `needs_refresh`、`tokenStatus` 为 `valid` / `needs_refresh`，才放行。单有 App ID、App Secret 或 bot 身份不算用户已登录。
-3. 首次发现可用授权后立即执行一次下面的只读请求，之后默认每 45 分钟执行；若本地状态已变成 `needs_refresh`，不等待常规间隔。access token 是否刷新、refresh token 的轮换及持久化均由 CLI 处理，扩展不硬编码 token 有效期。
+未登录不会阻止原有飞书 IM 渠道启动，已在群中的 Bot 仍能回复。已接管工单通过后续事件和补漏同步再次尝试入群；首次启用前的历史工单不自动接管。
 
-   ```bash
-   lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --format json
-   ```
+CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的命令遵循原有 sandbox 配置。服务器或容器部署必须提供 CLI 可执行文件、正确的 profile/app 配置，并持久化 auth-mcp 状态目录；仅挂载 `config.json` 不够。不要把真实配置或凭据提交到 Git。
 
-4. 临时调用失败按 30、60、120、240、300 秒退避，实际重试在后续本地检查轮次进行；不输出原始 stdout/stderr、用户资料或 token。CLI 明确返回用户认证失败后暂停该授权，直到本地授权信息发生变化；重新扫码后自动恢复保活，无需重启。
-5. 邀请和保活共用扩展内的锁，CLI 自身负责跨进程 token 刷新锁。停止渠道时先取消任务并清理运行中的 CLI 子进程，再关闭 HTTP client；POSIX 系统会清理独立进程组，包含 npm 启动器的子进程。
-
-未登录不会阻止原有飞书 IM 渠道启动，已在群中的 Bot 仍能回复。已接管工单通过后续事件和补漏同步再次尝试入群；首次启用前的历史工单不自动接管。授权满 365 天、被撤销，或停机超过 refresh token 有效期时，仍需重新授权。
-
-CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的命令则遵循原有 sandbox 配置。二者需要使用同一份应用配置和可用的授权存储。服务器或容器部署必须提供 CLI 可执行文件，并持久化其配置、安全凭据存储和必要的解密材料；仅挂载 `config.json` 不够。不要把真实配置或凭据提交到 Git。
-
-需要模型使用飞书业务能力时，再通过共享 Skills 安装流程将所需 `lark-*` Skills 暴露到实际工作区的 `skills/` 目录，并确保模型的执行环境可用 CLI。自动邀请和后台保活由固定扩展代码执行，不依赖模型读取 Skill；本扩展不会自动安装或修改共享 Skills。
+需要模型使用飞书业务能力时，再通过共享 Skills 安装流程将所需 `lark-*` Skills 暴露到实际工作区的 `skills/` 目录。自动邀请和 auth-mcp 验活由固定扩展代码执行，不依赖模型读取 Skill。
 
 ## 飞书后台设置
 
@@ -154,7 +150,7 @@ CLI 命令在 Gateway 所在运行环境执行；模型通过 Skills 执行的�
 2. 开通服务台读取/事件订阅权限 `helpdesk:all:readonly`；启动时通过服务台专用接口订阅工单创建、更新和 `helpdesk.ticket_message.created_v1`。
 3. 机器人需要成员查询权限，例如 `im:chat.members:read`；邀请用户需要 `im:chat.members:write_only`。应用权限和用户授权均须生效。
 4. 沿用已有飞书 IM 的消息读取、发消息、图片、资源和表情等权限，不因开启扩展扩大工具或发送者权限。
-5. 当前用户的关单和 CLI 回执查询需要 `helpdesk:all`、`im:message`、消息读取及工单访问权限；Web Messenger 发送还需要 auth-mcp 的 `feishu_helpdesk` prod 会话处于 ready。恢复群消息仍受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
+5. 当前用户的关单和 CLI 回执查询需要 `helpdesk:all`、`im:message`、消息读取及工单访问权限；Web Messenger 发送还需要 auth-mcp 的 `lark-qr` prod 会话处于 ready。恢复群消息仍受用户读取权限和群成员关系约束。详细权限见主动跟进部署说明。
 
 ## 复用范围与验证
 

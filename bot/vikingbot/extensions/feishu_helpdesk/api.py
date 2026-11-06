@@ -41,13 +41,16 @@ class HelpdeskAPI:
         tenant_token: Callable[[], Awaitable[str]],
         cli: LarkCLIAdapter | None = None,
         http_client: httpx.AsyncClient | None = None,
+        bot_config=None,
     ):
         self.settings = settings
         self.app_id = app_id
         self.domain = domain.rstrip("/")
         self.tenant_token = tenant_token
         self.http = http_client or httpx.AsyncClient(timeout=15.0)
-        self.cli = cli or LarkCLIAdapter(settings.cli, app_id, domain=self.domain)
+        self.cli = cli or LarkCLIAdapter(
+            settings.cli, app_id, domain=self.domain, bot_config=bot_config
+        )
         self._read_lock = asyncio.Lock()
         self._last_read = 0.0
 
@@ -123,9 +126,6 @@ class HelpdeskAPI:
                 "page_size": 200,
             },
         )
-
-    def start(self):
-        self.cli.start()
 
     async def close(self):
         await self.cli.close()

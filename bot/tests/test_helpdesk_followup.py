@@ -288,13 +288,13 @@ async def test_failure_does_not_count_or_start_close_wait(desk):
 async def test_explicit_send_refusal_recovers_after_restart_and_permission_fix(
     desk, tmp_path, monkeypatch, new_round
 ):
-    from test_feishu_helpdesk_cli import authorization, success
+    from test_feishu_helpdesk_cli import auth_access_value, success
     from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
     from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
     service, api, clock = await initialized(desk)
     adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
-    adapter._authorization = AsyncMock(return_value=authorization()["identities"]["user"])
+    adapter._auth_access = AsyncMock(return_value=auth_access_value())
     api.cli = adapter
     permitted = False
 
@@ -355,7 +355,7 @@ async def test_refusal_on_retry_does_not_disprove_an_earlier_uncertain_send(desk
 
 @pytest.mark.asyncio
 async def test_remaining_uuid_budget_stops_and_reaps_slow_cli(desk, monkeypatch):
-    from test_feishu_helpdesk_cli import authorization, success
+    from test_feishu_helpdesk_cli import auth_access_value, success
     from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
     from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
@@ -368,7 +368,7 @@ async def test_remaining_uuid_budget_stops_and_reaps_slow_cli(desk, monkeypatch)
     adapter = LarkCLIAdapter(
         LarkCLIConfig(executable=sys.executable, timeout_seconds=180), "cli_bot"
     )
-    adapter._authorization = AsyncMock(return_value=authorization()["identities"]["user"])
+    adapter._auth_access = AsyncMock(return_value=auth_access_value())
     api.cli = adapter
     original_spawn, processes = asyncio.create_subprocess_exec, []
     late_receipt = success({"message_id": "om_too_late", "create_time": str(int(clock() * 1000))})
@@ -402,7 +402,7 @@ async def test_remaining_uuid_budget_stops_and_reaps_slow_cli(desk, monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["lock", "authorization"])
 async def test_uuid_expiry_is_rechecked_after_cli_wait(desk, phase):
-    from test_feishu_helpdesk_cli import authorization, success
+    from test_feishu_helpdesk_cli import auth_access_value, success
     from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
     from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
@@ -416,14 +416,16 @@ async def test_uuid_expiry_is_rechecked_after_cli_wait(desk, phase):
     api.cli = adapter
     entered, release = asyncio.Event(), asyncio.Event()
 
+    async def auth_access():
+        entered.set()
+        if phase == "authorization":
+            await release.wait()
+        return auth_access_value()
+
     async def command(*args, **kwargs):
-        if args[0] == "auth":
-            entered.set()
-            if phase == "authorization":
-                await release.wait()
-            return authorization()
         return success({"message_id": "om_expired", "create_time": int(clock() * 1000)})
 
+    adapter._auth_access = AsyncMock(side_effect=auth_access)
     adapter._command = AsyncMock(side_effect=command)
     lock_held = phase == "lock"
     if lock_held:
@@ -444,8 +446,7 @@ async def test_uuid_expiry_is_rechecked_after_cli_wait(desk, phase):
         release.set()
         with pytest.raises(LarkCLIError, match="exceeds idempotency window"):
             await asyncio.wait_for(sending, 2)
-        assert adapter._command.await_count == 1
-        assert adapter._command.call_args.args[0] == "auth"  # No expired send.
+        assert adapter._command.await_count == 0
         item = service.store.tickets["t1"]
         assert item["paused"] and item["pause_reason"] == "receipt_expired"
         assert item["count"] == 0 and item["last_send"] is None
@@ -460,20 +461,19 @@ async def test_uuid_expiry_is_rechecked_after_cli_wait(desk, phase):
 
 @pytest.mark.asyncio
 async def test_raw_cli_retry_keeps_original_send_time_for_next_reminder(desk):
-    from test_feishu_helpdesk_cli import authorization, success
+    from test_feishu_helpdesk_cli import auth_access_value, success
     from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
     from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
 
     service, api, clock = await initialized(desk)
     adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
+    adapter._auth_access = AsyncMock(return_value=auth_access_value())
     api.cli = adapter
     receipts, requests = {}, []
     lose_response = True
 
     async def command(*args, **kwargs):
         nonlocal lose_response
-        if args[0] == "auth":
-            return authorization()
         assert args[:4] == ("api", "POST", "/open-apis/im/v1/messages", "--params")
         body = json.loads(args[6])
         requests.append(body)
@@ -637,21 +637,15 @@ async def test_latest_api_message_during_cli_auth_wait_prevents_close(desk):
 
 @pytest.mark.asyncio
 async def test_final_check_cannot_deadlock_while_real_cli_and_sync_locks_are_held(desk):
-    from test_feishu_helpdesk_cli import authorization, success
+    from test_feishu_helpdesk_cli import auth_access_value, success
     from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter
     from vikingbot.extensions.feishu_helpdesk.config import LarkCLIConfig
     from vikingbot.extensions.feishu_helpdesk.followup import StaleAction
 
     service, api, clock = await initialized(desk)
     adapter = LarkCLIAdapter(LarkCLIConfig(), "cli_bot")
-    adapter._command = AsyncMock(
-        side_effect=lambda *args, **kwargs: authorization() if args[0] == "auth" else success()
-    )
-
-    async def prepared_helper(ticket, authorization, body, user, before, deadline, submission):
-        await before(user)
-
-    adapter._close_helper = prepared_helper
+    adapter._auth_access = AsyncMock(return_value=auth_access_value())
+    adapter._command = AsyncMock(return_value=success())
     api.cli = adapter
     api.messages["t1"] = [
         {
@@ -675,7 +669,7 @@ async def test_final_check_cannot_deadlock_while_real_cli_and_sync_locks_are_hel
             await asyncio.wait_for(
                 adapter.close_ticket("t1", "fake", {"status": 51}, before_call=final_check), 1
             )
-    assert adapter._command.await_count == 1  # local auth only; no IM lookup/PUT inside lock
+    assert adapter._command.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -1375,48 +1369,17 @@ async def test_close_preparation_failure_never_persists_a_pending_put(desk):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", [154003, 99991668, 99991672, 99991679])
 async def test_explicit_close_refusal_clears_only_this_pending_attempt_and_can_retry(desk, code):
-    import httpx
-    from vikingbot.extensions.feishu_helpdesk.close_helper import CloseFailure, CloseOperation
-
     service, api, clock = await initialized(desk)
     service.judge.judge.return_value = Decision("resolved", reason="业务确认恢复")
     human(service, clock)
     generation = service.store.tickets["t1"]["generation"]
     original = api.cli.close_ticket
 
-    def client_factory(**kwargs):
-        return httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda request: httpx.Response(403, json={"code": code})),
-            **kwargs,
-        )
-
     async def refused(ticket, authorization, body, *, before_call):
         assert service.store.tickets["t1"]["close_pending"] is None
         await before_call("ou_operator")
         assert service.store.tickets["t1"]["close_pending"]
-        operation = CloseOperation(
-            SimpleNamespace(
-                path=f"/open-apis/helpdesk/v1/tickets/{ticket}",
-                authorization=authorization,
-                body=body,
-                timeout_seconds=5,
-            ),
-            receive=None,
-            emit=None,
-            probe=SimpleNamespace(),
-            client_factory=client_factory,
-        )
-        try:
-            await operation.put("feishu", "fake-user-token")
-        except CloseFailure as error:
-            raise LarkCLIError(
-                error.reason,
-                code=error.code,
-                authentication=error.authentication,
-                retryable=error.retryable,
-                rejected=error.rejected,
-            ) from None
-        pytest.fail("native permission refusal was accepted")
+        raise LarkCLIError("close API refused the request", code=code, rejected=True)
 
     api.cli.close_ticket = refused
     await drain(service)

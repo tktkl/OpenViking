@@ -37,7 +37,7 @@
           "reply": {
             "mode": "feishu_web",
             "auth_mcp_server": "wangoon-auth-mcp",
-            "provider": "feishu_helpdesk",
+            "provider": "lark-qr",
             "environment": "prod",
             "profile": "default",
             "actor_open_id": "ou_actor_open_id",
@@ -77,8 +77,11 @@
             "executable": "lark-cli",
             "profile": "support",
             "timeout_seconds": 30,
-            "auth_check_interval_seconds": 60,
-            "keepalive_interval_seconds": 1800
+            "auth_mcp_server": "wangoon-auth-mcp",
+            "provider": "lark-cli",
+            "environment": "prod",
+            "auth_profile": "default",
+            "token_cache_seconds": 60
           }
         }
       }

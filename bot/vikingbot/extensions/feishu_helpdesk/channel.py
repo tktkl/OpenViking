@@ -81,6 +81,7 @@ class FeishuHelpdeskChannel(FeishuChannel):
             app_id=config.app_id,
             domain=config.domain,
             tenant_token=self._get_tenant_access_token,
+            bot_config=bot_config,
         )
         if reply_sender is not None and hasattr(reply_sender, "bind_helpdesk"):
             cache_path = None
@@ -158,7 +159,6 @@ class FeishuHelpdeskChannel(FeishuChannel):
             await self._helpdesk_api.subscribe()
             if self._followup is not None:
                 await self._followup.start()
-            self._helpdesk_api.start()
             self._helpdesk_ready = True
             if self._resolver_task is None and self._reply_sender is not None and hasattr(
                 self._reply_sender, "warm"

@@ -561,7 +561,6 @@ async def test_helpdesk_initialization_failure_keeps_native_im_active(
     )
     channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
     channel._helpdesk_api.subscribe = AsyncMock()
-    channel._helpdesk_api.start = Mock()
     setattr(channel._helpdesk_api, operation, fail)
     task = asyncio.create_task(channel.start())
     try:
@@ -570,7 +569,7 @@ async def test_helpdesk_initialization_failure_keeps_native_im_active(
         assert channel._running is True
         assert not task.done()
         assert channel._helpdesk_ready is False
-        channel._helpdesk_api.start.assert_not_called()
+        assert not hasattr(channel._helpdesk_api, "start")
         channel._schedule_ticket(ticket_event())
         channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
 
@@ -627,7 +626,7 @@ async def test_native_im_does_not_wait_for_helpdesk_and_stop_cancels_initializat
         await asyncio.wait_for(initializing.wait(), timeout=1)
         assert not task.done()
         assert channel._helpdesk_ready is False
-        assert channel._helpdesk_api.cli._keepalive_task is None
+        assert not hasattr(channel._helpdesk_api.cli, "_keepalive_task")
         channel._schedule_ticket(ticket_event())
         channel._helpdesk_api.ensure_in_chat.assert_not_awaited()
         channel._add_reaction = AsyncMock()
@@ -654,17 +653,15 @@ async def test_skipped_unauthorized_invitation_is_not_recorded_as_admitted(chann
 
 
 @pytest.mark.asyncio
-async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(channel, monkeypatch):
+async def test_helpdesk_start_does_not_create_cli_keepalive(channel, monkeypatch):
     channel._helpdesk_api.tickets_page = AsyncMock(return_value={"tickets": [], "total": 0})
     cli = channel._helpdesk_api.cli
-    keepalive_started = asyncio.Event()
-    cli.keepalive_once = AsyncMock(side_effect=keepalive_started.set)
     channel._helpdesk_api.bot_open_id = AsyncMock(return_value="ou_bot")
     channel._helpdesk_api.subscribe = AsyncMock()
     native_started = asyncio.Event()
 
     async def native_start():
-        assert cli._keepalive_task is None
+        assert not hasattr(cli, "keepalive_once")
         channel._running = True
         native_started.set()
         await asyncio.Future()
@@ -673,7 +670,6 @@ async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(chann
     task = asyncio.create_task(channel.start())
     try:
         await asyncio.wait_for(native_started.wait(), timeout=1)
-        await asyncio.wait_for(keepalive_started.wait(), timeout=1)
         assert channel._helpdesk_ready is True
         channel._schedule_ticket(ticket_event())
         await asyncio.wait_for(asyncio.gather(*tuple(channel._helpdesk_tasks)), timeout=1)
@@ -682,7 +678,7 @@ async def test_keepalive_lifecycle_follows_channel_and_does_not_replace_im(chann
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    assert cli._keepalive_task is None
+    assert not hasattr(cli, "_keepalive_task")
     assert channel._helpdesk_ready is False
     assert channel._helpdesk_api.http.is_closed
 

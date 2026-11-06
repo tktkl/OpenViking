@@ -44,7 +44,7 @@ flowchart TD
         "reply": {
           "mode": "feishu_web",
           "auth_mcp_server": "wangoon-auth-mcp",
-          "provider": "feishu_helpdesk",
+          "provider": "lark-qr",
           "environment": "prod",
           "profile": "default",
           "actor_open_id": "ou_actor_open_id",
@@ -72,7 +72,13 @@ flowchart TD
         },
         "cli": {
           "executable": "lark-cli",
-          "profile": "support"
+          "profile": "support",
+          "timeout_seconds": 30,
+          "auth_mcp_server": "wangoon-auth-mcp",
+          "provider": "lark-cli",
+          "environment": "prod",
+          "auth_profile": "default",
+          "token_cache_seconds": 60
         }
       }
     }]
@@ -93,20 +99,15 @@ flowchart TD
 
 `reply.mode="lark_cli"` 仍是兼容默认值，适合普通群或支持用户 API 发送的环境。`feishu_web` 使用 `auth_mcp_server`、`provider`、`environment`、`profile` 从 wangoon-auth-mcp 获取 ready 会话，`actor_open_id` 必须是目标工单的处理人。`feed_ids` 可手工配置映射；`auto_resolve_feed_id=true` 时，缓存未命中会通过无头 Chromium、CDP 和 Web Messenger 页面解析群名得到内部 feed id，并写入派生缓存。浏览器页面在后台常驻，只有消息列表预热调用成功后才冻结；解析失败会丢弃并重建浏览器，避免复用半初始化页面。部署需要 Chromium/Playwright 可执行文件、`websocket-client`、可读取的 auth-mcp 配置和租户 Web Messenger 地址。
 
-官方 `lark-cli` 继续负责工单消息读取、发送回执对账、Bot 入群、授权状态检查、保活以及关单前检查。关单由随包安装的独立 Python 子进程执行：先由 CLI 完成身份、命令策略检查和必要续期，再只读解密该用户的本地凭据，在内存中使用 access token 调用服务台。脚本不导出或另存凭据，不自行使用 refresh token。服务台读取和订阅继续使用应用授权加服务台 Token。
+官方 `lark-cli` 继续负责工单消息读取、回执对账、Bot 入群和关单前检查，但用户授权改由 auth-mcp 管理。VikingBot 从 `provider=lark-cli` 领取 token，并以 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_USER_ACCESS_TOKEN` 注入 CLI；不再执行本地 `auth status` 或后台保活。
 
-除了既有机器人和成员查询权限，应用需开通 `helpdesk:all:readonly` 读取/订阅权限。当前 CLI 用户需要有目标工单访问权限，以及 `helpdesk:all`、`im:message.send_as_user`、`im:message`、`im:chat.members:write_only`、所需的消息读取权限和 `offline_access`。用户读取群消息还受 `im:message.group_msg:get_as_user` 和群成员关系约束。应用权限与 OAuth 授权都必须生效。例如在运行 Gateway 的系统账号下：
+auth-mcp 的唯一扫码源是 prod 的 `lark-qr`。`lark-cli` 优先使用自己的 refresh token；refresh 失败后才会复用源会话自动授权。关单直接通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行，最终 `before_call` 业务检查在 PUT 前完成；不再启动 `close_helper`，不读取本地加密凭据或 Keychain。
 
-```bash
-lark-cli --profile support auth login \
-  --scope "offline_access helpdesk:all im:message.send_as_user im:message im:chat.members:write_only im:message:readonly im:message.group_msg:get_as_user"
-```
+应用需保留 `helpdesk:all:readonly` 读取/订阅权限。当前用户需要有目标工单访问权限，以及 `helpdesk:all`、`im:message`、`im:chat.members:write_only`、所需消息读取权限。权限清单在 auth-mcp `lark-cli` 的冻结 scope 中维护，VikingBot 不单独发起 OAuth 授权。用户读取群消息还受 `im:message.group_msg:get_as_user` 和群成员关系约束。
 
-已授权且权限齐全的部署只需更新 VikingBot，保留 CLI 登录态及上面的配置，然后重启 `vikingbot gateway` 或 `openviking-server --with-bot`。从旧补丁版迁移时，将 `cli.executable` 改回官方 `lark-cli`；SQLite 无须迁移。
+已授权且权限齐全的部署只需更新 VikingBot、确认 `lark-qr`/`lark-cli` ready，然后重启 `vikingbot gateway` 或 `openviking-server --with-bot`。容器/服务器需持久化 CLI profile/app 配置和 auth-mcp 状态目录；只挂载 `config.json` 不够。`lark-qr` 二维码会解码校验非空 `qrlogin.token`，`token:null` 占位码不会发送给用户。
 
-容器/服务器需保留 CLI 配置、安全凭据存储及必要解密材料，使用与 Gateway 相同的系统账号和目录设置；只挂载 `config.json` 不够。Linux 读取 `LARKSUITE_CLI_DATA_DIR` 或 `~/.local/share` 下的 `lark-cli` 加密文件和既有 `master.key`。macOS 读取 `~/Library/Application Support/lark-cli`，优先使用既有 `master.key.file`，否则只读访问系统 Keychain；访问失败仅暂缓关单，不创建密钥、不自动降级。配置目录沿用 `LARKSUITE_CLI_CONFIG_DIR`、CLI profile 和工作区，不扫描其他账号或工作区。初版仅支持本地 profile；环境 Token、自定义凭据 provider、未知格式明确拒绝关单。兼容性按必要字段和加密布局检查，不按 CLI 版本号一律拦截，维护点见 [凭据兼容说明](../../../compat/lark-cli/README.md)。
-
-保持原有 `allow_from`、命令授权、`@Bot`、媒体和沙箱设置；监测人工活动不要求 `@Bot`。关单凭据读取失败不停止人工消息、欢迎、提醒或后台回执对账。
+保持原有 `allow_from`、命令授权、`@Bot`、媒体和沙箱设置；监测人工活动不要求 `@Bot`。auth-mcp 领取失败不停止人工消息、欢迎、提醒或后台回执对账。
 
 ## 发现、补漏与恢复
 
@@ -179,8 +180,6 @@ PYTHONPATH=bot:. python -m pytest -c bot/pytest.ini \
   bot/tests/test_feishu_helpdesk.py \
   bot/tests/test_feishu_helpdesk_api.py \
   bot/tests/test_feishu_helpdesk_cli.py \
-  bot/tests/test_helpdesk_cli_credentials.py \
-  bot/tests/test_helpdesk_close_helper.py \
   bot/tests/test_helpdesk_close_protocol.py \
   bot/tests/test_agent_session_concurrency.py \
   bot/tests/test_session_dispatcher.py \

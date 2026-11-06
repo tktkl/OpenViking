@@ -23,7 +23,7 @@ def settings(**overrides):
     values = {
         "mode": "feishu_web",
         "auth_mcp_server": "wangoon-auth-mcp",
-        "provider": "feishu_helpdesk",
+        "provider": "lark-qr",
         "environment": "prod",
         "profile": "default",
         "actor_open_id": "ou_actor",
