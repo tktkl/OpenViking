@@ -19,6 +19,7 @@ from vikingbot.agent.tools.ov_file import (
     VikingSearchTool,
 )
 from vikingbot.agent.tools.registry import ToolRegistry
+from vikingbot.agent.tools.send_file import SendFileTool
 from vikingbot.agent.tools.shell import ExecTool
 from vikingbot.agent.tools.web import WebFetchTool
 from vikingbot.agent.tools.websearch import WebSearchTool
@@ -125,6 +126,8 @@ def register_default_tools(
     if include_message_tool and send_callback:
         message_tool = MessageTool(send_callback=send_callback)
         registry.register(message_tool)
+        if not getattr(config, "read_only", False):
+            registry.register(SendFileTool(send_callback=send_callback))
 
     # Spawn tool
     if include_spawn_tool and subagent_manager:

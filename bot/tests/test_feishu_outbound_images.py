@@ -249,3 +249,30 @@ def test_manager_passes_active_config_to_feishu():
 
     channel = next(iter(manager.channels.values()))
     assert channel._bot_config is config
+
+
+@pytest.mark.asyncio
+async def test_file_only_outbound_uses_native_feishu_file_sender(monkeypatch):
+    channel = FeishuChannel(
+        FeishuChannelConfig(app_id="cli_app"), MessageBus(), bot_config=Config()
+    )
+    channel._client = SimpleNamespace()
+    channel._get_tenant_access_token = AsyncMock(return_value="tenant-token")
+    send_files = AsyncMock()
+    monkeypatch.setattr("vikingbot.channels.feishu.send_files", send_files)
+    msg = OutboundMessage(
+        session_key=SessionKey(type="feishu", channel_id="cli_app", chat_id="oc_chat"),
+        content="",
+        files=[{"filename": "report.xlsx", "content": b"xlsx"}],
+        metadata={"reply_to": "oc_chat", "message_id": "om_trigger"},
+    )
+
+    assert await channel.send(msg) is True
+    send_files.assert_awaited_once_with(
+        domain=channel.config.domain,
+        access_token="tenant-token",
+        receive_id="oc_chat",
+        files=msg.files,
+        reply_to_message_id="om_trigger",
+        reply_in_thread=False,
+    )

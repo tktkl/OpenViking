@@ -31,6 +31,7 @@ except ImportError:
 from vikingbot.bus.events import OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.base import BaseChannel
+from vikingbot.channels.feishu_files import FeishuFileSendError, send_files
 from vikingbot.config.schema import BotMode, Config, FeishuChannelConfig
 from vikingbot.utils.image_format import sniff_image_format
 from vikingbot.utils.session_paths import workspace_name
@@ -567,6 +568,30 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
 
+            reply_to_message_id = self._reply_to_message_id_from_metadata(msg.metadata)
+            if msg.files:
+                try:
+                    await send_files(
+                        domain=self.config.domain,
+                        access_token=await self._get_tenant_access_token(),
+                        receive_id=reply_to,
+                        files=msg.files,
+                        reply_to_message_id=reply_to_message_id,
+                        reply_in_thread=self._should_reply_in_thread(
+                            msg.metadata, reply_to_message_id, msg.session_key.chat_id
+                        )
+                        if reply_to_message_id
+                        else False,
+                    )
+                except FeishuFileSendError as exc:
+                    logger.warning(str(exc))
+                    return False
+                except Exception as exc:
+                    logger.warning(f"Failed to send Feishu file attachment: {type(exc).__name__}")
+                    return False
+                if not (msg.content or "").strip():
+                    return True
+
             # Process images and get cleaned content
             cleaned_content, images = await self._extract_and_upload_images(msg.content, msg)
 
@@ -575,7 +600,6 @@ class FeishuChannel(BaseChannel):
             # --- Build interactive card with markdown rendering ---
             original_sender_id = None
             chat_type = "group"
-            reply_to_message_id = self._reply_to_message_id_from_metadata(msg.metadata)
             if msg.metadata:
                 original_sender_id = msg.metadata.get("sender_id")
                 chat_type = msg.metadata.get("chat_type", "group")

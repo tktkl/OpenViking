@@ -40,9 +40,11 @@ A Skill may orchestrate several tools, but it does not receive additional permis
 | OpenViking | `openviking_list/search/grep/glob/multi_read` | Browse, retrieve, and read context |
 | OpenViking | `openviking_rule_search` (Beta) | Retrieve compiled constraints applicable to a concrete task |
 | OpenViking | `openviking_add_resource`, `openviking_memory_commit` | Add resources and commit memory |
-| Delivery | `message`, `generate_image` | Send messages proactively or generate images |
+| Delivery | `message`, `send_file`, `generate_image` | Send messages, workspace file attachments, or generate images |
 | Automation | `cron` | Manage scheduled Agent tasks; disabled by default |
 | Parallel work | `spawn` | Start a background subagent |
+
+`send_file` is currently Feishu-only. It reads a file from the current Session sandbox workspace and sends a native file message as the Bot identity. Paths must be workspace-relative and may not be absolute or contain `..`; Helpdesk file delivery does not reuse Thunder.Wu's human customer-service Web identity.
 
 ToolRegistry handles registration, argument validation, execution, and Hooks. ToolContext gives each call the current SessionKey, sender identity, channel metadata, sandbox, and authenticated OpenViking connection.
 

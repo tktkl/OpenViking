@@ -40,9 +40,11 @@ Skill 可以编排多个工具，但不会自动获得额外权限。工具是�
 | OpenViking | `openviking_list/search/grep/glob/multi_read` | 浏览、检索和读取上下文 |
 | OpenViking | `openviking_rule_search`（Beta） | 检索适用于具体任务的已编译约束 |
 | OpenViking | `openviking_add_resource`、`openviking_memory_commit` | 添加资源和提交记忆 |
-| 对外操作 | `message`、`generate_image` | 主动发送消息或生成图片 |
+| 对外操作 | `message`、`send_file`、`generate_image` | 主动发送消息、工作区文件附件或生成图片 |
 | 自动化 | `cron` | 管理定时 Agent 任务，默认关闭 |
 | 并行任务 | `spawn` | 启动后台子 Agent |
+
+`send_file` 当前仅支持飞书渠道；它从当前 Session 的沙箱工作区读取文件，并以 Bot 身份发送原生文件消息。路径必须是工作区相对路径，不能是绝对路径或包含 `..`；服务台文件发送不会复用 Thunder.Wu 的人工客服 Web 身份。
 
 ToolRegistry 负责注册、参数校验、执行和 Hook。ToolContext 为每次调用提供当前 SessionKey、发送者身份、渠道 metadata、沙箱和已认证的 OpenViking 连接。
 

@@ -63,6 +63,7 @@ class OutboundMessage:
     event_type: OutboundEventType = OutboundEventType.RESPONSE
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
+    files: list[dict[str, Any]] = field(default_factory=list)  # In-process attachment payloads
     metadata: dict[str, Any] = field(default_factory=dict)
     response_id: str | None = None
     token_usage: dict[str, int] = field(default_factory=dict)
