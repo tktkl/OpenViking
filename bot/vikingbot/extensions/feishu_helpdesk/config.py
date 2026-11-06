@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from vikingbot.extensions.feishu_helpdesk.escalation import normalize_skill_group, normalize_system
 
-WELCOME = "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。"
+WELCOME = "您好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。"
 
 
 class HelpdeskMessagesConfig(BaseModel):
@@ -16,12 +16,12 @@ class HelpdeskMessagesConfig(BaseModel):
     prefix: str = Field(default="【AI分身自动回复】", min_length=1, max_length=100)
     welcome: str = Field(default=WELCOME, min_length=1, max_length=1000)
     second_reminder_suffix: str = Field(
-        default="如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
+        default="如仍未收到{audience}，{minutes}分钟后将自动关闭本工单。",
         min_length=1,
         max_length=1000,
     )
     escalation_reminder_suffix: str = Field(
-        default="如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
+        default="如仍未收到{audience}，{minutes}分钟后将升级处理。",
         min_length=1,
         max_length=1000,
     )
@@ -46,11 +46,19 @@ class HelpdeskMessagesConfig(BaseModel):
                 for _, field, spec, conversion in Formatter().parse(value)
                 if field is not None
             ]
-            if fields != [("minutes", "", None)]:
+            names = [field for field, _, _ in fields]
+            if (
+                names.count("minutes") != 1
+                or names.count("audience") > 1
+                or any(field not in {"minutes", "audience"} for field in names)
+                or any(spec or conversion for _, spec, conversion in fields)
+            ):
                 raise ValueError()
-            value.format(minutes=5)
+            value.format(minutes=5, audience="相关方")
         except (ValueError, KeyError, IndexError):
-            raise ValueError("reminder suffix must contain exactly one {minutes}") from None
+            raise ValueError(
+                "reminder suffix must contain one {minutes} and optional {audience}"
+            ) from None
         return value.strip()
 
     def render(self, text):
@@ -97,7 +105,7 @@ class FeishuHelpdeskEscalationConfig(BaseModel):
     """Configurable system-to-group routing for unresolved escalations."""
 
     enabled: bool = True
-    interval_minutes: int = Field(default=30, gt=0, strict=True)
+    interval_minutes: int = Field(default=45, gt=0, strict=True)
     sender: Literal["bot", "lark_cli"] = "bot"
     groups: dict[str, str] = Field(default_factory=dict)
     followup_skill_groups: dict[str, list[str]] = Field(default_factory=dict)

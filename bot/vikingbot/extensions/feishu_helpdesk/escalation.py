@@ -122,12 +122,16 @@ def render_escalation(
     chat_id: str,
     interval_minutes: int,
     guest: object = None,
+    summary: str = "",
 ) -> str:
     subject = ticket_subject(guest, system)
     link = ticket_group_link(chat_id)
+    summary = " ".join(str(summary or "").split())
+    summary_line = f"问题概要：{summary}\n" if summary else ""
     return (
         "【升级提醒】\n"
         f"{subject}（{ticket_id}）经首次催办后仍未解决，现已升级。\n"
+        f"{summary_line}"
         f"原工单群：{link}\n"
         "请相关同学尽快处理。问题彻底解决前，"
         f"本群每 {interval_minutes} 分钟提醒一次。"

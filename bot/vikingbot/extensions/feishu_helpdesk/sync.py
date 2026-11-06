@@ -28,12 +28,15 @@ class HelpdeskSync:
 
     async def discover(self):
         end = self.clock()
+        changed = []
         for field in ("create", "update"):
             start = max(self.store.meta("activated_at"), self.store.meta(field + "_cursor") - 60)
-            await self._window(field, start, end)
+            changed.extend(await self._window(field, start, end))
             self.store.set_meta(field + "_cursor", end)
+        return list(dict.fromkeys(changed))
 
     async def _window(self, field, start, end):
+        changed = []
         first = await self.api.tickets_page(field, start, end, 1)
         rows, total = page_items(first, "tickets")
         if total >= 10000:
@@ -41,9 +44,9 @@ class HelpdeskSync:
             if int(end * 1000) - int(start * 1000) < 2:
                 raise ValueError("Helpdesk window cannot be completely enumerated")
             middle = int((start + end) * 500) / 1000
-            await self._window(field, start, middle)
-            await self._window(field, middle, end)
-            return
+            changed.extend(await self._window(field, start, middle))
+            changed.extend(await self._window(field, middle, end))
+            return list(dict.fromkeys(changed))
         page, count = 1, 0
         expected_total, seen = total, set()
         while True:
@@ -52,12 +55,23 @@ class HelpdeskSync:
                 if not identity or identity in seen:
                     raise ValueError("Unstable Helpdesk ticket pagination")
                 seen.add(identity)
-                self.service.register(ticket)
+                before = self.store.tickets.get(identity)
+                after = self.service.register(ticket)
+                if after is not None and (
+                    before is None
+                    or (after.get("updated") or -1) > (before.get("updated") or -1)
+                    or after["status"] != before["status"]
+                    or after["generation"] != before["generation"]
+                    or after["chat_id"] != before["chat_id"]
+                    or bool(after.get("refresh_pending"))
+                    != bool(before.get("refresh_pending"))
+                ):
+                    changed.append(identity)
             count += len(rows)
             if count >= total:
                 if count != total:
                     raise ValueError("Inconsistent Helpdesk ticket total")
-                return
+                return list(dict.fromkeys(changed))
             if not rows:
                 raise ValueError("Truncated Helpdesk ticket pagination")
             page += 1

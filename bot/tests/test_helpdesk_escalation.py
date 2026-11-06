@@ -1,9 +1,12 @@
 """Escalation routing, timing, and self-healing behavior."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
+from test_helpdesk_followup import add_ticket, drain, human, initialized
+from test_helpdesk_followup import desk as desk
 from vikingbot.config.schema import FeishuChannelConfig
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
 from vikingbot.extensions.feishu_helpdesk.decision import Decision
@@ -15,13 +18,11 @@ from vikingbot.extensions.feishu_helpdesk.escalation import (
     ticket_subject,
 )
 
-from test_helpdesk_followup import add_ticket, desk as desk, drain, human, initialized
-
 TMS_GROUP = "oc_9d44f08fa000144519d54ed5565730f1"
 COMMON_GROUP = "oc_c3deaf22ddfa568d745fd4d881e2ddde"
 ESCALATION = {
     "enabled": True,
-    "interval_minutes": 30,
+    "interval_minutes": 45,
     "groups": {
         "tms": TMS_GROUP,
         "scm": COMMON_GROUP,
@@ -48,13 +49,13 @@ SCOPE_ESCALATION = {
 def test_escalation_defaults_and_group_keys_are_normalized():
     config = FeishuChannelConfig().helpdesk
     assert config.followup_interval_minutes == 5
-    assert config.escalation.interval_minutes == 30
+    assert config.escalation.interval_minutes == 45
     assert config.escalation.groups == {}
 
     configured = FeishuChannelConfig(
         helpdesk={
             "escalation": {
-                "interval_minutes": 30,
+                "interval_minutes": 45,
                 "groups": {"pdm": COMMON_GROUP, "TMS": TMS_GROUP},
             }
         }
@@ -140,6 +141,7 @@ def test_escalation_text_uses_customer_name_and_clickable_ticket_group():
         "oc_d61a2638665e64f5a98e2fb5c401746d",
         10,
         guest={"name": "Darry"},
+        summary="26-4326 柜的物流单号未回传，等待仓库重新推送并同步 TMS 发运状态。",
     )
     assert ticket_subject({"name": "Darry"}, "TMS") == "Darry 的 TMS 工单"
     assert "Darry 的 TMS 工单（7704211350305655987）" in text
@@ -147,6 +149,10 @@ def test_escalation_text_uses_customer_name_and_clickable_ticket_group():
         "https://applink.feishu.cn/client/chat/open?openChatId="
         "oc_d61a2638665e64f5a98e2fb5c401746d"
     ) in text
+    assert (
+        "问题概要：26-4326 柜的物流单号未回传，等待仓库重新推送并同步 TMS 发运状态。"
+        in text
+    )
     assert "原工单群：oc_d61a2638665e64f5a98e2fb5c401746d" not in text
     assert ticket_subject({}, "TMS") == "客户 的 TMS 工单"
 
@@ -229,9 +235,12 @@ async def test_three_minute_reminders_skip_welcome_outside_followup_scope(desk):
 
 
 @pytest.mark.asyncio
-async def test_one_five_minute_reminder_then_thirty_minute_escalation(desk):
+async def test_one_five_minute_reminder_then_forty_five_minute_escalation(desk):
     service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
+    service.judge.summarize = AsyncMock(
+        return_value="齐色样单无法上传，业务方已提供截图，等待开发排查上传失败原因。"
+    )
     human(service, clock, text="产品信息人工客服（PDM）")
     await drain(service)
 
@@ -240,6 +249,8 @@ async def test_one_five_minute_reminder_then_thirty_minute_escalation(desk):
     item = service.store.tickets["t1"]
     assert item["count"] == 1 and item["escalation_started_at"] is None
     assert "5分钟后将升级处理" in api.cli.sends[-1][1]
+    assert "产品/研发/测试的处理进展或结论" in api.cli.sends[-1][1]
+    assert "业务方的补充或确认" not in api.cli.sends[-1][1]
 
     clock.advance(299)
     await drain(service)
@@ -255,12 +266,13 @@ async def test_one_five_minute_reminder_then_thirty_minute_escalation(desk):
     assert api.cli.sends[-1][0] == COMMON_GROUP
     assert service.store.outbox("t1:escalation:1")["transport"] == "feishu_bot"
     assert "客户 的 PDM 工单（t1）" in api.cli.sends[-1][1]
+    assert "问题概要：齐色样单无法上传，业务方已提供截图，等待开发排查上传失败原因。" in api.cli.sends[-1][1]
     assert "openChatId=oc_ticket" in api.cli.sends[-1][1]
-    assert "本群每 30 分钟提醒一次" in api.cli.sends[-1][1]
+    assert "本群每 45 分钟提醒一次" in api.cli.sends[-1][1]
     ticket_sends = [send for send in api.cli.sends if send[0] == "oc_ticket"]
     assert len(ticket_sends) == 2
 
-    clock.advance(1799)
+    clock.advance(2699)
     await drain(service)
     assert service.store.tickets["t1"]["escalation_count"] == 1
     clock.advance(1)
@@ -268,7 +280,54 @@ async def test_one_five_minute_reminder_then_thirty_minute_escalation(desk):
     item = service.store.tickets["t1"]
     assert item["escalation_count"] == 2
     assert api.cli.sends[-1][0] == COMMON_GROUP
+    service.judge.summarize.assert_awaited_once()
     assert not api.cli.closes
+
+
+@pytest.mark.asyncio
+async def test_business_wait_reminder_names_business_as_the_required_responder(desk):
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
+    service.judge.judge.return_value = Decision("awaiting_details", "您好，请补充问题。")
+    human(service, clock, text="产品信息人工客服（PDM）")
+    await drain(service)
+
+    clock.advance(300)
+    await drain(service)
+
+    assert "业务方的补充或确认" in api.cli.sends[-1][1]
+    assert "产品/研发/测试" not in api.cli.sends[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_new_human_message_during_summary_prevents_stale_escalation(desk):
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
+    service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
+    human(service, clock, text="产品信息人工客服（PDM）")
+    await drain(service)
+    service.store.save(
+        service.store.tickets["t1"],
+        count=1,
+        last_send=clock() - 300,
+        scenario="awaiting_handler",
+        evaluated_generation=service.store.tickets["t1"]["generation"],
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def summarize(*args):
+        entered.set()
+        await release.wait()
+        return "不应被发送的旧摘要"
+
+    service.judge.summarize = summarize
+    task = asyncio.create_task(drain(service))
+    await entered.wait()
+    human(service, clock, mid="om_new_problem", text="又发现一个新的问题")
+    release.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert service.store.tickets["t1"]["escalation_count"] == 0
+    assert service.store.outbox("t1:escalation:1") is None
+    assert all("不应被发送的旧摘要" not in text for _, text, _ in api.cli.sends)
 
 
 @pytest.mark.asyncio
@@ -293,7 +352,7 @@ async def test_ticket_group_stays_silent_but_escalation_continues_after_reply(de
     assert len(api.cli.sends) == sends_before
     assert service.store.tickets["t1"]["count"] == 0
 
-    clock.advance(1800)
+    clock.advance(2700)
     await drain(service)
     assert len(api.cli.sends) == sends_before + 1
     assert api.cli.sends[-1][0] == TMS_GROUP
@@ -338,7 +397,7 @@ async def test_resolution_stops_escalation_and_restart_does_not_duplicate(desk, 
     await drain(restarted)
     assert restarted.store.tickets["t1"]["status"] == 51
     sends_at_resolution = len(api.cli.sends)
-    clock.advance(1800)
+    clock.advance(2700)
     await drain(restarted)
     assert len(api.cli.sends) == sends_at_resolution
     assert restarted.store.tickets["t1"]["escalation_count"] == 1

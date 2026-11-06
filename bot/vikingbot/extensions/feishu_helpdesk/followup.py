@@ -33,6 +33,9 @@ from vikingbot.extensions.feishu_helpdesk.state import HelpdeskState, timestamp
 from vikingbot.extensions.feishu_helpdesk.sync import HelpdeskSync
 
 CLOSED = {50, 51, 52}
+DISCOVERY_INTERVAL_SECONDS = 10
+SWEEP_INTERVAL_SECONDS = 60
+SWEEP_BATCH_SIZE = 10
 
 
 class StaleAction(Exception):
@@ -76,6 +79,8 @@ class HelpdeskFollowup:
         self.running = False
         self._tasks, self._executions = set(), set()
         self._queued, self._synced, self._dirty = {}, set(), set()
+        self._sync_retry_at, self._sync_failures = {}, {}
+        self._sweep_offset = 0
         self._wakeup, self._sync_wakeup, self._idle = (
             asyncio.Event(),
             asyncio.Event(),
@@ -353,51 +358,116 @@ class HelpdeskFollowup:
             raise StaleAction()
         return item
 
-    async def reconcile(self, *, discover=True, ids=None):
+    def _reconcile_ids(self):
+        return [
+            t["id"]
+            for t in self.store.tickets.values()
+            if t["status"] not in CLOSED
+            or t["notice_pending"]
+            or t["close_pending"] is not None
+            or t.get("refresh_pending")
+        ]
+
+    def _next_sweep_batch(self, excluded, limit):
+        """Rotate through existing tickets so no full pass blocks new work."""
+        ticket_ids = self._reconcile_ids()
+        if not ticket_ids or limit <= 0:
+            return []
+        # A restart must not make an already-pending welcome wait behind every
+        # other open ticket. Keep these first, then rotate the remainder.
+        ticket_ids.sort(
+            key=lambda ticket_id: self.store.tickets[ticket_id].get("welcome_at") is not None
+        )
+        batch = []
+        for _ in range(len(ticket_ids)):
+            index = self._sweep_offset % len(ticket_ids)
+            self._sweep_offset = (index + 1) % len(ticket_ids)
+            ticket_id = ticket_ids[index]
+            if ticket_id in excluded:
+                continue
+            batch.append(ticket_id)
+            if len(batch) >= limit:
+                break
+        return batch
+
+    async def reconcile(self, *, discover=True, ids=None, max_existing=None):
+        changed = []
         if discover:
             try:
-                await self.sync.discover()
+                changed = await self.sync.discover()
+                if changed:
+                    logger.info("Helpdesk changed tickets: {}", ",".join(changed))
             except Exception as error:
                 logger.warning("Helpdesk discovery failed: {}", type(error).__name__)
-        targets = (
-            [
-                t["id"]
-                for t in self.store.tickets.values()
-                if t["status"] not in CLOSED
-                or t["notice_pending"]
-                or t["close_pending"]
-                or t.get("refresh_pending")
-            ]
-            if ids is None
-            else list(ids)
-        )
+        if ids is None and max_existing is None:
+            candidates = self._reconcile_ids()
+        else:
+            candidates = list(
+                dict.fromkeys(
+                    ticket_id
+                    for ticket_id in [*(ids or []), *changed]
+                    if ticket_id in self.store.tickets
+                )
+            )
+            if max_existing:
+                candidates.extend(self._next_sweep_batch(set(candidates), max_existing))
+        now = self.clock()
+        targets = []
+        for ticket_id in candidates:
+            if self._sync_retry_at.get(ticket_id, 0) > now:
+                self._dirty.add(ticket_id)
+                continue
+            targets.append(ticket_id)
         for ticket_id in targets:
             if not self.running:
                 return
             try:
                 await self.sync.ticket(ticket_id)
                 self._synced.add(ticket_id)
+                self._sync_retry_at.pop(ticket_id, None)
+                self._sync_failures.pop(ticket_id, None)
             except Exception as error:
                 self._synced.discard(ticket_id)
+                failures = self._sync_failures.get(ticket_id, 0) + 1
+                delay = min(60, 10 * (2 ** min(failures - 1, 3)))
+                self._sync_failures[ticket_id] = failures
+                self._sync_retry_at[ticket_id] = self.clock() + delay
+                self._dirty.add(ticket_id)
                 logger.warning(
-                    "Helpdesk synchronization failed: ticket={}, error={}",
+                    "Helpdesk synchronization failed: ticket={}, error={}, retry_in={}s",
                     ticket_id,
                     type(error).__name__,
+                    delay,
                 )
         self._wakeup.set()
 
     async def _monitor(self):
-        next_scan = 0
+        next_scan = 0.0
+        next_sweep = 0.0
         while self.running:
-            scan = self.clock() >= next_scan
+            now = self.clock()
+            scan = now >= next_scan
             if scan:
-                next_scan = self.clock() + 60
+                next_scan = now + DISCOVERY_INTERVAL_SECONDS
+            sweep = now >= next_sweep
+            if sweep:
+                next_sweep = now + SWEEP_INTERVAL_SECONDS
             dirty, self._dirty = self._dirty, set()
             self._sync_wakeup.clear()
-            await self.reconcile(discover=scan, ids=None if scan else dirty)
+            await self.reconcile(
+                discover=scan,
+                ids=dirty,
+                max_existing=SWEEP_BATCH_SIZE if sweep else 0,
+            )
             try:
+                wait_seconds = max(
+                    0.1, min(DISCOVERY_INTERVAL_SECONDS, next_scan - self.clock())
+                )
+                for retry_at in self._sync_retry_at.values():
+                    wait_seconds = min(wait_seconds, max(0.1, retry_at - self.clock()))
                 await asyncio.wait_for(
-                    self._sync_wakeup.wait(), max(0.1, min(60, next_scan - self.clock()))
+                    self._sync_wakeup.wait(),
+                    wait_seconds,
                 )
             except asyncio.TimeoutError:
                 pass
@@ -729,7 +799,12 @@ class HelpdeskFollowup:
                     if self._escalation_configured()
                     else self.config.helpdesk.messages.second_reminder_suffix
                 )
-                text += "\n" + suffix.format(minutes=minutes)
+                audience = (
+                    "业务方的补充或确认"
+                    if decision.scenario in BUSINESS_WAIT
+                    else "产品/研发/测试的处理进展或结论"
+                )
+                text += "\n" + suffix.format(minutes=minutes, audience=audience)
             receipt = await self._send(item, f"reminder:{generation}:1", text)
             current = self.store.tickets[ticket_id]
             if current["generation"] == generation:
@@ -784,6 +859,28 @@ class HelpdeskFollowup:
             escalation_system=system,
             escalation_chat_id=target,
         )
+        summary = str(item.get("escalation_summary") or "").strip()
+        if item.get("escalation_summary_generation") != item["generation"]:
+            try:
+                summary = await self.judge.summarize(
+                    item, self.store.messages(item["id"])
+                )
+            except Exception as error:
+                logger.warning(
+                    "Helpdesk escalation summary failed: ticket={}, error={}",
+                    item["id"],
+                    type(error).__name__,
+                )
+                summary = ""
+            current = self.store.tickets[item["id"]]
+            if current["generation"] != item["generation"]:
+                raise StaleAction()
+            if summary:
+                item = self.store.save(
+                    current,
+                    escalation_summary=summary,
+                    escalation_summary_generation=current["generation"],
+                )
         sequence = int(item.get("escalation_count") or 0) + 1
         kind = f"escalation:{sequence}"
         text = render_escalation(
@@ -792,6 +889,7 @@ class HelpdeskFollowup:
             item["chat_id"],
             self.config.helpdesk.escalation.interval_minutes,
             guest=item.get("guest"),
+            summary=summary,
         )
         receipt = await self._send(item, kind, text, chat_id=target)
         current = self.store.tickets[item["id"]]

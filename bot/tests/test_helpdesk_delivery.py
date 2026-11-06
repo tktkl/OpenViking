@@ -334,8 +334,8 @@ async def test_all_automatic_messages_use_configured_format_and_interval(desk):
         clock.advance(420)
         await drain(service)
     assert all(text.startswith("【自动服务通知】\n") for _, text, _ in api.cli.sends)
-    assert "等待7分钟" in api.cli.sends[2][1]
-    assert api.cli.sends[-1][1] == "【自动服务通知】\n等待业务回复超时，已关闭。"
+    assert "还会等待7分钟" in api.cli.sends[1][1]
+    assert api.cli.sends[2][1] == "【自动服务通知】\n等待业务回复超时，已关闭。"
 
 
 @pytest.mark.parametrize(

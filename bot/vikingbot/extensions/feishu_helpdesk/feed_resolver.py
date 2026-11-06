@@ -315,19 +315,32 @@ class FeishuBrowserSession:
             time.sleep(0.25)
         if not module_ready:
             raise FeedResolutionError("web messenger feed module did not load")
-        self._started = True
         # The first C$ call triggers the messenger feed sync.  Do it during
-        # background warmup so the first real ticket does not pay this cost.
-        try:
-            _evaluate(
-                self._cdp,
-                "window.__ov_feed_require(700426).C$({filter:9,count:100})"
-                ".then(x=>x.previews||[])",
-                await_promise=True,
-            )
-        except FeedResolutionError:
-            pass
+        # background warmup so the first real ticket does not pay this cost. A
+        # newly loaded messenger can expose the module before its UI stores are
+        # initialized; C$ then throws while reading an undefined module. Keep
+        # the page active and retry until the same call used by resolve() works
+        # before freezing it. Otherwise the cached browser stays permanently
+        # half-initialized for the lifetime of the bot process.
+        self._wait_for_feed_sync(deadline)
+        self._started = True
         self._freeze()
+
+    def _wait_for_feed_sync(self, deadline: float):
+        while time.monotonic() < deadline:
+            try:
+                previews = _evaluate(
+                    self._cdp,
+                    "window.__ov_feed_require(700426).C$({filter:9,count:100})"
+                    ".then(x=>x.previews||[])",
+                    await_promise=True,
+                )
+            except FeedResolutionError:
+                previews = None
+            if isinstance(previews, list):
+                return previews
+            time.sleep(0.25)
+        raise FeedResolutionError("web messenger feed sync did not become ready")
 
     def _freeze(self):
         if self._frozen or self._cdp is None:
@@ -497,14 +510,29 @@ class FeishuWebFeedResolver:
                 return
             if self._browser is not None:
                 await self._run_browser(self._browser.close)
-            self._browser = FeishuBrowserSession(
+            browser = FeishuBrowserSession(
                 web_url=self.settings.web_url,
                 cookies=cookies,
                 executable=self.settings.browser_executable,
                 timeout=self.settings.feed_resolution_timeout_seconds,
             )
-            await self._run_browser(self._browser.start)
+            try:
+                await self._run_browser(browser.start)
+            except BaseException:
+                await self._run_browser(browser.close)
+                self._browser = None
+                self._browser_cookie_signature = None
+                raise
+            self._browser = browser
             self._browser_cookie_signature = signature
+
+    async def _discard_browser(self):
+        async with self._browser_lock:
+            browser = self._browser
+            self._browser = None
+            self._browser_cookie_signature = None
+            if browser is not None:
+                await self._run_browser(browser.close)
 
     async def warm(self, cookies=None):
         try:
@@ -546,8 +574,15 @@ class FeishuWebFeedResolver:
         names = _chat_names(chat)
         if cookies is None:
             cookies = await self.cookie_provider()
-        await self._ensure_browser(cookies)
-        feed_id = await self._run_browser(self._browser.resolve, names)
+        for attempt in range(2):
+            await self._ensure_browser(cookies)
+            try:
+                feed_id = await self._run_browser(self._browser.resolve, names)
+                break
+            except FeedResolutionError:
+                await self._discard_browser()
+                if attempt:
+                    raise
         self.cache.put(chat_id, feed_id)
         return feed_id
 

@@ -1,12 +1,14 @@
 """Feed-id cache and resolver tests; the browser itself is mocked."""
 
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from vikingbot.extensions.feishu_helpdesk.feed_resolver import (
     FeedIdCache,
+    FeedResolutionError,
+    FeishuBrowserSession,
     FeishuWebFeedResolver,
 )
 
@@ -76,3 +78,55 @@ async def test_resolver_requires_opt_in_on_cache_miss(tmp_path):
     )
     with pytest.raises(RuntimeError, match="not cached"):
         await resolver.resolve("oc_missing")
+
+
+def test_feed_sync_waits_for_messenger_stores_before_freezing(monkeypatch):
+    session = FeishuBrowserSession(
+        web_url="https://messenger.test/", cookies=[], executable="", timeout=2
+    )
+    session._cdp = object()
+    attempts = []
+
+    def evaluate(*args, **kwargs):
+        attempts.append(kwargs)
+        if len(attempts) < 3:
+            raise FeedResolutionError("messenger UI is not ready")
+        return [{"feedId": "42"}]
+
+    monkeypatch.setattr(
+        "vikingbot.extensions.feishu_helpdesk.feed_resolver._evaluate", evaluate
+    )
+    monkeypatch.setattr(
+        "vikingbot.extensions.feishu_helpdesk.feed_resolver.time.sleep", lambda _: None
+    )
+
+    assert session._wait_for_feed_sync(time.monotonic() + 2) == [{"feedId": "42"}]
+    assert len(attempts) == 3
+    assert all(call["await_promise"] is True for call in attempts)
+
+
+@pytest.mark.asyncio
+async def test_resolver_rebuilds_a_browser_after_a_feed_resolution_failure(
+    tmp_path, monkeypatch
+):
+    api = SimpleNamespace(chat=AsyncMock(return_value={"name": "[Processing] ticket"}))
+    resolver = FeishuWebFeedResolver(
+        settings(), api=api, cache_path=tmp_path / "ids.json"
+    )
+    first = SimpleNamespace(
+        resolve=Mock(side_effect=FeedResolutionError("half initialized")),
+        close=Mock(),
+    )
+    second = SimpleNamespace(resolve=Mock(return_value="42"), close=Mock())
+    browsers = [first, second]
+
+    async def ensure_browser(cookies):
+        resolver._browser = browsers.pop(0)
+
+    resolver._ensure_browser = AsyncMock(side_effect=ensure_browser)
+
+    assert await resolver.resolve("oc_chat", cookies=[{"name": "session"}]) == "42"
+    first.close.assert_called_once_with()
+    second.close.assert_not_called()
+    assert FeedIdCache(tmp_path / "ids.json").get("oc_chat") == "42"
+    await resolver.close()

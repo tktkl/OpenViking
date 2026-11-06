@@ -114,9 +114,9 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
           "followup_interval_minutes": 5,
           "messages": {
             "prefix": "【AI分身自动回复】",
-            "welcome": "你好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
-            "second_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将自动关闭本工单。",
-            "escalation_reminder_suffix": "如仍未收到你的补充或确认，{minutes}分钟后将升级处理。",
+            "welcome": "您好，请描述遇到的问题，并补充相关截图或其他信息。如已经提供，可忽略此消息。",
+            "second_reminder_suffix": "如仍未收到{audience}，{minutes}分钟后将自动关闭本工单。",
+            "escalation_reminder_suffix": "如仍未收到{audience}，{minutes}分钟后将升级处理。",
             "closed_resolved": "问题已解决，工单已关闭。",
             "closed_timeout": "因催办后仍未收到业务补充或确认，工单已关闭。"
           },
@@ -138,7 +138,7 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
           },
           "escalation": {
             "enabled": true,
-            "interval_minutes": 30,
+            "interval_minutes": 45,
             "sender": "bot",
             "groups": {
               "TMS": "oc_tms_escalation_group",
@@ -171,7 +171,7 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 | `helpdesk.enabled` | `false` | 显式设为 `true`，同时提供 ID 和 Token |
 | `helpdesk.followup_interval_minutes` | `5` | 严格正整数，单位分钟；首次催办与上次消息之间的间隔 |
 | `helpdesk.escalation.enabled` | `true` | 开关升级；关闭时保留无升级路由的兼容行为 |
-| `helpdesk.escalation.interval_minutes` | `30` | 升级后重复提醒间隔，单位分钟 |
+| `helpdesk.escalation.interval_minutes` | `45` | 升级后重复提醒间隔，单位分钟 |
 | `helpdesk.escalation.sender` | `bot` | 升级群发送身份；`bot` 走官方 IM API，`lark_cli` 走 CLI 用户身份，均不使用 Web Messenger |
 | `helpdesk.escalation.groups` | 空 | 系统名到升级群 `oc_*` 的映射；配置后按工单最初选择的系统路由 |
 | `helpdesk.messages` | 示例中的文案 | 可全部省略；欢迎、提醒及关闭说明统一带 `prefix` 和换行 |
@@ -186,9 +186,9 @@ lark-cli --profile support api GET /open-apis/authen/v1/user_info --as user --fo
 
 配置修改后重启生效。分钟数不能写成 `0`、小数、布尔值或字符串。连续跟进次数固定为两次，不另设次数配置。
 
-欢迎正文固定为示例中的一句话，不包含时间、不调用模型。首次提醒在配置升级路由时追加 `escalation_reminder_suffix`，无升级路由时首次提醒追加旧版兼容字段 `second_reminder_suffix`；两者都必须且只能包含一次裸 `{minutes}`。跟进正文仍由模型结合对话生成。
+欢迎正文固定为示例中的一句话，不包含时间、不调用模型，统一使用“您好”。首次提醒在配置升级路由时追加 `escalation_reminder_suffix`，无升级路由时首次提醒追加旧版兼容字段 `second_reminder_suffix`；两者都必须且只能包含一次裸 `{minutes}`，可选使用 `{audience}`。等待业务补充或确认时，`audience` 为“业务方的补充或确认”；等待处理时，为“产品/研发/测试的处理进展或结论”。跟进正文仍由模型结合对话生成，首句问候统一为“您好”。
 
-启用升级后，首次提醒再等待一个跟进间隔仍无解决，就向对应升级群发送包含客户名、工单号、系统和原工单群可点击链接的通知；之后每 30 分钟重复，直到工单解决或关闭。升级群默认以应用 Bot 身份通过官方 IM API 发送。原工单群继续同步和判断，但不再发送提醒。升级路由启用时，首次提醒后不会因业务静默自动超时关单。
+启用升级后，首次提醒再等待一个跟进间隔仍无解决，就向对应升级群发送包含客户名、工单号、系统和原工单群可点击链接的通知，并附带模型根据当前对话生成的简短“问题概要”。同一轮 45 分钟重复提醒复用摘要，业务产生新消息后才重新生成；摘要失败不阻塞升级。之后每 45 分钟重复，直到工单解决或关闭。升级群默认以应用 Bot 身份通过官方 IM API 发送。原工单群继续同步和判断，但不再发送提醒。升级路由启用时，首次提醒后不会因业务静默自动超时关单。
 
 示例 `allow_from: []` 代表不限制用户；已有白名单时保留原值。`thread_require_mention: true` 沿用普通 Agent 回答需要 `@Bot` 的规则，服务台人工活动监测不要求 `@Bot`。
 
@@ -220,7 +220,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 ## 6. 工单发现和自动跟进规则
 
-服务台会主动查询。实时事件负责及时接收变化，启动时及每 60 秒增量查询负责补漏，本地期限调度最多每 10 秒校准一次自然时间。这里的 60 秒查询周期与 5 分钟业务间隔相互独立。
+服务台会主动查询。实时事件负责及时接收变化，启动后每 10 秒增量发现负责补漏；新工单及状态、群关联发生变化的工单优先定向同步，失败按 10、20、40、60 秒上限退避重试。存量工单每 60 秒最多轮转补扫 10 张；本地期限调度最多每 10 秒校准一次自然时间。这里的发现与补扫周期和 5 分钟业务间隔相互独立。
 
 首次启用时持久化接管起点，只接管此后新建且未关闭的工单。首次启用前的历史工单不会批量发送欢迎；已有数据库的部署会继续原有接管记录，并补发现停机期间的新工单。
 
@@ -232,7 +232,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 ```text
 【服务台自动消息】
-你好，请描述遇到的问题，并补充相关截图或报错信息。
+您好，请描述遇到的问题，并补充相关截图或报错信息。
 ```
 
 没有人工沟通时，从欢迎成功发送时间开始计时；有人工沟通后，从最后一条人工消息的产生时间计算。本轮一直静默且提醒均成功时：
@@ -241,7 +241,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 | --- | --- |
 | 静默满 5 分钟 | 第一次提醒 |
 | 第一次成功发送后再静默 5 分钟 | 仍未解决时升级到配置的系统群 |
-| 升级通知成功后每 30 分钟 | 升级群重复提醒，直到解决或关闭 |
+| 升级通知成功后每 45 分钟 | 升级群重复提醒，直到解决或关闭 |
 
 通常对应第 3、6、9 分钟升级。排队、网络及状态核对可能使实际执行稍晚；发送失败不增加次数，也不推进下一期限。停机恢复后不会一次补发多轮提醒，下一次等待从本次成功时间重新计算。
 
@@ -273,7 +273,7 @@ Feishu Helpdesk CLI: authorized user keepalive active; credentials managed by la
 
 1. 启动后创建新工单并建立群关联，确认欢迎只发一次且发送者为 `actor_open_id` 对应的 Web 会话用户；首次解析应写入 feed 缓存，后续不再启动新浏览器。
 2. 不描述问题并持续静默，核对第 5／10 分钟的首次提醒和升级；首次提醒应写明 5 分钟后升级。
-3. 确认 TMS 和其他系统分别进入配置映射的升级群，发送者为应用 Bot；首次通知后每 30 分钟重复，原工单群不再提醒。
+3. 确认 TMS 和其他系统分别进入配置映射的升级群，发送者为应用 Bot；首次通知后每 45 分钟重复，原工单群不再提醒。
 4. 在升级后发送人工消息，确认原工单群仍恢复判断但不恢复提醒；可信“已解决”沟通应立即关单，只发送一次关闭说明。
 5. 在一个会话中等待较慢回答，同时向另一会话提问，确认第二个会话能处理；同会话仍保持顺序。
 6. 停机期间新建工单后重启，确认补接管；已欢迎工单重启后不重复欢迎，也不补发多轮过期提醒或升级通知。
@@ -320,7 +320,7 @@ CLI 升级通常不需要修改源码补丁；必要字段、加密布局或刷�
 | 发送或入群出现 `232011`／`232017` | 检查 CLI 用户是否在关联群、是否有相应邀请权限 |
 | `Helpdesk synchronization failed` | 检查服务台读取权限、Token、网络与限流；未补齐消息时不会依据不完整历史自动关单 |
 | `Helpdesk receipt reconciliation failed` | 检查当前用户的群消息读取权限及网络；人工 IM 交付继续运行 |
-| 两次催办后没有关闭 | 当前配置启用升级，本就不会超时关单；检查是否已按 30 分钟节奏升级，以及是否已有可信“已解决”判断 |
+| 首次催办后没有关闭 | 当前配置启用升级，本就不会超时关单；检查是否已按 45 分钟节奏升级，以及是否已有可信“已解决”判断 |
 | 升级群没有收到通知 | 检查系统识别、`escalation.groups`、Bot 是否在升级群，以及 outbox 的 `transport=feishu_bot` 和发送日志 |
 | 工单群提示 `feed id` 或 Web 登录失败 | 检查 auth-mcp `feishu_helpdesk` 会话是否 ready、Chromium 是否可执行、`web_url`/`feed_ids` 是否正确 |
 | `Helpdesk automation paused` | 查看暂停原因；发送回执过期或跨轮不确定时暂停该工单自动化，独立后台对账继续运行 |

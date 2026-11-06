@@ -15,7 +15,7 @@
 | `agent/loop.py` | 物理群忙碌查询涵盖话题、总线/调度器排队、执行及最终保存，以及 `process_direct()` 的初始化、处理和清理；ContextVar 只排除调度回调自身 |
 | `agent/session_dispatcher.py` | 只增加只读 `queued_session_keys()`，包括内部回调，不改变 worker/公平调度 |
 | `channels/manager.py`、`cli/commands.py` | 仅给启用的服务台子类注入当前 provider、model 及 `has_chat_work` |
-| `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，当前默认 5；`reply` 选择工单群发送身份；`escalation` 配置系统映射、30 分钟间隔和 Bot/CLI 发送；`messages` 统一标识和文案，时间模板校验 |
+| `extensions/feishu_helpdesk/config.py` | `followup_interval_minutes` 严格正整数，当前默认 5；`reply` 选择工单群发送身份；`escalation` 配置系统映射、45 分钟间隔和 Bot/CLI 发送；`messages` 统一标识和文案，时间模板校验 |
 | `extensions/feishu_helpdesk/api.py`、`cli.py` | 应用授权只读；普通用户操作显式 CLI `--as user`；关单启动当前 Python，准备后再做最终回调；共享锁、总预算、stdin、进程组取消和脱敏 |
 | `extensions/feishu_helpdesk/close_helper.py` | 固定关单 API，版本 1 的 ready/commit/abort 协议；CLI 策略与身份检查、续期先于刷新锁；一次 PUT、不重放不确定提交 |
 | `extensions/feishu_helpdesk/cli_credentials.py` | 集中适配 CLI 目录、工作区、profile、AES-GCM 和刷新锁；只读解密 access token，不创建密钥、不使用 refresh token |
@@ -125,12 +125,12 @@
 | --- | --- | --- | --- |
 | `extensions/feishu_helpdesk/reply.py` | 新增可插拔 `FeishuWebGatewaySender`、Web Gateway protobuf、回执解码、auth-mcp Cookie 获取和 feed-id 接入 | 工单群发送与状态机解耦；发送前调用 `before_call` 写入 actor/attempt；同一 UUID 重试；Web 回执数字 ID 与后续 `om_*` echo 可关联；Cookie 不写日志、不落盘 | 上游若新增统一 sender 接口，应适配该接口而不是把 Web 逻辑塞回 `followup.py` |
 | `extensions/feishu_helpdesk/feed_resolver.py` | 新增 `oc_* → feed_id` 静态映射、持久缓存、无头 Chromium/CDP 解析、常驻页面冻结/恢复 | 先查配置和缓存；未命中才启动浏览器；页面在空闲时冻结，避免每工单启动；缓存文件只保存 chat/feed 映射 | 上游若提供 chat 到 feed 的官方接口，优先替换浏览器解析，保留缓存与错误边界 |
-| `extensions/feishu_helpdesk/escalation.py` | 从工单首条人工选择识别系统，技能组字段兜底，渲染客户名、工单号、流程链接和 30 分钟说明 | 只从配置的 `groups` 生成系统集合；忽略 Bot 的分类选项列表；配置加载器把 `PDM` 转成 `P_D_M` 时仍须归一化为 `PDM` | 不要硬编码系统到群映射；链接使用 `https://applink.feishu.cn/client/chat/open?openChatId=oc_*` |
-| `extensions/feishu_helpdesk/config.py` | 增加 `reply`、`escalation` 配置；工单群间隔默认 5 分钟；升级默认 30 分钟；升级 sender 默认 `bot`；增加升级提醒后缀 | `followup_interval_minutes`、升级间隔均为严格正整数；任意系统键可配置；`feishu_web` 必须显式提供 `actor_open_id` 和 `auth_mcp_server` | 上游若调整 Pydantic 配置结构，保留字段默认值和模型校验，不要丢失大小写系统键归一化 |
+| `extensions/feishu_helpdesk/escalation.py` | 从工单首条人工选择识别系统，技能组字段兜底，渲染客户名、工单号、流程链接和 45 分钟说明 | 只从配置的 `groups` 生成系统集合；忽略 Bot 的分类选项列表；配置加载器把 `PDM` 转成 `P_D_M` 时仍须归一化为 `PDM` | 不要硬编码系统到群映射；链接使用 `https://applink.feishu.cn/client/chat/open?openChatId=oc_*` |
+| `extensions/feishu_helpdesk/config.py` | 增加 `reply`、`escalation` 配置；工单群间隔默认 5 分钟；升级默认 45 分钟；升级 sender 默认 `bot`；增加升级提醒后缀 | `followup_interval_minutes`、升级间隔均为严格正整数；任意系统键可配置；`feishu_web` 必须显式提供 `actor_open_id` 和 `auth_mcp_server` | 上游若调整 Pydantic 配置结构，保留字段默认值和模型校验，不要丢失大小写系统键归一化 |
 | `channels/manager.py` | 仅在启用 Helpdesk 时构建并注入 reply sender | sender 是可插拔依赖，不应该让普通 Feishu 渠道初始化 Web、浏览器或 auth-mcp | 上游若重构渠道工厂，需把注入点迁移到同等生命周期位置 |
 | `extensions/feishu_helpdesk/channel.py` | 接收 reply sender；绑定 Helpdesk 和 feed 缓存；后台 warm；停止时关闭；持久化 `actual_agent_group`/`hit_agent_groups`；注册 reaction no-op | `bind_helpdesk()` 先于发送；warm 任务不阻塞原生 IM；停止顺序为取消任务、关闭 sender、关闭 API；reaction 事件不再产生 processor-not-found | 上游若改事件 builder、start/stop 顺序或 ticket 对象字段名，逐项迁移 |
 | `extensions/feishu_helpdesk/api.py` | 增加群详情和 `send_bot_text()` | 升级群必须使用 tenant token 官方 IM API；接收 `before_call` 并返回 `message_id/create_time`；不得复用 Helpdesk Token 作为发送 token | 上游若提供统一 Bot sender，可替换实现，但保留幂等 UUID 和 tester 身份 |
-| `extensions/feishu_helpdesk/followup.py` | 升级状态机、独立 outbox、工单/升级发送路由、30 分钟重复、升级后停止工单提醒、解析失败延迟、关单通知一次策略、已升级工单关单失败重试 | 升级状态不因新人工消息重置；工单群与升级群使用独立期限和 outbox；`scenario=resolved` 优先关单，不被升级提前返回截断；升级群消息不写回工单 | 这是最高冲突文件；不要整文件选择 ours/theirs，应按“pending/欢迎/升级/判断/提醒/关单”分支合并 |
+| `extensions/feishu_helpdesk/followup.py` | 升级状态机、独立 outbox、工单/升级发送路由、45 分钟重复、升级后停止工单提醒、解析失败延迟、关单通知一次策略、已升级工单关单失败重试 | 升级状态不因新人工消息重置；工单群与升级群使用独立期限和 outbox；`scenario=resolved` 优先关单，不被升级提前返回截断；升级群消息不写回工单 | 这是最高冲突文件；不要整文件选择 ours/theirs，应按“pending/欢迎/升级/判断/提醒/关单”分支合并 |
 | `extensions/feishu_helpdesk/delivery.py` | 后台只读回执对账；transport 精确识别；关闭工单死信；升级群消息不写回工单 | `feishu_web` 和 `feishu_bot` 均可按精确文案、目标和尝试窗口确认；升级群讨论不进入 ticket messages；关闭后停止重试 | 上游若改 outbox 或 observe 接口，保持 transport 与目标群过滤 |
 | `extensions/feishu_helpdesk/state.py` | 增加升级字段；持久化技能组字段；支持删除/死信 outbox；自动消息可用 `im_message_id` 识别 | 旧 SQLite 自动兼容，新增字段均可缺省；人工消息不重置升级状态；重开后重置升级轮次 | 不要新增破坏性 schema migration；旧库启动必须成功 |
 | `extensions/feishu_helpdesk/sync.py` | 对 Helpdesk 数字内部消息按 guest/agent/system 分类 | 数字消息 ID 不能永久保持 `human=None`；未知来源仍然阻塞判断；系统消息不冒充人工 | 上游若改消息字段，可按新字段分类，但不能退化为“所有非 om_ 都未知” |
@@ -146,7 +146,7 @@
 | 新人工消息 | 立即作废旧判断并重新判断 | 不直接发送 | 新 generation，清零本轮提醒次数；已升级标记保留 |
 | 未解决且无本轮提醒 | 5 分钟后第一次提醒 | 不发送 | `count=1,last_send=成功时间` |
 | 第一次成功后仍未解决 | 静默 5 分钟后直接升级 | 首条升级通知 | `count=1,last_send=成功时间; escalation_started_at/escalation_last_sent/escalation_count` |
-| 升级后每 30 分钟 | 只同步和判断，不发提醒 | 重复升级通知 | 更新 `escalation_last_sent` 和序号 |
+| 升级后每 45 分钟 | 只同步和判断，不发提醒 | 重复升级通知 | 更新 `escalation_last_sent` 和序号 |
 | 判定 resolved | 立即关单，成功后最多发一次关闭说明 | 停止 | `status=51,solved=2` |
 | 关单失败 | 5/10 秒重试或 60 秒核对 `close_pending` | 停止发送，等待解决状态确认 | 保留升级字段，resolve 不因升级分支跳过 |
 | 远端已关闭 | 停止提醒和升级 | 停止 | `status` 为 50/51/52，后台 outbox 死信 |
@@ -168,7 +168,7 @@
 4. 合入 `sync.py`、`decision.py`、`delivery.py`，保证消息来源、echo 去重和回执对账稳定。
 5. 最后按分支语义合入 `followup.py`；重点检查 `_due`、`_next_wait`、`_execute`、`_send`、`_close`、`_notice` 六个函数。
 6. VLM 改动可独立合并；它不依赖服务台状态，但若上游改了 `get_completion_async` 或模型参数构造，必须重新透传 `reasoning_effort`。
-7. 合并后按下列顺序验证：配置加载 → 旧 SQLite 启动 → 普通 IM → 工单 welcome/5/10 时间线 → 升级群 Bot 30 分钟 → resolved 立即关单 → 关单失败重试 → 重启不重复。
+7. 合并后按下列顺序验证：配置加载 → 旧 SQLite 启动 → 普通 IM → 工单 welcome/5/10 时间线 → 升级群 Bot 45 分钟 → resolved 立即关单 → 关单失败重试 → 重启不重复。
 
 不要合并下列本机文件；它们只用于当前部署环境：
 
@@ -208,4 +208,4 @@ cd ..
 PYTHONPATH=bot:. .venv/bin/python -m pytest -c bot/pytest.ini -q tests/unit/test_vlm_reasoning_models.py
 ```
 
-重点断言：升级后工单群静默、升级群 30 分钟重复、系统映射配置化、resolved 立即关单、升级后关单失败可重试、Echo 不误判人工、旧 SQLite 不需迁移、`feishu_bot` 与 `feishu_web` 回执互不串群。
+重点断言：升级后工单群静默、升级群 45 分钟重复、系统映射配置化、resolved 立即关单、升级后关单失败可重试、Echo 不误判人工、旧 SQLite 不需迁移、`feishu_bot` 与 `feishu_web` 回执互不串群。

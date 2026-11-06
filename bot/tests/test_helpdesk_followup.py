@@ -1013,6 +1013,61 @@ async def test_judge_has_independent_budget_and_requires_latest_evidence():
 
 
 @pytest.mark.asyncio
+async def test_judge_summarizes_ticket_problem_without_copying_raw_messages():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "summary": "齐色样单无法上传，业务方已提供截图，等待开发排查上传失败原因。"
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+
+    summary = await judge.summarize(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": []},
+        [
+            {
+                "im_id": "om_welcome",
+                "human": False,
+                "sender": "",
+                "text": "你好，请描述遇到的问题。",
+                "time": 1,
+            },
+            {
+                "im_id": "om_problem",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "你好，麻烦帮我看下这两个款的齐色单上传不了",
+                "time": 2,
+            },
+            {
+                "im_id": "om_image",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "[image]",
+                "image_summary": "上传页面提示文件解析失败",
+                "time": 3,
+            },
+        ],
+    )
+
+    assert summary == "齐色样单无法上传，业务方已提供截图，等待开发排查上传失败原因。"
+    call = provider.chat.call_args.kwargs
+    assert call["max_tokens"] == 256
+    assert call["session_id"] == "helpdesk-summary:t1"
+    assert call["tools"] == [] and call["thinking"] is False
+    payload = call["messages"][1]["content"]
+    assert "齐色单上传不了" in payload
+    assert "上传页面提示文件解析失败" in payload
+    assert "请描述遇到的问题" not in payload
+
+
+@pytest.mark.asyncio
 async def test_discovery_cursors_overlap_and_advance_independently(desk):
     service, api, clock = await desk()
     activated = clock()
@@ -1047,6 +1102,97 @@ async def test_empty_discovery_accepts_null_ticket_list(desk):
 
     assert service.store.meta("create_cursor") == clock()
     assert service.store.meta("update_cursor") == clock()
+
+
+@pytest.mark.asyncio
+async def test_discovery_returns_newly_registered_tickets(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock, "existing")
+    clock.advance(1)
+    api.tickets["new"] = {
+        "ticket_id": "new",
+        "helpdesk_id": "desk",
+        "status": 2,
+        "created_at": int(clock() * 1000),
+        "updated_at": int(clock() * 1000),
+        "guest": {"id": "ou_new"},
+        "agents": [{"id": "ou_agent"}],
+        "collaborators": [],
+    }
+
+    assert await service.sync.discover() == ["new"]
+    assert "existing" in service.store.tickets
+    assert "new" in service.store.tickets
+
+
+@pytest.mark.asyncio
+async def test_discovery_and_reconcile_include_changed_existing_tickets(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock, "existing", chat="")
+    clock.advance(1)
+    api.tickets["existing"].update(
+        chat_id="oc_real_group",
+        updated_at=int(clock() * 1000),
+    )
+
+    await service.reconcile(max_existing=0)
+
+    assert api.ticket.await_args_list[0].args[0] == "existing"
+    assert service.store.tickets["existing"]["chat_id"] == "oc_real_group"
+    assert await service.sync.discover() == []
+
+    clock.advance(1)
+    api.tickets["existing"].update(status=51, updated_at=int(clock() * 1000))
+    assert await service.sync.discover() == ["existing"]
+
+
+@pytest.mark.asyncio
+async def test_failed_sync_is_requeued_with_bounded_backoff(desk):
+    service, api, clock = await desk()
+    add_ticket(service, api, clock)
+    service.sync.ticket = AsyncMock(side_effect=[RuntimeError("temporary"), None])
+
+    await service.reconcile(discover=False, ids=["t1"], max_existing=0)
+
+    assert service._sync_failures["t1"] == 1
+    assert service._sync_retry_at["t1"] == clock() + 10
+    assert "t1" in service._dirty
+
+    await service.reconcile(discover=False, ids=["t1"], max_existing=0)
+    assert service.sync.ticket.await_count == 1
+
+    clock.advance(10)
+    await service.reconcile(discover=False, ids=["t1"], max_existing=0)
+    assert service.sync.ticket.await_count == 2
+    assert "t1" not in service._sync_retry_at
+    assert "t1" not in service._sync_failures
+
+
+@pytest.mark.asyncio
+async def test_reconcile_prioritizes_new_tickets_and_sweeps_a_bounded_batch(desk):
+    service, api, clock = await desk()
+    for index in range(5):
+        add_ticket(service, api, clock, f"t{index}", chat=f"oc_t{index}")
+    clock.advance(1)
+    api.tickets["new"] = {
+        "ticket_id": "new",
+        "helpdesk_id": "desk",
+        "status": 2,
+        "created_at": int(clock() * 1000),
+        "updated_at": int(clock() * 1000),
+        "guest": {"id": "ou_new"},
+        "agents": [{"id": "ou_agent"}],
+        "collaborators": [],
+    }
+
+    await service.reconcile(max_existing=2)
+    first_calls = [call.args[0] for call in api.ticket.await_args_list]
+    assert first_calls == ["new", "t0", "t1"]
+
+    api.ticket.reset_mock()
+    await service.reconcile(max_existing=2)
+    second_calls = [call.args[0] for call in api.ticket.await_args_list]
+    assert second_calls == ["t2", "t3"]
 
 
 @pytest.mark.asyncio
@@ -1732,7 +1878,7 @@ async def test_judge_accepts_json_inside_model_prose_and_fences():
                             "scenario": "awaiting_details",
                             "evidence_ids": ["om_1"],
                             "reason": "客户只选择了分类",
-                            "followup": "请补充具体问题。",
+                            "followup": "你好，请补充具体问题。",
                         },
                         ensure_ascii=False,
                     )
@@ -1755,7 +1901,7 @@ async def test_judge_accepts_json_inside_model_prose_and_fences():
         ],
     )
     assert result.scenario == "awaiting_details"
-    assert result.followup == "请补充具体问题。"
+    assert result.followup == "您好，请补充具体问题。"
 
 
 @pytest.mark.asyncio

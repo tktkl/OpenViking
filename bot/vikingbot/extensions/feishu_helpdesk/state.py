@@ -145,6 +145,8 @@ class HelpdeskState:
                 "escalation_started_at": None,
                 "escalation_last_sent": None,
                 "escalation_count": 0,
+                "escalation_summary": "",
+                "escalation_summary_generation": -1,
             }
         # Trusted chat identity is independent of the event's state version.
         # A scan can learn newer status before an older event supplies the group.
@@ -205,6 +207,8 @@ class HelpdeskState:
                 escalation_started_at=None,
                 escalation_last_sent=None,
                 escalation_count=0,
+                escalation_summary="",
+                escalation_summary_generation=-1,
             )
         old_group_state = (
             old.get("actual_agent_group"),
