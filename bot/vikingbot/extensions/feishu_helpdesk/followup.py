@@ -31,11 +31,13 @@ from vikingbot.extensions.feishu_helpdesk.escalation import (
 )
 from vikingbot.extensions.feishu_helpdesk.state import HelpdeskState, timestamp
 from vikingbot.extensions.feishu_helpdesk.sync import HelpdeskSync
+from vikingbot.extensions.feishu_helpdesk.worktime import is_business_time
 
 CLOSED = {50, 51, 52}
 DISCOVERY_INTERVAL_SECONDS = 10
 SWEEP_INTERVAL_SECONDS = 60
 SWEEP_BATCH_SIZE = 10
+OFF_HOURS_CLOSE_REASON = "非工作时间升级提醒后暂时关闭，请工作时间重新开启工单"
 
 
 class StaleAction(Exception):
@@ -476,6 +478,14 @@ class HelpdeskFollowup:
         escalation = self.config.helpdesk.escalation
         return escalation.enabled and bool(escalation.groups)
 
+    def _off_hours_close_required(self):
+        escalation = self.config.helpdesk.escalation
+        return escalation.off_hours_close_enabled and not is_business_time(
+            self.clock(),
+            start=escalation.work_start,
+            end=escalation.work_end,
+        )
+
     def _escalation_target(self, system):
         normalized = normalize_system(system)
         for configured, chat_id in self.config.helpdesk.escalation.groups.items():
@@ -531,6 +541,8 @@ class HelpdeskFollowup:
             return True
         if item["paused"] or self.clock() < item["retry_at"]:
             return False
+        if item.get("off_hours_close_pending"):
+            return True
         if item["welcome_at"] is None or item["close_pending"] is not None:
             return True
         if item["evaluated_generation"] != item["generation"] or item["scenario"] == "resolved":
@@ -744,6 +756,9 @@ class HelpdeskFollowup:
             # must not immediately close it again before any new human input.
             self.store.save(item, retry_at=self.clock() + 60)
             return
+        if item.get("off_hours_close_pending"):
+            await self._close_off_hours(item, generation)
+            return
         if item["scenario"] != "resolved" and self._escalation_due(item):
             sent = await self._maybe_escalate(item, generation)
             if sent:
@@ -881,6 +896,7 @@ class HelpdeskFollowup:
                     escalation_summary=summary,
                     escalation_summary_generation=current["generation"],
                 )
+        off_hours_close = self._off_hours_close_required()
         sequence = int(item.get("escalation_count") or 0) + 1
         kind = f"escalation:{sequence}"
         text = render_escalation(
@@ -890,17 +906,35 @@ class HelpdeskFollowup:
             self.config.helpdesk.escalation.interval_minutes,
             guest=item.get("guest"),
             summary=summary,
+            off_hours_close=off_hours_close,
         )
         receipt = await self._send(item, kind, text, chat_id=target)
         current = self.store.tickets[item["id"]]
-        self._record_escalation(current, kind, receipt["sent_at"])
+        current = self._record_escalation(current, kind, receipt["sent_at"])
         logger.warning(
             "Helpdesk escalated: ticket={}, system={}, sequence={}",
             item["id"],
             system,
             sequence,
         )
+        if off_hours_close:
+            await self._close_off_hours(current, generation)
         return True
+
+    async def _close_off_hours(self, item, generation):
+        current = self.store.save(item, off_hours_close_pending=True)
+        try:
+            await self._close(
+                current,
+                solved=1,
+                reason=OFF_HOURS_CLOSE_REASON,
+                allow_unresolved=True,
+                notice="off_hours",
+            )
+        except StaleAction:
+            raise
+        except Exception as error:
+            self._defer_close(item["id"], generation, error)
 
     async def _send(self, item, kind, text, *, chat_id=None):
         escalation = kind.startswith("escalation:")
@@ -1042,11 +1076,11 @@ class HelpdeskFollowup:
             self._sending.pop(item["id"], None)
             self.delivery.wakeup.set()
 
-    async def _close(self, item, *, solved, reason):
+    async def _close(self, item, *, solved, reason, allow_unresolved=False, notice=""):
         ticket_id, generation = item["id"], item["generation"]
 
         def check_timeout(current):
-            if solved == 1 and (
+            if solved == 1 and not allow_unresolved and (
                 current["count"] != 1
                 or current["scenario"] not in BUSINESS_WAIT
                 or current["last_send"] is None
@@ -1061,7 +1095,7 @@ class HelpdeskFollowup:
             return
         check_timeout(current)
         body = {"status": 51, "solved": solved, "comment": reason}
-        pending = {"body": body, "generation": generation}
+        pending = {"body": body, "generation": generation, "notice": notice}
         prepared = False
 
         async def before(_actor):
@@ -1102,6 +1136,8 @@ class HelpdeskFollowup:
             current,
             close_pending=None,
             closed_solved=solved,
+            closed_notice=notice,
+            off_hours_close_pending=False,
             notice_pending=True,
             retry_at=0,
         )
@@ -1150,13 +1186,18 @@ class HelpdeskFollowup:
             close_pending=None,
             notice_pending=owned,
             closed_solved=pending["body"]["solved"],
+            closed_notice=pending.get("notice", ""),
+            off_hours_close_pending=False,
         )
 
     async def _notice(self, item):
         messages = self.config.helpdesk.messages
-        text = (
-            messages.closed_resolved if item.get("closed_solved") == 2 else messages.closed_timeout
-        )
+        if item.get("closed_notice") == "off_hours":
+            text = messages.closed_off_hours
+        elif item.get("closed_solved") == 2:
+            text = messages.closed_resolved
+        else:
+            text = messages.closed_timeout
         cycle = item.get("close_cycle", 0)
         key = f"{item['id']}:notice:{cycle}" if cycle else f"{item['id']}:notice"
         try:

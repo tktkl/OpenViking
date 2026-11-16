@@ -1,5 +1,6 @@
 """Opt-in configuration, independent of the upstream channel schema."""
 
+from datetime import time
 from string import Formatter
 from typing import Literal
 
@@ -29,8 +30,20 @@ class HelpdeskMessagesConfig(BaseModel):
     closed_timeout: str = Field(
         default="因催办后仍未收到业务补充或确认，工单已关闭。", min_length=1, max_length=1000
     )
+    closed_off_hours: str = Field(
+        default=(
+            "您好，当前客服繁忙或不在线。为避免工单长时间滞留，本工单将暂时关闭；"
+            "请您在工作时间（工作日 09:00–18:30，法定节假日除外）重新开启工单，"
+            "我们会及时接续跟进。若情况紧急，请联系对应系统负责人电话加急处理。"
+            "感谢您的理解与配合。"
+        ),
+        min_length=1,
+        max_length=1000,
+    )
 
-    @field_validator("prefix", "welcome", "closed_resolved", "closed_timeout")
+    @field_validator(
+        "prefix", "welcome", "closed_resolved", "closed_timeout", "closed_off_hours"
+    )
     @classmethod
     def nonblank(cls, value):
         if not value.strip():
@@ -110,8 +123,17 @@ class FeishuHelpdeskEscalationConfig(BaseModel):
     enabled: bool = True
     interval_minutes: int = Field(default=45, gt=0, strict=True)
     sender: Literal["bot", "lark_cli"] = "bot"
+    off_hours_close_enabled: bool = True
+    work_start: time = time(9, 0)
+    work_end: time = time(18, 30)
     groups: dict[str, str] = Field(default_factory=dict)
     followup_skill_groups: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_work_hours(self):
+        if self.work_start >= self.work_end:
+            raise ValueError("work_start must be earlier than work_end")
+        return self
 
     @field_validator("groups")
     @classmethod

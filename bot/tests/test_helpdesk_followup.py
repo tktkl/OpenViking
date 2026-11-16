@@ -1868,6 +1868,50 @@ async def test_judge_accepts_json_inside_model_prose_and_fences():
 
 
 @pytest.mark.asyncio
+async def test_judge_accepts_effective_agent_recommendation_as_resolved():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "resolved",
+                        "evidence_ids": ["om_solution"],
+                        "reason": "处理方给出了可执行建议，业务方已读且没有追问或异议",
+                        "followup": "",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_agent"}]},
+        [
+            {
+                "im_id": "om_problem",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "款式设计页面被锁定，无法补充信息。",
+                "time": 1,
+            },
+            {
+                "im_id": "om_solution",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "请使用历史数据处理工具补充信息，操作入口见截图。",
+                "time": 2,
+            },
+        ],
+    )
+
+    assert result.scenario == "resolved"
+    system_prompt = provider.chat.await_args.kwargs["messages"][0]["content"]
+    assert "具体可执行且有效的处理建议" in system_prompt
+    assert "没有后续追问或异议时应按已解决判断" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_judge_coalesces_ticket_and_im_echo_before_evidence_validation():
     provider = SimpleNamespace(
         chat=AsyncMock(

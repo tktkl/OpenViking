@@ -1,11 +1,13 @@
 """Escalation routing, timing, and self-healing behavior."""
 
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
-from test_helpdesk_followup import add_ticket, drain, human, initialized
+from test_helpdesk_followup import Clock, add_ticket, drain, human, initialized
 from test_helpdesk_followup import desk as desk
 from vikingbot.config.schema import FeishuChannelConfig
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIError
@@ -17,6 +19,7 @@ from vikingbot.extensions.feishu_helpdesk.escalation import (
     render_escalation,
     ticket_subject,
 )
+from vikingbot.extensions.feishu_helpdesk.worktime import is_business_time
 
 TMS_GROUP = "oc_9d44f08fa000144519d54ed5565730f1"
 COMMON_GROUP = "oc_c3deaf22ddfa568d745fd4d881e2ddde"
@@ -50,6 +53,9 @@ def test_escalation_defaults_and_group_keys_are_normalized():
     config = FeishuChannelConfig().helpdesk
     assert config.followup_interval_minutes == 5
     assert config.escalation.interval_minutes == 45
+    assert config.escalation.off_hours_close_enabled is True
+    assert config.escalation.work_start.isoformat() == "09:00:00"
+    assert config.escalation.work_end.isoformat() == "18:30:00"
     assert config.escalation.groups == {}
 
     configured = FeishuChannelConfig(
@@ -61,6 +67,40 @@ def test_escalation_defaults_and_group_keys_are_normalized():
         }
     ).helpdesk.escalation
     assert configured.groups == {"PDM": COMMON_GROUP, "TMS": TMS_GROUP}
+
+
+def test_escalation_rejects_reversed_work_hours():
+    with pytest.raises(ValidationError):
+        FeishuChannelConfig(
+            helpdesk={
+                "escalation": {
+                    "work_start": "18:30",
+                    "work_end": "09:00",
+                }
+            }
+        )
+
+
+def china_timestamp(year, month, day, hour, minute=0):
+    return datetime(
+        year, month, day, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")
+    ).timestamp()
+
+
+@pytest.mark.parametrize(
+    "timestamp,expected",
+    [
+        (china_timestamp(2026, 11, 16, 8, 59), False),
+        (china_timestamp(2026, 11, 16, 9, 0), True),
+        (china_timestamp(2026, 11, 16, 18, 29), True),
+        (china_timestamp(2026, 11, 16, 18, 30), False),
+        (china_timestamp(2026, 11, 14, 12, 0), False),
+        (china_timestamp(2026, 10, 1, 10, 0), False),
+        (china_timestamp(2026, 10, 10, 10, 0), True),
+    ],
+)
+def test_business_time_uses_china_workdays_and_holidays(timestamp, expected):
+    assert is_business_time(timestamp) is expected
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "10", None])
@@ -155,6 +195,21 @@ def test_escalation_text_uses_customer_name_and_clickable_ticket_group():
     )
     assert "原工单群：oc_d61a2638665e64f5a98e2fb5c401746d" not in text
     assert ticket_subject({}, "TMS") == "客户 的 TMS 工单"
+
+
+def test_off_hours_escalation_text_only_reminds_once():
+    text = render_escalation(
+        "7704211350305655987",
+        "TMS",
+        "oc_d61a2638665e64f5a98e2fb5c401746d",
+        45,
+        guest={"name": "Darry"},
+        summary="物流单号未回传。",
+        off_hours_close=True,
+    )
+    assert "本群仅提醒本次" in text
+    assert "工单将暂时关闭" in text
+    assert "每 45 分钟提醒一次" not in text
 
 
 @pytest.mark.asyncio
@@ -296,6 +351,55 @@ async def test_business_wait_reminder_names_business_as_the_required_responder(d
 
     assert "业务方的补充或确认" in api.cli.sends[-1][1]
     assert "产品/研发/测试" not in api.cli.sends[-1][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off_hours_timestamp",
+    [
+        china_timestamp(2026, 11, 16, 19, 0),
+        china_timestamp(2026, 11, 14, 12, 0),
+        china_timestamp(2026, 10, 1, 10, 0),
+    ],
+)
+async def test_off_hours_escalation_reminds_once_then_closes(desk, off_hours_timestamp):
+    clock = Clock()
+    clock.now = off_hours_timestamp
+    service, api, clock = await initialized(
+        desk, minutes=5, clock=clock, escalation=ESCALATION
+    )
+    item = service.store.tickets["t1"]
+    service.store.save(
+        item,
+        escalation_system="PDM",
+        escalation_chat_id=COMMON_GROUP,
+        count=1,
+        last_send=clock() - 300,
+        scenario="awaiting_handler",
+        evaluated_generation=item["generation"],
+    )
+
+    await drain(service)
+
+    escalation_sends = [send for send in api.cli.sends if send[0] == COMMON_GROUP]
+    assert len(escalation_sends) == 1
+    assert "本群仅提醒本次" in escalation_sends[0][1]
+    assert "每 45 分钟提醒一次" not in escalation_sends[0][1]
+    notice_sends = [
+        send for send in api.cli.sends if send[0] == "oc_ticket" and "客服繁忙或不在线" in send[1]
+    ]
+    assert len(notice_sends) == 1
+    assert api.cli.closes[-1][1]["solved"] == 1
+    item = service.store.tickets["t1"]
+    assert item["status"] == 51
+    assert item["closed_notice"] == "off_hours"
+    assert not item["off_hours_close_pending"]
+
+    sends_after_close = len(api.cli.sends)
+    clock.advance(2700)
+    await drain(service)
+    assert len(api.cli.sends) == sends_after_close
+    assert len(api.cli.closes) == 1
 
 
 @pytest.mark.asyncio

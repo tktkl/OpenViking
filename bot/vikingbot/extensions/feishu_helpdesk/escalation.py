@@ -123,18 +123,25 @@ def render_escalation(
     interval_minutes: int,
     guest: object = None,
     summary: str = "",
+    off_hours_close: bool = False,
 ) -> str:
     subject = ticket_subject(guest, system)
     link = ticket_group_link(chat_id)
     summary = " ".join(str(summary or "").split())
     summary_line = f"问题概要：{summary}\n" if summary else ""
+    if off_hours_close:
+        ending = (
+            "请相关同学在下一个工作时间跟进。当前为非工作时间，本群仅提醒本次；"
+            "工单将暂时关闭，业务方可在工作时间重新开启。"
+        )
+    else:
+        ending = f"请相关同学尽快处理。问题彻底解决前，本群每 {interval_minutes} 分钟提醒一次。"
     return (
         "【升级提醒】\n"
         f"{subject}（{ticket_id}）经首次催办后仍未解决，现已升级。\n"
         f"{summary_line}"
         f"原工单群：{link}\n"
-        "请相关同学尽快处理。问题彻底解决前，"
-        f"本群每 {interval_minutes} 分钟提醒一次。"
+        f"{ending}"
     )
 
 

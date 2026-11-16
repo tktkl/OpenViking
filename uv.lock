@@ -658,6 +658,15 @@ wheels = [
 ]
 
 [[package]]
+name = "chinese-calendar"
+version = "1.12.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/7b/f5f66c5d2d01610fc23a4619923d59d94523ef5c70b67c1aadb9234de05a/chinese_calendar-1.12.1.tar.gz", hash = "sha256:9355e6398cd360100fab75262971dd28e1ca61cac994ccb3768cfb84b77466fe", size = 18123, upload-time = "2026-11-05T10:32:32.973Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/c7/152a1cc368ff364cdf7917198bd78dcd56267a5b1dc2cf44d2dbd752e971/chinese_calendar-1.12.1-py3-none-any.whl", hash = "sha256:201168423c879a9584b5cd13054f039a2ff34dad9cf5f822dd1133379983a79e", size = 12412, upload-time = "2026-11-05T10:32:30.604Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.1.8"
 source = { registry = "https://pypi.org/simple" }
@@ -3523,6 +3532,7 @@ dependencies = [
     { name = "async-timeout" },
     { name = "cairosvg" },
     { name = "charset-normalizer" },
+    { name = "chinese-calendar" },
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "fastapi" },
@@ -3727,6 +3737,7 @@ requires-dist = [
     { name = "build", marker = "extra == 'build'" },
     { name = "cairosvg", specifier = ">=2.9.1" },
     { name = "charset-normalizer", specifier = ">=3.4,<4" },
+    { name = "chinese-calendar", specifier = ">=1.12.1,<2" },
     { name = "cmake", marker = "extra == 'build'", specifier = ">=3.15" },
     { name = "croniter", marker = "extra == 'bot'", specifier = ">=2.0.0" },
     { name = "cryptography", specifier = ">=48.0.1" },

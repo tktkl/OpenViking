@@ -32,7 +32,8 @@
             "second_reminder_suffix": "如仍未收到{audience}，{minutes}分钟后将自动关闭本工单。",
             "escalation_reminder_suffix": "如仍未收到{audience}，{minutes}分钟后将升级处理。",
             "closed_resolved": "问题已解决，工单已关闭。",
-            "closed_timeout": "因催办后仍未收到业务补充或确认，工单已关闭。"
+            "closed_timeout": "因催办后仍未收到业务补充或确认，工单已关闭。",
+            "closed_off_hours": "您好，当前客服繁忙或不在线。为避免工单长时间滞留，本工单将暂时关闭；请您在工作时间（工作日 09:00–18:30，法定节假日除外）重新开启工单，我们会及时接续跟进。若情况紧急，请联系对应系统负责人电话加急处理。感谢您的理解与配合。"
           },
           "reply": {
             "mode": "feishu_web",
@@ -56,6 +57,9 @@
             "enabled": true,
             "interval_minutes": 45,
             "sender": "bot",
+            "off_hours_close_enabled": true,
+            "work_start": "09:00",
+            "work_end": "18:30",
             "groups": {
               "TMS": "oc_tms_escalation_group",
               "SCM": "oc_business_escalation_group",
