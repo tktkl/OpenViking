@@ -18,6 +18,8 @@ from vikingbot.extensions.feishu_helpdesk.decision import (
     BUSINESS_WAIT,
     ConversationJudge,
     JudgeParseError,
+    coalesce_echoed_messages,
+    message_role,
     message_text,
     open_id,
 )
@@ -37,7 +39,9 @@ CLOSED = {50, 51, 52}
 DISCOVERY_INTERVAL_SECONDS = 10
 SWEEP_INTERVAL_SECONDS = 60
 SWEEP_BATCH_SIZE = 10
+DECISION_SCAN_INTERVAL_SECONDS = 60
 OFF_HOURS_CLOSE_REASON = "非工作时间升级提醒后暂时关闭，请工作时间重新开启工单"
+RESOLUTION_SILENCE_SECONDS = 4 * 60
 
 
 class StaleAction(Exception):
@@ -83,6 +87,7 @@ class HelpdeskFollowup:
         self._queued, self._synced, self._dirty = {}, set(), set()
         self._sync_retry_at, self._sync_failures = {}, {}
         self._sweep_offset = 0
+        self._next_decision_scan = self.clock()
         self._wakeup, self._sync_wakeup, self._idle = (
             asyncio.Event(),
             asyncio.Event(),
@@ -506,8 +511,58 @@ class HelpdeskFollowup:
     def _escalated(self, item):
         return item.get("escalation_started_at") is not None
 
+    def _resolution_candidate_active(self, item):
+        return bool(
+            item.get("resolution_candidate_message_id")
+            and item.get("resolution_deadline") is not None
+        )
+
+    def _resolution_candidate_current(self, item, messages):
+        candidate_id = str(item.get("resolution_candidate_message_id") or "")
+        candidate_at = item.get("resolution_candidate_at")
+        humans = [m for m in coalesce_echoed_messages(messages) if m.get("human") is True]
+        latest = humans[-1] if humans else {}
+        latest_id = latest.get("im_id") or latest.get("ticket_id")
+        return bool(
+            candidate_id
+            and candidate_at is not None
+            and candidate_id == latest_id
+            and message_role(item, latest) == "agent"
+            and candidate_at >= (item.get("last_guest_message_at") or 0)
+        )
+
+    def _record_resolution_candidate(self, item, decision, messages):
+        candidate_id = decision.candidate_message_id
+        humans = [m for m in coalesce_echoed_messages(messages) if m.get("human") is True]
+        latest = humans[-1] if humans else {}
+        latest_id = latest.get("im_id") or latest.get("ticket_id")
+        candidate_at = float(latest.get("time") or 0)
+        if (
+            not decision.resolution_candidate
+            or not candidate_id
+            or candidate_id != latest_id
+            or message_role(item, latest) != "agent"
+            or candidate_at < (item.get("last_guest_message_at") or 0)
+        ):
+            return None
+        scenario = "awaiting_confirmation" if decision.scenario == "resolved" else decision.scenario
+        return self.store.save(
+            item,
+            scenario=scenario,
+            evaluated_generation=item["generation"],
+            resolution_candidate_at=candidate_at,
+            resolution_candidate_message_id=candidate_id,
+            resolution_candidate_evidence_ids=list(decision.evidence_ids),
+            resolution_candidate_reason=decision.reason,
+            resolution_deadline=candidate_at + RESOLUTION_SILENCE_SECONDS,
+            resolution_reviewed_generation=-1,
+            retry_at=0,
+        )
+
     def _escalation_due(self, item):
         if not self._escalation_configured() or item["status"] in CLOSED:
+            return False
+        if self._resolution_candidate_active(item):
             return False
         if item["evaluated_generation"] != item["generation"]:
             return False
@@ -524,6 +579,8 @@ class HelpdeskFollowup:
 
     def _escalation_wait(self, item):
         if item["status"] in CLOSED or not self._escalation_configured():
+            return None
+        if self._resolution_candidate_active(item):
             return None
         if item["evaluated_generation"] != item["generation"]:
             return 0.1
@@ -545,6 +602,8 @@ class HelpdeskFollowup:
             return True
         if item["welcome_at"] is None or item["close_pending"] is not None:
             return True
+        if self._resolution_candidate_active(item):
+            return self.clock() >= item["resolution_deadline"]
         if item["evaluated_generation"] != item["generation"] or item["scenario"] == "resolved":
             return True
         escalation_wait = self._escalation_wait(item)
@@ -555,7 +614,50 @@ class HelpdeskFollowup:
             item["count"] < 1 or item["scenario"] in BUSINESS_WAIT
         )
 
-    async def tick(self):
+    def _urgent_due(self, item):
+        """Return whether an item has a durable action deadline, not just new chat."""
+        if item["status"] in CLOSED:
+            return item["notice_pending"] or item["close_pending"] is not None
+        if item.get("scope_exit_pending"):
+            return True
+        if item["paused"] or self.clock() < item["retry_at"]:
+            return False
+        if item.get("off_hours_close_pending"):
+            return True
+        if item["welcome_at"] is None or item["close_pending"] is not None:
+            return True
+        if self._resolution_candidate_active(item):
+            return self.clock() >= item["resolution_deadline"]
+        if item["evaluated_generation"] != item["generation"]:
+            return False
+        if item["scenario"] == "resolved":
+            return True
+        # Reminders and escalation notifications follow the periodic decision
+        # scan, so event/short-retry wakeups cannot emit them ahead of that scan.
+        return False
+
+    def _urgent_wait(self, item):
+        """Nearest non-chat deadline for one ticket, excluding the periodic scan."""
+        if self._urgent_due(item):
+            return 0.1
+        if item["status"] in CLOSED or item["paused"]:
+            return None
+        if item["retry_at"] > self.clock():
+            return item["retry_at"] - self.clock()
+        if self._resolution_candidate_active(item):
+            return max(0.1, item["resolution_deadline"] - self.clock())
+        if item["evaluated_generation"] != item["generation"]:
+            return None
+        return None
+
+    def _urgent_tick_due(self):
+        return any(
+            self._urgent_due(item)
+            for item in self.store.tickets.values()
+            if item["id"] in self._synced and item["chat_id"] and item["id"] not in self._queued
+        )
+
+    async def tick(self, *, scan=True):
         for item in list(self.store.tickets.values()):
             if (
                 not self.running
@@ -563,6 +665,7 @@ class HelpdeskFollowup:
                 or not item["chat_id"]
                 or item["id"] in self._queued
                 or not self._due(item)
+                or (not scan and not self._urgent_due(item))
             ):
                 continue
             await self._enqueue(item)
@@ -570,15 +673,20 @@ class HelpdeskFollowup:
     async def _timer(self):
         while self.running:
             self._wakeup.clear()
-            await self.tick()
+            scan = self.clock() >= self._next_decision_scan
+            urgent = self._urgent_tick_due()
+            if scan or urgent:
+                await self.tick(scan=scan)
+            if scan:
+                self._next_decision_scan = self.clock() + DECISION_SCAN_INTERVAL_SECONDS
             try:
                 await asyncio.wait_for(self._wakeup.wait(), self._next_wait())
             except asyncio.TimeoutError:
                 pass
 
     def _next_wait(self):
-        """Wake at the nearest durable deadline, and recalibrate wall time every 10s."""
-        delays = [10.0]
+        """Wake at the next scan or the nearest durable non-chat deadline."""
+        delays = [max(0.1, self._next_decision_scan - self.clock())]
         for item in self.store.tickets.values():
             if (
                 item["paused"]
@@ -587,18 +695,9 @@ class HelpdeskFollowup:
                 or item["id"] in self._queued
             ):
                 continue
-            if item["retry_at"] > self.clock():
-                delays.append(item["retry_at"] - self.clock())
-            elif self._due(item):
-                delays.append(0.1)
-            elif item["status"] not in CLOSED:
-                escalation_wait = self._escalation_wait(item)
-                if escalation_wait is not None:
-                    delays.append(escalation_wait)
-                elif item["count"] < 1 or item["scenario"] in BUSINESS_WAIT:
-                    base = item["last_send"] or item["last_human"] or item["welcome_at"]
-                    if base is not None:
-                        delays.append(max(0.1, base + self.interval - self.clock()))
+            urgent_wait = self._urgent_wait(item)
+            if urgent_wait is not None:
+                delays.append(urgent_wait)
         return max(0.1, min(delays))
 
     async def _enqueue(self, item):
@@ -760,6 +859,81 @@ class HelpdeskFollowup:
         if item.get("off_hours_close_pending"):
             await self._close_off_hours(item, generation)
             return
+        messages = self.store.messages(ticket_id)
+        if self._resolution_candidate_active(item) and not self._resolution_candidate_current(
+            item, messages
+        ):
+            # A newer human message should have invalidated this through observe().
+            # Keep a defensive reset for restored or externally edited state.
+            item = self.store.save(
+                item,
+                scenario="unknown",
+                evaluated_generation=-1,
+                resolution_candidate_at=None,
+                resolution_candidate_message_id="",
+                resolution_candidate_evidence_ids=[],
+                resolution_candidate_reason="",
+                resolution_deadline=None,
+                resolution_reviewed_generation=-1,
+                retry_at=0,
+            )
+        if (
+            item["scenario"] == "resolved"
+            and item.get("resolution_reviewed_generation") == generation
+        ):
+            try:
+                await self._close(
+                    item,
+                    solved=2,
+                    reason=item.get("resolution_candidate_reason") or "静默窗口复核确认问题已解决",
+                )
+            except StaleAction:
+                raise
+            except Exception as error:
+                self._defer_close(ticket_id, generation, error)
+            return
+        if self._resolution_candidate_active(item):
+            if self.clock() < item["resolution_deadline"]:
+                return
+            review = await self.judge.review_resolution(item, messages)
+            item = self._check(ticket_id, generation)
+            if review.scenario == "resolved":
+                item = self.store.save(
+                    item,
+                    scenario="resolved",
+                    evaluated_generation=generation,
+                    resolution_candidate_at=None,
+                    resolution_candidate_message_id="",
+                    resolution_candidate_evidence_ids=[],
+                    resolution_candidate_reason=review.reason,
+                    resolution_deadline=None,
+                    resolution_reviewed_generation=generation,
+                    retry_at=0,
+                )
+                try:
+                    await self._close(
+                        item,
+                        solved=2,
+                        reason=review.reason or "静默窗口复核确认问题已解决",
+                    )
+                except StaleAction:
+                    raise
+                except Exception as error:
+                    self._defer_close(ticket_id, generation, error)
+                return
+            item = self.store.save(
+                item,
+                scenario=review.scenario,
+                evaluated_generation=generation,
+                resolution_candidate_at=None,
+                resolution_candidate_message_id="",
+                resolution_candidate_evidence_ids=[],
+                resolution_candidate_reason="",
+                resolution_deadline=None,
+                resolution_reviewed_generation=-1,
+                retry_at=0,
+            )
+            return
         if item["scenario"] != "resolved" and self._escalation_due(item):
             sent = await self._maybe_escalate(item, generation)
             if sent:
@@ -778,7 +952,7 @@ class HelpdeskFollowup:
             # Repeat escalation notifications use their own clock. Resolved
             # tickets continue so a failed close can be retried.
             return
-        decision = await self.judge.judge(item, self.store.messages(ticket_id))
+        decision = await self.judge.judge(item, messages)
         item = self._check(ticket_id, generation)
         item = self.store.save(
             item,
@@ -786,6 +960,9 @@ class HelpdeskFollowup:
             evaluated_generation=generation,
             retry_at=self.clock() + 30 if decision.scenario == "unknown" else 0,
         )
+        candidate = self._record_resolution_candidate(item, decision, messages)
+        if candidate is not None:
+            return
         if decision.scenario == "unknown":
             self.store.save(item, evaluated_generation=-1)
             return

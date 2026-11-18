@@ -965,6 +965,61 @@ def test_ticket_generation_ignores_volatile_profile_fields(tmp_path):
         state.close()
 
 
+def test_state_tracks_guest_and_handler_message_times_and_clears_candidate(tmp_path):
+    clock = Clock()
+    state = HelpdeskState(tmp_path / "state.sqlite3", clock())
+    try:
+        ticket = {
+            "ticket_id": "t1",
+            "created_at": int(clock() * 1000),
+            "status": 2,
+            "guest": {"id": "ou_guest"},
+            "agents": [{"id": "ou_agent"}],
+        }
+        state.register(ticket, clock())
+        state.observe(
+            "t1",
+            {
+                "im_id": "om_question",
+                "sender": "ou_guest",
+                "human": True,
+                "time": clock(),
+                "text": "问题",
+                "kind": "text",
+            },
+        )
+        item = state.tickets["t1"]
+        assert item["last_guest_message_id"] == "om_question"
+        assert item["last_guest_message_at"] == clock()
+        assert item["last_handler_message_at"] is None
+
+        clock.advance(10)
+        item = state.save(
+            item,
+            resolution_candidate_message_id="om_answer",
+            resolution_candidate_at=clock(),
+            resolution_deadline=clock() + 240,
+        )
+        state.observe(
+            "t1",
+            {
+                "im_id": "om_answer",
+                "sender": "ou_agent",
+                "human": True,
+                "time": clock(),
+                "text": "处理结果",
+                "kind": "text",
+            },
+        )
+        item = state.tickets["t1"]
+        assert item["last_handler_message_id"] == "om_answer"
+        assert item["last_handler_message_at"] == clock()
+        assert item["resolution_candidate_message_id"] == ""
+        assert item["resolution_deadline"] is None
+    finally:
+        state.close()
+
+
 @pytest.mark.asyncio
 async def test_judge_has_independent_budget_and_requires_latest_evidence():
     provider = SimpleNamespace(
@@ -1640,9 +1695,53 @@ async def test_unknown_model_result_and_failure_keep_ticket_open(desk):
 async def test_nearest_deadline_uses_wall_time(desk):
     service, api, clock = await initialized(desk)
     clock.advance(297)
-    assert service._next_wait() == 3
-    clock.advance(-100)
+    service._next_decision_scan = clock() + 10
     assert service._next_wait() == 10
+    clock.advance(-100)
+    service._next_decision_scan = clock() + 60
+    assert service._next_wait() == 60
+
+
+@pytest.mark.asyncio
+async def test_new_message_waits_for_decision_scan(desk):
+    service, api, clock = await initialized(desk)
+    calls = service.judge.judge.await_count
+    human(service, clock)
+    service._next_decision_scan = clock() + 60
+
+    await service.tick(scan=False)
+    assert service.bus.inbound.empty()
+    assert service._next_wait() == 60
+    clock.advance(59)
+    await service.tick(scan=False)
+    assert service.bus.inbound.empty()
+
+    clock.advance(1)
+    service._next_decision_scan = clock()
+    await service.tick(scan=True)
+    assert not service.bus.inbound.empty()
+    await drain(service)
+    assert service.judge.judge.await_count == calls + 1
+
+
+@pytest.mark.asyncio
+async def test_reminder_waits_for_decision_scan(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("awaiting_handler", "请处理方继续跟进。")
+    human(service, clock)
+    await drain(service)
+
+    clock.advance(300)
+    service._next_decision_scan = clock() + 60
+    await service.tick(scan=False)
+    assert service.bus.inbound.empty()
+    assert len(api.cli.sends) == 1
+
+    service._next_decision_scan = clock()
+    await service.tick(scan=True)
+    assert not service.bus.inbound.empty()
+    await drain(service)
+    assert len(api.cli.sends) == 2
 
 
 @pytest.mark.asyncio
@@ -1868,16 +1967,18 @@ async def test_judge_accepts_json_inside_model_prose_and_fences():
 
 
 @pytest.mark.asyncio
-async def test_judge_accepts_effective_agent_recommendation_as_resolved():
+async def test_judge_marks_effective_agent_recommendation_as_resolution_candidate():
     provider = SimpleNamespace(
         chat=AsyncMock(
             return_value=LLMResponse(
                 content=json.dumps(
                     {
-                        "scenario": "resolved",
+                        "scenario": "awaiting_confirmation",
+                        "resolution_candidate": True,
+                        "candidate_message_id": "om_solution",
                         "evidence_ids": ["om_solution"],
-                        "reason": "处理方给出了可执行建议，业务方已读且没有追问或异议",
-                        "followup": "",
+                        "reason": "处理方给出了具体可执行建议，等待业务验证",
+                        "followup": "请验证上述操作是否已解决您的问题。",
                     },
                     ensure_ascii=False,
                 )
@@ -1905,10 +2006,330 @@ async def test_judge_accepts_effective_agent_recommendation_as_resolved():
         ],
     )
 
-    assert result.scenario == "resolved"
+    assert result.scenario == "awaiting_confirmation"
+    assert result.resolution_candidate is True
+    assert result.candidate_message_id == "om_solution"
     system_prompt = provider.chat.await_args.kwargs["messages"][0]["content"]
-    assert "具体可执行且有效的处理建议" in system_prompt
-    assert "没有后续追问或异议时应按已解决判断" in system_prompt
+    assert "给出具体、可执行的处理动作" in system_prompt
+    assert "不能只看最后一句" in system_prompt
+    assert "合并成答复段" in system_prompt
+    assert "不要求指出具体个人或完成时间" in system_prompt
+    assert "后续静默窗口复核" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_judge_canonicalizes_mistyped_candidate_message_id():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_confirmation",
+                        "resolution_candidate": True,
+                        "candidate_message_id": "om_solution_typo",
+                        "evidence_ids": ["om_problem", "om_solution_typo"],
+                        "reason": "处理方已给出明确结论",
+                        "followup": "请确认该结论是否解答了您的问题。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_agent"}]},
+        [
+            {"im_id": "om_problem", "human": True, "sender": "ou_guest", "text": "问题", "time": 1},
+            {
+                "im_id": "om_solution",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "明确结论",
+                "time": 2,
+            },
+        ],
+    )
+    assert result.resolution_candidate is True
+    assert result.candidate_message_id == "om_solution"
+    assert result.evidence_ids == ("om_problem", "om_solution")
+
+
+@pytest.mark.asyncio
+async def test_judge_supplies_default_followup_for_resolution_candidate():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "scenario": "awaiting_confirmation",
+                        "resolution_candidate": True,
+                        "candidate_message_id": "om_solution",
+                        "evidence_ids": ["om_solution"],
+                        "reason": "处理方给出了完整结论",
+                        "followup": "",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_agent"}]},
+        [
+            {"im_id": "om_problem", "human": True, "sender": "ou_guest", "text": "问题", "time": 1},
+            {
+                "im_id": "om_solution",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "完整结论",
+                "time": 2,
+            },
+        ],
+    )
+    assert result.resolution_candidate is True
+    assert result.followup
+
+
+@pytest.mark.asyncio
+async def test_judge_combines_short_handler_continuation_with_prior_answer():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            side_effect=[
+                LLMResponse(
+                    content=json.dumps(
+                        {
+                            "scenario": "awaiting_handler",
+                            "resolution_candidate": False,
+                            "candidate_message_id": "",
+                            "evidence_ids": ["om_who"],
+                            "reason": "最后一句是短答复",
+                            "followup": "请处理方继续确认。",
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+                LLMResponse(
+                    content=json.dumps(
+                        {
+                            "resolved": True,
+                            "evidence_ids": ["om_action", "om_who"],
+                            "followup": "",
+                            "reason": "责任角色和动作已由前后两条处理方消息共同说明",
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.judge(
+        {"id": "t1", "guest": {"id": "ou_guest"}, "agents": [{"id": "ou_agent"}]},
+        [
+            {
+                "im_id": "om_question",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "找谁确认是否录全？",
+                "time": 1,
+            },
+            {
+                "im_id": "om_action",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "找产品录下法语翻译就行",
+                "time": 2,
+            },
+            {
+                "im_id": "om_who",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "也是产品",
+                "time": 3,
+            },
+        ],
+    )
+    assert result.scenario == "awaiting_confirmation"
+    assert result.resolution_candidate is True
+    assert result.candidate_message_id == "om_who"
+    assert provider.chat.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_judge_reviews_candidate_after_quiet_window():
+    provider = SimpleNamespace(
+        chat=AsyncMock(
+            return_value=LLMResponse(
+                content=json.dumps(
+                    {
+                        "resolved": True,
+                        "evidence_ids": ["om_problem", "om_solution"],
+                        "followup": "",
+                        "reason": "处理方给出的原因和结论完整回答了原问题",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+    )
+    judge = ConversationJudge(provider, "model")
+    result = await judge.review_resolution(
+        {
+            "id": "t1",
+            "guest": {"id": "ou_guest"},
+            "agents": [{"id": "ou_agent"}],
+            "resolution_candidate_message_id": "om_solution",
+        },
+        [
+            {
+                "im_id": "om_problem",
+                "human": True,
+                "sender": "ou_guest",
+                "text": "为什么没有回补历史需求？",
+                "time": 1,
+            },
+            {
+                "im_id": "om_solution",
+                "human": True,
+                "sender": "ou_agent",
+                "text": "需求按当时配置生成，后续配置变更不会回补既有需求。",
+                "time": 2,
+            },
+        ],
+    )
+    assert result.scenario == "resolved"
+    prompt = provider.chat.await_args.kwargs["messages"][0]["content"]
+    assert "至少 4 分钟" in prompt
+    assert "候选答复段" in prompt
+    assert "不能只检查段末单句" in prompt
+    assert "不要求具体个人、完成时间" in prompt
+    assert "om_solution" in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_resolution_candidate_waits_four_minutes_then_reviews_and_closes(desk):
+    service, api, clock = await initialized(desk)
+    candidate_at = clock()
+    service.judge.judge.return_value = Decision(
+        "awaiting_confirmation",
+        "请业务验证。",
+        reason="处理方给出了明确的修复完成结论",
+        evidence_ids=("om_agent_fix",),
+        resolution_candidate=True,
+        candidate_message_id="om_agent_fix",
+    )
+    service.judge.review_resolution = AsyncMock(
+        return_value=Decision(
+            "resolved",
+            reason="复核确认修复已完成且原问题已解答",
+            evidence_ids=("om_agent_fix",),
+        )
+    )
+    service.observe(
+        "t1",
+        {
+            "im_id": "om_agent_fix",
+            "sender": "ou_agent",
+            "human": True,
+            "time": candidate_at,
+            "text": "问题已修复，请验证。",
+            "kind": "text",
+        },
+    )
+    await drain(service)
+
+    item = service.store.tickets["t1"]
+    assert item["resolution_candidate_message_id"] == "om_agent_fix"
+    assert item["resolution_deadline"] == candidate_at + 240
+    assert item["resolution_reviewed_generation"] == -1
+    assert not api.cli.closes
+
+    clock.advance(239)
+    await drain(service)
+    service.judge.review_resolution.assert_not_awaited()
+    assert not api.cli.closes
+
+    clock.advance(1)
+    service._next_decision_scan = clock() + 60
+    await service.tick(scan=False)
+    assert not service.bus.inbound.empty()
+    await drain(service)
+    service.judge.review_resolution.assert_awaited_once()
+    assert api.cli.closes[0][1]["solved"] == 2
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_cancels_resolution_candidate_without_review(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision(
+        "awaiting_confirmation",
+        "请业务验证。",
+        evidence_ids=("om_agent_fix",),
+        resolution_candidate=True,
+        candidate_message_id="om_agent_fix",
+    )
+    human(service, clock, "om_agent_fix", sender="ou_agent", text="已经修复")
+    await drain(service)
+    assert service.store.tickets["t1"]["resolution_candidate_message_id"] == "om_agent_fix"
+
+    clock.advance(60)
+    human(service, clock, "om_guest_reply", text="还有一个异常")
+    await drain(service)
+    item = service.store.tickets["t1"]
+    assert item["resolution_candidate_message_id"] == ""
+    assert item["last_guest_message_id"] == "om_guest_reply"
+
+    clock.advance(240)
+    await drain(service)
+    if hasattr(service.judge, "review_resolution") and isinstance(
+        service.judge.review_resolution, AsyncMock
+    ):
+        service.judge.review_resolution.assert_not_awaited()
+    assert not api.cli.closes
+
+
+@pytest.mark.asyncio
+async def test_failed_resolution_review_clears_candidate_and_does_not_close(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision(
+        "awaiting_confirmation",
+        "请业务验证。",
+        evidence_ids=("om_agent_fix",),
+        resolution_candidate=True,
+        candidate_message_id="om_agent_fix",
+    )
+    service.judge.review_resolution = AsyncMock(
+        return_value=Decision(
+            "awaiting_handler",
+            "请处理方继续跟进。",
+            reason="只是可能原因，尚未完成处理",
+            evidence_ids=("om_agent_fix",),
+        )
+    )
+    human(service, clock, "om_agent_fix", sender="ou_agent", text="可能是配置问题")
+    await drain(service)
+    clock.advance(240)
+    await drain(service)
+
+    item = service.store.tickets["t1"]
+    assert item["resolution_candidate_message_id"] == ""
+    assert item["resolution_reviewed_generation"] == -1
+    assert not api.cli.closes
+
+
+@pytest.mark.asyncio
+async def test_vague_handler_message_does_not_start_resolution_window(desk):
+    service, api, clock = await initialized(desk)
+    service.judge.judge.return_value = Decision("awaiting_handler", "请处理方继续排查。")
+    human(service, clock, "om_agent_vague", sender="ou_agent", text="再查一下")
+    await drain(service)
+
+    item = service.store.tickets["t1"]
+    assert item["resolution_candidate_message_id"] == ""
+    assert item["resolution_deadline"] is None
+    assert not api.cli.closes
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,8 @@ import sqlite3
 import uuid
 from pathlib import Path
 
+from vikingbot.extensions.feishu_helpdesk.decision import message_role
+
 
 def _identity_signature(ticket):
     """Stable ticket participants; Feishu profile/CDN fields are volatile."""
@@ -123,10 +125,20 @@ class HelpdeskState:
                 "generation": 0,
                 "count": 0,
                 "last_human": None,
+                "last_guest_message_at": None,
+                "last_guest_message_id": "",
+                "last_handler_message_at": None,
+                "last_handler_message_id": "",
                 "last_send": None,
                 "welcome_at": None,
                 "scenario": "unknown",
                 "evaluated_generation": -1,
+                "resolution_candidate_at": None,
+                "resolution_candidate_message_id": "",
+                "resolution_candidate_evidence_ids": [],
+                "resolution_candidate_reason": "",
+                "resolution_deadline": None,
+                "resolution_reviewed_generation": -1,
                 "retry_at": 0,
                 "message_cursor": created,
                 "updated": -1,
@@ -196,6 +208,12 @@ class HelpdeskState:
                 count=0,
                 last_send=None,
                 scenario="unknown",
+                resolution_candidate_at=None,
+                resolution_candidate_message_id="",
+                resolution_candidate_evidence_ids=[],
+                resolution_candidate_reason="",
+                resolution_deadline=None,
+                resolution_reviewed_generation=-1,
                 close_pending=None,
                 notice_pending=False,
                 off_hours_close_pending=False,
@@ -248,6 +266,14 @@ class HelpdeskState:
         if status != old["status"] or _identity_signature(candidate) != _identity_signature(old):
             values["generation"] = old["generation"] + 1
             values["evaluated_generation"] = -1
+            values.update(
+                resolution_candidate_at=None,
+                resolution_candidate_message_id="",
+                resolution_candidate_evidence_ids=[],
+                resolution_candidate_reason="",
+                resolution_deadline=None,
+                resolution_reviewed_generation=-1,
+            )
         return self.save(old, **values)
 
     def outbox(self, key):
@@ -352,6 +378,7 @@ class HelpdeskState:
         item = self.tickets[ticket_id]
         candidate = item
         if newly_human:
+            role = message_role(item, merged)
             candidate = {
                 **item,
                 "last_human": max(merged["time"], item["last_human"] or item["created"]),
@@ -359,8 +386,24 @@ class HelpdeskState:
                 "count": 0,
                 "last_send": None,
                 "scenario": "unknown",
+                "resolution_candidate_at": None,
+                "resolution_candidate_message_id": "",
+                "resolution_candidate_evidence_ids": [],
+                "resolution_candidate_reason": "",
+                "resolution_deadline": None,
+                "resolution_reviewed_generation": -1,
                 "retry_at": 0,
             }
+            if role == "guest" and merged["time"] >= (item.get("last_guest_message_at") or 0):
+                candidate["last_guest_message_at"] = merged["time"]
+                candidate["last_guest_message_id"] = merged.get("im_id") or merged.get(
+                    "ticket_id", ""
+                )
+            elif role == "agent" and merged["time"] >= (item.get("last_handler_message_at") or 0):
+                candidate["last_handler_message_at"] = merged["time"]
+                candidate["last_handler_message_id"] = merged.get("im_id") or merged.get(
+                    "ticket_id", ""
+                )
             if merged["time"] > item.get("reopen_human_after", 0):
                 candidate["reopen_waiting_for_human"] = False
         elif (
@@ -377,6 +420,12 @@ class HelpdeskState:
                 **item,
                 "generation": item["generation"] + 1,
                 "evaluated_generation": -1,
+                "resolution_candidate_at": None,
+                "resolution_candidate_message_id": "",
+                "resolution_candidate_evidence_ids": [],
+                "resolution_candidate_reason": "",
+                "resolution_deadline": None,
+                "resolution_reviewed_generation": -1,
                 "retry_at": 0,
             }
         with self.db:

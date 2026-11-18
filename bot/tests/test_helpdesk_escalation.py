@@ -340,6 +340,31 @@ async def test_one_five_minute_reminder_then_forty_five_minute_escalation(desk):
 
 
 @pytest.mark.asyncio
+async def test_escalation_send_waits_for_decision_scan(desk):
+    service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
+    service.judge.judge.return_value = Decision("awaiting_handler", "请研发继续排查。")
+    service.judge.summarize = AsyncMock(return_value="等待研发继续排查。")
+    human(service, clock, text="物流管理人工客服（TMS）")
+    await drain(service)
+
+    clock.advance(300)
+    await drain(service)
+    assert service.store.tickets["t1"]["count"] == 1
+    assert service.store.tickets["t1"]["escalation_count"] == 0
+
+    clock.advance(2700)
+    service._next_decision_scan = clock() + 60
+    await service.tick(scan=False)
+    assert service.bus.inbound.empty()
+    assert service.store.tickets["t1"]["escalation_count"] == 0
+
+    service._next_decision_scan = clock()
+    await service.tick(scan=True)
+    await drain(service)
+    assert service.store.tickets["t1"]["escalation_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_business_wait_reminder_names_business_as_the_required_responder(desk):
     service, api, clock = await initialized(desk, minutes=5, escalation=ESCALATION)
     service.judge.judge.return_value = Decision("awaiting_details", "您好，请补充问题。")
