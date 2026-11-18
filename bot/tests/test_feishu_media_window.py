@@ -9,14 +9,26 @@ SESSION_KEY = SessionKey(type="feishu", channel_id="cli_bot", chat_id="oc_chat")
 NOW = datetime(2026, 11, 5, 10, 0, 0)
 
 
-def inbound(*, message_id="om_current", sender="ou_user", reply_to=None, media=None, refs=None):
+def inbound(
+    *,
+    message_id="om_current",
+    sender="ou_user",
+    reply_to=None,
+    quoted_message_id=None,
+    media=None,
+    refs=None,
+):
     return InboundMessage(
         session_key=SESSION_KEY,
         sender_id=sender,
         content="@bot 看一下",
         media=media or [],
         media_refs=refs or [],
-        metadata={"message_id": message_id, "reply_to": reply_to},
+        metadata={
+            "message_id": message_id,
+            "reply_to": reply_to,
+            "quoted_message_id": quoted_message_id,
+        },
     )
 
 
@@ -110,6 +122,34 @@ def test_reply_parent_is_used_even_outside_normal_window():
         session,
         inbound(reply_to="om_parent"),
         FeishuMediaWindowConfig(max_images=4, max_age_minutes=10, max_messages=20),
+        now=NOW.timestamp(),
+    )
+
+    assert selected == ["/tmp/parent.png"]
+
+
+def test_quoted_message_id_is_used_when_reply_to_is_the_chat():
+    session = Session(SESSION_KEY)
+    add_media_message(
+        session,
+        message_id="om_parent",
+        sender="ou_user",
+        when=NOW - timedelta(hours=2),
+        refs=[ref("om_parent", "img_parent", "/tmp/parent.png")],
+    )
+    session.messages.extend(
+        {
+            "role": "assistant",
+            "content": f"message {index}",
+            "timestamp": (NOW - timedelta(minutes=30 - index)).isoformat(),
+        }
+        for index in range(25)
+    )
+
+    selected = select_recent_media(
+        session,
+        inbound(quoted_message_id="om_parent"),
+        FeishuMediaWindowConfig(max_images=10, max_age_minutes=10, max_messages=20),
         now=NOW.timestamp(),
     )
 

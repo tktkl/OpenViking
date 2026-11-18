@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -50,7 +51,9 @@ try:
         GetChatMembersRequest,
         GetChatRequest,
         GetImageRequest,
+        GetMessageRequest,
         GetMessageResourceRequest,
+        ListMessageRequest,
         P2ImMessageReceiveV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -62,8 +65,10 @@ except ImportError:
     lark = None
     Emoji = None
     GetImageRequest = None
+    GetMessageRequest = None
     GetUserRequest = None
     GetChatMembersRequest = None
+    ListMessageRequest = None
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -75,6 +80,11 @@ MSG_TYPE_MAP = {
 
 # Pre-compiled regex patterns
 OPEN_ID_MENTION_PATTERN = re.compile(r"@ou_[a-f0-9]+")
+
+# Simple quoted-context expansion: a quoted media burst is bounded to two
+# minutes around the parent and the nearest same-sender text as a caption.
+QUOTE_CONTEXT_WINDOW_SECONDS = 120
+QUOTE_CONTEXT_MAX_CHARS = 6000
 
 
 class FeishuChannel(BaseChannel):
@@ -773,26 +783,265 @@ class FeishuChannel(BaseChannel):
             logger.debug(f"Stack trace: {traceback.format_exc()}")
             return None
 
+    @staticmethod
+    def _message_type(message: Any) -> str:
+        return str(getattr(message, "msg_type", None) or getattr(message, "message_type", "") or "")
+
+    @staticmethod
+    def _message_content(message: Any) -> str:
+        body = getattr(message, "body", None)
+        value = getattr(body, "content", None) if body is not None else None
+        return str(value if value is not None else getattr(message, "content", "") or "")
+
+    @staticmethod
+    def _message_sender_id(message: Any) -> str:
+        sender = getattr(message, "sender", None)
+        sender_id = getattr(sender, "sender_id", None) if sender is not None else None
+        return str(getattr(sender_id, "open_id", "") or getattr(sender, "id", "") or "")
+
+    @staticmethod
+    def _message_time_ms(message: Any) -> int:
+        try:
+            timestamp = int(getattr(message, "create_time", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return timestamp * 1000 if 0 < timestamp < 10_000_000_000 else timestamp
+
+    async def _fetch_message(self, message_id: str) -> Any | None:
+        """Fetch one message by id for quoted-message expansion."""
+        if not self._client or GetMessageRequest is None:
+            return None
+        try:
+            request = (
+                GetMessageRequest.builder()
+                .message_id(message_id)
+                .user_id_type("open_id")
+                .with_sender_name(True)
+                .build()
+            )
+            response = await self._client.im.v1.message.aget(request)
+            if not response.success():
+                logger.warning(
+                    f"Failed to fetch quoted Feishu message: message_id={message_id}, "
+                    f"code={response.code}, msg={response.msg}"
+                )
+                return None
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            return items[0] if items else None
+        except Exception as error:
+            logger.warning(f"Failed to fetch quoted Feishu message {message_id}: {error}")
+            return None
+
+    async def _list_messages_near(self, chat_id: str, center_time_ms: int) -> list[Any]:
+        """List a bounded chat-message window around the quoted parent."""
+        if not self._client or ListMessageRequest is None or not chat_id or not center_time_ms:
+            return []
+        center = int(center_time_ms / 1000)
+        try:
+            request = (
+                ListMessageRequest.builder()
+                .container_id_type("chat")
+                .container_id(chat_id)
+                .start_time(str(max(0, center - QUOTE_CONTEXT_WINDOW_SECONDS)))
+                .end_time(str(center + QUOTE_CONTEXT_WINDOW_SECONDS))
+                .sort_type("ByCreateTimeAsc")
+                .page_size(50)
+                .with_sender_name(True)
+                .card_msg_content_type("raw_card_content")
+                .build()
+            )
+            response = await self._client.im.v1.message.alist(request)
+            if not response.success():
+                logger.warning(
+                    f"Failed to list messages near quoted Feishu message: chat_id={chat_id}, "
+                    f"code={response.code}, msg={response.msg}"
+                )
+                return []
+            return list(getattr(getattr(response, "data", None), "items", None) or [])
+        except Exception as error:
+            logger.warning(f"Failed to list messages near quoted Feishu message: {error}")
+            return []
+
+    async def _build_quoted_context(self, message: Any) -> dict[str, Any] | None:
+        """Add the quoted parent and, for media, its same-sender two-minute burst."""
+        parent_id = str(getattr(message, "parent_id", "") or "")
+        if not parent_id:
+            return None
+        parent = await self._fetch_message(parent_id)
+        if parent is None:
+            return None
+
+        parent_type = self._message_type(parent)
+        parent_sender_id = self._message_sender_id(parent)
+        parent_sender = getattr(parent, "sender", None)
+        sender_label = str(
+            getattr(parent_sender, "sender_name", "") or getattr(parent_sender, "name", "") or ""
+        )
+        chat_id = str(getattr(parent, "chat_id", "") or getattr(message, "chat_id", ""))
+        if not sender_label and parent_sender_id:
+            sender_label = (
+                await self._get_user_name(parent_sender_id, chat_id=chat_id) or parent_sender_id
+            )
+        parent_time = self._message_time_ms(parent)
+        max_images = max(1, int(getattr(self.config.media_window, "max_images", 10)))
+        parent_text, parent_media, _ = await self._parse_message_content(
+            parent,
+            parent_type,
+            parent_id,
+            raw_content=self._message_content(parent),
+            max_images=max_images,
+        )
+        parent_text = parent_text.strip()
+        if parent_text == "[image]":
+            parent_text = ""
+
+        media: list[tuple[int, int, str]] = [
+            (parent_time, index, path) for index, path in enumerate(parent_media)
+        ]
+        captions: list[str] = []
+        if parent_media:
+            nearby = await self._list_messages_near(chat_id, parent_time)
+            parent_root = str(getattr(parent, "root_id", "") or "")
+            parent_thread = str(getattr(parent, "thread_id", "") or "")
+
+            def same_sender(candidate: Any) -> bool:
+                if self._message_sender_id(candidate) != parent_sender_id:
+                    return False
+                candidate_root = str(getattr(candidate, "root_id", "") or "")
+                candidate_thread = str(getattr(candidate, "thread_id", "") or "")
+                return not (
+                    (parent_root and candidate_root and parent_root != candidate_root)
+                    or (parent_thread and candidate_thread and parent_thread != candidate_thread)
+                )
+
+            candidates = [
+                candidate
+                for candidate in nearby
+                if str(getattr(candidate, "message_id", "") or "") != parent_id
+                and same_sender(candidate)
+            ]
+            remaining = max(0, max_images - len(media))
+            image_candidates = sorted(
+                (
+                    candidate
+                    for candidate in candidates
+                    if self._message_type(candidate) in {"image", "post"}
+                ),
+                key=lambda item: (
+                    abs(self._message_time_ms(item) - parent_time),
+                    self._message_time_ms(item),
+                ),
+            )
+            for candidate in image_candidates:
+                if remaining <= 0:
+                    break
+                _, paths, _ = await self._parse_message_content(
+                    candidate,
+                    self._message_type(candidate),
+                    str(getattr(candidate, "message_id", "") or ""),
+                    raw_content=self._message_content(candidate),
+                    max_images=remaining,
+                )
+                candidate_time = self._message_time_ms(candidate)
+                media.extend((candidate_time, index, path) for index, path in enumerate(paths))
+                remaining -= len(paths)
+
+            text_candidates = [
+                candidate
+                for candidate in candidates
+                if self._message_type(candidate) in {"text", "post"}
+            ]
+            before = [
+                item
+                for item in text_candidates
+                if self._message_time_ms(item) <= parent_time
+            ]
+            after = [item for item in text_candidates if self._message_time_ms(item) > parent_time]
+            selected_text = []
+            if before:
+                selected_text.append(max(before, key=self._message_time_ms))
+            if after:
+                selected_text.append(min(after, key=self._message_time_ms))
+            for candidate in selected_text:
+                text, _, _ = await self._parse_message_content(
+                    candidate,
+                    self._message_type(candidate),
+                    str(getattr(candidate, "message_id", "") or ""),
+                    raw_content=self._message_content(candidate),
+                    max_images=0,
+                )
+                text = text.strip()
+                if text and text not in {"[image]", "[file]", "[audio]", "[sticker]"}:
+                    captions.append(text)
+
+        media.sort(key=lambda item: (item[0], item[1]))
+        media_paths = [path for _, _, path in media[:max_images]]
+        formatted_time = (
+            datetime.fromtimestamp(parent_time / 1000).strftime("%Y-%m-%d %H:%M")
+            if parent_time
+            else "unknown time"
+        )
+        parts = [
+            f"[Quoted message from {sender_label or parent_sender_id or 'unknown'} "
+            f"at {formatted_time}]"
+        ]
+        if parent_text:
+            parts.append(parent_text)
+        if media_paths:
+            parts.append(
+                f"[Related images from the same sender: {len(media_paths)} "
+                "attached in chronological order]"
+            )
+        if captions:
+            parts.append("[Nearby same-sender text]")
+            parts.extend(f"- {text}" for text in captions)
+        if not parent_text and not media_paths and len(parts) == 1:
+            parts.append("[Quoted message content unavailable]")
+        parts.append("[End quoted message]")
+        context_text = "\n".join(parts)
+        if len(context_text) > QUOTE_CONTEXT_MAX_CHARS:
+            context_text = (
+                context_text[:QUOTE_CONTEXT_MAX_CHARS]
+                + "\n...[quoted context truncated]"
+            )
+        return {
+            "text": context_text,
+            "media": media_paths,
+            "parent_id": parent_id,
+            "image_count": len(media_paths),
+        }
+
     async def _parse_message_content(
-        self, message: Any, msg_type: str, message_id: str
+        self,
+        message: Any,
+        msg_type: str,
+        message_id: str,
+        *,
+        raw_content: str | None = None,
+        max_images: int | None = None,
     ) -> tuple[str, list[str], list[dict[str, Any]]]:
         """Parse message content and extract media files with stable source references."""
         content = ""
         media = []
         media_refs: list[dict[str, Any]] = []
+        raw_content = (
+            str(raw_content)
+            if raw_content is not None
+            else str(getattr(message, "content", "") or "")
+        )
 
         if msg_type == "text":
             try:
-                content = json.loads(message.content).get("text", "")
-            except json.JSONDecodeError:
-                content = message.content or ""
+                content = json.loads(raw_content).get("text", "")
+            except (json.JSONDecodeError, AttributeError):
+                content = raw_content
         elif msg_type in ("image", "post"):
             content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
             text_content = ""
             image_keys = []
 
             try:
-                msg_content = json.loads(message.content)
+                msg_content = json.loads(raw_content)
 
                 if msg_type == "image":
                     image_key = msg_content.get("image_key")
@@ -816,6 +1065,9 @@ class FeishuChannel(BaseChannel):
                     text_content = " ".join(text_parts).strip()
                     if text_content:
                         content = text_content
+
+                if max_images is not None:
+                    image_keys = image_keys[: max(0, int(max_images))]
 
                 # Download images in parallel
                 if image_keys:
@@ -842,7 +1094,7 @@ class FeishuChannel(BaseChannel):
             except Exception as e:
                 logger.warning(f"Failed to process {msg_type} message: {e}")
         elif msg_type == "interactive":
-            content = message.content
+            content = raw_content
         else:
             content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
@@ -1096,6 +1348,15 @@ class FeishuChannel(BaseChannel):
                         content = content.replace(f"@{user_id}", f"@{name}")
                 content = re.sub(r"\s{2,}", " ", content).strip()
 
+            quoted_context = None
+            if should_process and getattr(message, "parent_id", None):
+                quoted_context = await self._build_quoted_context(message)
+                if quoted_context:
+                    content = f"{content}\n\n{quoted_context['text']}"
+                    # Keep the direct message's own media ahead of quoted media
+                    # when the global ten-image turn budget is applied later.
+                    media = [*media, *(quoted_context.get("media") or [])]
+
             # 9. 构建会话ID（处理话题群）
             reply_to = chat_id if chat_type == "group" else sender_id
             final_chat_id = chat_id
@@ -1135,6 +1396,11 @@ class FeishuChannel(BaseChannel):
                     "chat_mode": chat_mode,
                     "topic_title": topic_title if isinstance(topic_title, str) else "",
                     "sender_id": sender_id,
+                    "parent_id": getattr(message, "parent_id", "") or "",
+                    "quoted_message_id": getattr(message, "parent_id", "") or "",
+                    "quoted_image_count": (
+                        int(quoted_context.get("image_count", 0)) if quoted_context else 0
+                    ),
                     "media_refs": media_refs,
                 },
             )

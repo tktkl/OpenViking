@@ -124,7 +124,7 @@ class FeishuMediaWindowConfig(BaseModel):
     """Bounded recent-media context for Feishu group conversations."""
 
     enabled: bool = True
-    max_images: int = Field(default=4, ge=1)
+    max_images: int = Field(default=10, ge=1)
     max_age_minutes: int = Field(default=10, ge=1)
     max_messages: int = Field(default=20, ge=1)
     same_sender_only: bool = True

@@ -80,7 +80,12 @@ def select_recent_media(
     cutoff = now - config.max_age_minutes * 60
     metadata = message.metadata if isinstance(message.metadata, dict) else {}
     current_id = str(metadata.get("message_id") or "")
-    reply_to = str(metadata.get("reply_to") or "")
+    reply_to = str(
+        metadata.get("quoted_message_id")
+        or metadata.get("parent_id")
+        or metadata.get("reply_to")
+        or ""
+    )
     selected: list[str] = []
     seen: set[str] = set()
 
