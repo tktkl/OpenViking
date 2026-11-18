@@ -115,12 +115,13 @@
 - `escalation.sender` 默认 `bot`，升级群通过官方 IM API 以应用 Bot 身份发送；`lark_cli` 使用 CLI 用户身份。两条升级发送路径都不会使用 Web Messenger。
 - 启用升级后，工单群首次提醒后再静默 5 分钟即升级，原工单群停止提醒；升级群每 45 分钟重复，直到已解决关单或远端关闭。只有未配置升级路由时才保留旧版业务等待超时关单。
 - `followup_skill_groups` 把当前工单技能组映射到一个或多个系统，再复用 `escalation.groups` 解析升级群。只有当前技能组命中该映射才继续欢迎、提醒和判断；未命中时暂停自动跟进并尝试一次 Bot 退群，失败只记录不重试。技能组从范围外切回范围内时自动恢复入群和跟进。转接消息本身不会停止跟进，“原客服已退出会话”也不作为退出条件。
+- 非工作时间触发升级时，升级群只提醒一次；随后必须先向工单群发送暂时关闭说明，再关闭工单。关单后 Bot/用户会退出群聊，不能再补发说明。
 - `cli.executable` 默认官方 `lark-cli`，支持可执行文件的绝对路径；使用 argv 调用，不经过 shell。无需 CLI 补丁或 Go 工具。
 - `cli.profile` 默认空字符串，使用 CLI 当前默认配置。建议指定专用的 `support` profile；该 profile 仍需配置与飞书渠道一致的 App ID 和品牌。
 - `cli.auth_mcp_server` 默认 `wangoon-auth-mcp`，从 bot 的 `tools.mcp_servers` 中查找认证服务。`cli.provider` 默认 `lark-cli`，`cli.environment` 默认 `prod`，`cli.auth_profile` 默认 `default`。
 - 扩展不再执行 `lark-cli auth status`、本地 OAuth 登录或后台保活。每次用户操作先向 auth-mcp 领取 `lark-cli` token，并通过 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_USER_ACCESS_TOKEN` 注入 CLI；token 在内存中缓存 `cli.token_cache_seconds` 秒。
 - auth-mcp 自身优先使用 `lark-cli` refresh token；refresh 失败后才复用唯一扫码源 `lark-qr`。用户只需要在 `lark-qr` 源会话失效时扫一张码，其他 provider 自动授权。
-- 关单通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行；最终 `before_call` 业务检查在 PUT 前完成。不再启动 `close_helper`，也不读取 lark-cli 本地加密凭据、Keychain 或 refresh token。
+- 关单使用 auth-mcp 用户 token 直接 PUT `/open-apis/helpdesk/v1/tickets/<id>`，并同时携带 `Authorization` 与 `X-Lark-Helpdesk-Authorization`；最终 `before_call` 业务检查在 PUT 前完成。通用 `lark-cli api` 不能附加 Helpdesk 专用头，不用于关单。
 - 授权的客服用户必须已在目标工单群内，且群设置允许其添加机器人。服务台 Token 和机器人自己的 `tenant_access_token` 不能替代这项用户授权。
 - 用户 OAuth 继续使用冻结权限。完整跟进/关单至少需要 `helpdesk:all`、`im:message`、消息读取、`im:chat.members:write_only` 和邀请 Bot 所需权限；Web Messenger 发送只需要 `lark-qr` Cookie，不使用 lark-cli token。
 - 扩展不再读取早期版本的 `user_access_token`、`user_refresh_token`、`oauth_token_url` 或 `oauth.json`；这些配置已无运行作用。

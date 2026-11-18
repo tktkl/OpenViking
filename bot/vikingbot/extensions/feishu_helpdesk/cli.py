@@ -67,10 +67,11 @@ class LarkCLIAdapter:
         self.settings = settings
         self.app_id = app_id
         self.bot_config = bot_config
+        self.domain = domain.rstrip("/")
         self.brand = {
             "https://open.feishu.cn": "feishu",
             "https://open.larksuite.com": "lark",
-        }.get(domain.rstrip("/"))
+        }.get(self.domain)
         self._lock = asyncio.Lock()
         self._http_client = None
         self._auth_cache = None
@@ -387,14 +388,64 @@ class LarkCLIAdapter:
             raise LarkCLIError(
                 "Python close requires an official Feishu/Lark domain", rejected=True
             )
-        return await self._operate(
-            "api",
-            "PUT",
-            f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}",
-            "--data",
-            json.dumps(body, ensure_ascii=False),
-            before_call=before_call,
-        )
+        path = f"/open-apis/helpdesk/v1/tickets/{quote(ticket_id, safe='')}"
+        url = self.domain + path
+        async with self._lock:
+            for attempt in range(2):
+                auth = await self._authorization(force=attempt > 0)
+                expires_at = auth.get("expires_at")
+                if isinstance(expires_at, (int, float)) and expires_at <= time.time() + 5:
+                    auth = await self._authorization(force=True)
+                timeout = None
+                if before_call is not None:
+                    timeout = await before_call(auth["openId"])
+                try:
+                    request = self._client().put(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {auth['access_token']}",
+                            "X-Lark-Helpdesk-Authorization": authorization,
+                            "Content-Type": "application/json",
+                        },
+                        json=body,
+                    )
+                    response = await asyncio.wait_for(request, timeout)
+                except (asyncio.TimeoutError, httpx.TimeoutException):
+                    raise LarkCLIError("ticket update timed out", retryable=True) from None
+                except httpx.HTTPError as error:
+                    raise LarkCLIError("ticket update request failed", retryable=True) from error
+                try:
+                    result = response.json()
+                except ValueError:
+                    raise LarkCLIError("ticket update returned invalid JSON", retryable=True) from None
+                code = result.get("code") if isinstance(result, dict) else None
+                if response.status_code == 401 or code == 20037:
+                    if attempt == 0:
+                        self._auth_cache = None
+                        continue
+                    raise LarkCLIError(
+                        "ticket update authentication failed",
+                        code=code,
+                        authentication=True,
+                    )
+                if response.status_code >= 400 or code != 0:
+                    retryable = response.status_code == 429 or response.status_code >= 500
+                    rejected = response.status_code in (400, 403, 404, 409, 422) or code in (
+                        230001,
+                        230020,
+                        230027,
+                        230035,
+                        232009,
+                    )
+                    raise LarkCLIError(
+                        "ticket update failed",
+                        code=code,
+                        retryable=retryable,
+                        rejected=rejected,
+                    )
+                if not isinstance(result, dict):
+                    raise LarkCLIError("ticket update returned invalid response", retryable=True)
+                return result
 
     async def close(self):
         if self._http_client is not None:

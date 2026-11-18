@@ -69,7 +69,7 @@ LARKSUITE_CLI_USER_ACCESS_TOKEN=<auth-mcp 返回的用户 token>
 1. `auth_access_get(provider="lark-qr", environment="prod")`：唯一扫码入口。二维码必须是真实 `qrlogin.token`，`token:null` 占位码不会投递。
 2. `auth_access_get(provider="lark-cli", environment="prod")`：使用 `lark-qr` 自动授权，得到独立 lark-cli token。
 3. VikingBot 工单消息读取、回执对账、Bot 入群和关单前检查都使用该 token；token 刷新由 auth-mcp 负责。
-4. 关单直接通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行，最终的 `before_call` 业务检查仍在一次 PUT 前完成，不读取本地加密凭据。
+4. 关单使用 auth-mcp 用户 token 直接 PUT `/open-apis/helpdesk/v1/tickets/<id>`，同时携带 `Authorization` 与 `X-Lark-Helpdesk-Authorization`；最终的 `before_call` 业务检查仍在一次 PUT 前完成，不读取本地加密凭据。
 
 因此部署只需要：
 

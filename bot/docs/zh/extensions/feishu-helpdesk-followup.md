@@ -93,7 +93,7 @@ flowchart TD
 
 `escalation.groups` 是系统到升级群的配置映射。系统名来自工单首条业务选择，缺失时使用工单技能组字段兜底。TMS、SCM、SRM、QMS、PDM、PLM 当前分别路由到配置中的 TMS 群或业务系统公共群；新增系统只需增加映射，不改代码。升级通知默认以应用 Bot 身份通过官方 IM API 发送，不依赖 Web Cookie 或 feed_id 解析；可通过 `escalation.sender` 切换为 `lark_cli`。通知包含客户名、工单号、系统、模型生成的“问题概要”及原工单群可点击链接。问题概要只提炼业务现象、当前阻塞和待处理动作，不直接复制聊天记录；同一轮重复提醒复用摘要，业务产生新消息后才重新生成。首次发送后每 `escalation.interval_minutes` 分钟重复，直到工单解决或关闭。升级后原工单群继续同步和判断，但不再发送提醒。`escalation.enabled=false` 或 `groups` 为空时保留旧的无升级路由行为。
 
-`work_start`、`work_end` 默认分别为 `09:00`、`18:30`，按中国时区和官方工作日/法定节假日判断。仅当升级提醒实际触发时处于非工作时间（工作日工作时间之外、周末或法定节假日），升级群只发送一次提醒，随后向原工单群发送 `closed_off_hours` 说明并暂时关闭工单；业务可在下一个工作时间重新开启。`off_hours_close_enabled=false` 可关闭该行为。
+`work_start`、`work_end` 默认分别为 `09:00`、`18:30`，按中国时区和官方工作日/法定节假日判断。仅当升级提醒实际触发时处于非工作时间（工作日工作时间之外、周末或法定节假日），升级群只发送一次提醒；随后先向原工单群发送 `closed_off_hours` 说明，成功后再暂时关闭工单。必须先发说明再关单，因为服务台关闭工单后 Bot/用户会退出群聊，无法再补发。业务可在下一个工作时间重新开启。`off_hours_close_enabled=false` 可关闭该行为。
 
 法定节假日数据由 `chinese-calendar` 提供，当前已覆盖到 2027 年；每年国务院公布下一年度放假安排后应同步升级该依赖，以保证后续年度判断准确。
 
@@ -106,9 +106,9 @@ flowchart TD
 
 `reply.mode="lark_cli"` 仍是兼容默认值，适合普通群或支持用户 API 发送的环境。`feishu_web` 使用 `auth_mcp_server`、`provider`、`environment`、`profile` 从 wangoon-auth-mcp 获取 ready 会话，`actor_open_id` 必须是目标工单的处理人。`feed_ids` 可手工配置映射；`auto_resolve_feed_id=true` 时，缓存未命中会通过无头 Chromium、CDP 和 Web Messenger 页面解析群名得到内部 feed id，并写入派生缓存。浏览器页面在后台常驻，只有消息列表预热调用成功后才冻结；解析失败会丢弃并重建浏览器，避免复用半初始化页面。部署需要 Chromium/Playwright 可执行文件、`websocket-client`、可读取的 auth-mcp 配置和租户 Web Messenger 地址。
 
-官方 `lark-cli` 继续负责工单消息读取、回执对账、Bot 入群和关单前检查，但用户授权改由 auth-mcp 管理。VikingBot 从 `provider=lark-cli` 领取 token，并以 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_USER_ACCESS_TOKEN` 注入 CLI；不再执行本地 `auth status` 或后台保活。
+官方 `lark-cli` 继续负责工单消息读取、回执对账和 Bot 入群，但用户授权改由 auth-mcp 管理。VikingBot 从 `provider=lark-cli` 领取 token，并以 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_USER_ACCESS_TOKEN` 注入 CLI；不再执行本地 `auth status` 或后台保活。
 
-auth-mcp 的唯一扫码源是 prod 的 `lark-qr`。`lark-cli` 优先使用自己的 refresh token；refresh 失败后才会复用源会话自动授权。关单直接通过 `lark-cli api PUT /open-apis/helpdesk/v1/tickets/<id>` 执行，最终 `before_call` 业务检查在 PUT 前完成；不再启动 `close_helper`，不读取本地加密凭据或 Keychain。
+auth-mcp 的唯一扫码源是 prod 的 `lark-qr`。`lark-cli` 优先使用自己的 refresh token；refresh 失败后才会复用源会话自动授权。关单使用 auth-mcp 的用户 token 直接调用 Helpdesk `PUT /open-apis/helpdesk/v1/tickets/<id>`，同时携带 `Authorization` 和 Helpdesk 专用的 `X-Lark-Helpdesk-Authorization`；最终 `before_call` 业务检查在 PUT 前完成。通用 `lark-cli api` 无法附加 Helpdesk 专用头，因此不用于关单。
 
 应用需保留 `helpdesk:all:readonly` 读取/订阅权限。当前用户需要有目标工单访问权限，以及 `helpdesk:all`、`im:message`、`im:chat.members:write_only`、所需消息读取权限。权限清单在 auth-mcp `lark-cli` 的冻结 scope 中维护，VikingBot 不单独发起 OAuth 授权。用户读取群消息还受 `im:message.group_msg:get_as_user` 和群成员关系约束。
 

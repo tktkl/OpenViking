@@ -379,6 +379,19 @@ async def test_off_hours_escalation_reminds_once_then_closes(desk, off_hours_tim
         evaluated_generation=item["generation"],
     )
 
+    close = api.cli.close_ticket
+    notice_seen_before_close = False
+
+    async def guarded_close(*args, **kwargs):
+        nonlocal notice_seen_before_close
+        notice_seen_before_close = any(
+            send[0] == "oc_ticket" and "客服繁忙或不在线" in send[1]
+            for send in api.cli.sends
+        )
+        return await close(*args, **kwargs)
+
+    api.cli.close_ticket = guarded_close
+
     await drain(service)
 
     escalation_sends = [send for send in api.cli.sends if send[0] == COMMON_GROUP]
@@ -389,11 +402,13 @@ async def test_off_hours_escalation_reminds_once_then_closes(desk, off_hours_tim
         send for send in api.cli.sends if send[0] == "oc_ticket" and "客服繁忙或不在线" in send[1]
     ]
     assert len(notice_sends) == 1
+    assert notice_seen_before_close
     assert api.cli.closes[-1][1]["solved"] == 1
     item = service.store.tickets["t1"]
     assert item["status"] == 51
     assert item["closed_notice"] == "off_hours"
     assert not item["off_hours_close_pending"]
+    assert service.store.outbox("t1:off_hours_notice:0")["message_id"]
 
     sends_after_close = len(api.cli.sends)
     clock.advance(2700)

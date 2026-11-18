@@ -684,12 +684,13 @@ class HelpdeskFollowup:
             return
         delay = 5 if getattr(error, "rejected", False) else 10
         self.store.save(current, retry_at=self.clock() + delay)
+        detail = str(error) if isinstance(error, LarkCLIError) else type(error).__name__
         logger.warning(
             "Helpdesk close deferred; reminder/state machine remains independent: "
             "ticket={}, retry_seconds={}, error={}",
             ticket_id,
             delay,
-            type(error).__name__,
+            detail,
         )
 
     async def _execute(self, ticket_id, generation):
@@ -924,12 +925,20 @@ class HelpdeskFollowup:
     async def _close_off_hours(self, item, generation):
         current = self.store.save(item, off_hours_close_pending=True)
         try:
+            cycle = current.get("close_cycle", 0)
+            await self._send(
+                current,
+                f"off_hours_notice:{cycle}",
+                self.config.helpdesk.messages.closed_off_hours,
+            )
+            current = self.store.tickets[item["id"]]
             await self._close(
                 current,
                 solved=1,
                 reason=OFF_HOURS_CLOSE_REASON,
                 allow_unresolved=True,
                 notice="off_hours",
+                post_close_notice=False,
             )
         except StaleAction:
             raise
@@ -1076,7 +1085,16 @@ class HelpdeskFollowup:
             self._sending.pop(item["id"], None)
             self.delivery.wakeup.set()
 
-    async def _close(self, item, *, solved, reason, allow_unresolved=False, notice=""):
+    async def _close(
+        self,
+        item,
+        *,
+        solved,
+        reason,
+        allow_unresolved=False,
+        notice="",
+        post_close_notice=True,
+    ):
         ticket_id, generation = item["id"], item["generation"]
 
         def check_timeout(current):
@@ -1095,7 +1113,12 @@ class HelpdeskFollowup:
             return
         check_timeout(current)
         body = {"status": 51, "solved": solved, "comment": reason}
-        pending = {"body": body, "generation": generation, "notice": notice}
+        pending = {
+            "body": body,
+            "generation": generation,
+            "notice": notice,
+            "post_close_notice": post_close_notice,
+        }
         prepared = False
 
         async def before(_actor):
@@ -1138,10 +1161,11 @@ class HelpdeskFollowup:
             closed_solved=solved,
             closed_notice=notice,
             off_hours_close_pending=False,
-            notice_pending=True,
+            notice_pending=post_close_notice,
             retry_at=0,
         )
-        await self._notice(current)
+        if post_close_notice:
+            await self._notice(current)
 
     def _confirm_close_state(self, item, remote):
         current = self.store.tickets[item["id"]]
@@ -1184,7 +1208,7 @@ class HelpdeskFollowup:
         self.store.save(
             current,
             close_pending=None,
-            notice_pending=owned,
+            notice_pending=owned and pending.get("post_close_notice", True),
             closed_solved=pending["body"]["solved"],
             closed_notice=pending.get("notice", ""),
             off_hours_close_pending=False,

@@ -25,7 +25,7 @@
 
 ## Python 关单与 CLI 兼容边界
 
-关单现在直接通过官方 `lark-cli api PUT` 执行，`helpdesk.cli.executable` 仍使用官方 `lark-cli`。用户 token 由 auth-mcp 的 `lark-cli` provider 注入；不再启动 Python 关单子进程，不读取本地加密凭据、Keychain 或 refresh token。原有 SQLite 无须迁移。
+关单使用 auth-mcp 的 `lark-cli` 用户 token 直接发送 Helpdesk PUT 请求，并同时携带 `Authorization` 与 `X-Lark-Helpdesk-Authorization`。通用 `lark-cli api` 无法添加 Helpdesk 专用头，因此仅用于普通 CLI 操作。不再启动 Python 关单子进程，不读取本地加密凭据、Keychain 或 refresh token。原有 SQLite 无须迁移。
 
 上游合并须保留准备和提交之间的最终检查：`ready` 之后由 Bot 读取最新状态和消息，在当前轮次、关闭轮次、同群忙碌检查通过后持久化待确认操作，再立即 `commit`。刷新锁内不能调用 CLI；最新消息检查使用应用接口并跳过 CLI 来源核实。超时从共享 CLI 锁等待开始计算，取消回收脚本整个进程组。CLI 继续独占 OAuth 刷新和凭据写入；仅 Python 子进程只读解密 access token，不导出、不另存、不自建续期链路。
 

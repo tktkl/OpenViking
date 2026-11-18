@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import httpx
 from loguru import logger
 
 from vikingbot.extensions.feishu_helpdesk.cli import LarkCLIAdapter, LarkCLIError
@@ -65,17 +66,25 @@ async def test_followup_send_preserves_raw_timestamp_and_user_idempotency(cli, c
 
 
 @pytest.mark.asyncio
-async def test_close_uses_auth_mcp_token_and_one_put(cli):
+async def test_close_uses_auth_mcp_token_and_helpdesk_header(cli):
+    cli._http_client = AsyncMock()
+    cli._http_client.put.return_value = httpx.Response(200, json={"code": 0, "data": {}})
     before = AsyncMock(return_value=10)
     result = await cli.close_ticket(
         "t1", "private-desk-header", {"status": 51, "solved": 1}, before_call=before
     )
-    assert result == {}
+    assert result == {"code": 0, "data": {}}
     before.assert_awaited_once_with("ou_agent")
-    args = cli._command.call_args.args
-    assert args[:3] == ("api", "PUT", "/open-apis/helpdesk/v1/tickets/t1")
-    assert json.loads(args[args.index("--data") + 1]) == {"status": 51, "solved": 1}
-    assert cli._command.await_count == 1
+    assert cli._http_client.put.await_count == 1
+    call = cli._http_client.put.await_args
+    assert call.args == ("https://open.feishu.cn/open-apis/helpdesk/v1/tickets/t1",)
+    assert call.kwargs["headers"] == {
+        "Authorization": "Bearer user-token",
+        "X-Lark-Helpdesk-Authorization": "private-desk-header",
+        "Content-Type": "application/json",
+    }
+    assert call.kwargs["json"] == {"status": 51, "solved": 1}
+    assert cli._command.await_count == 0
 
 
 @pytest.mark.asyncio
