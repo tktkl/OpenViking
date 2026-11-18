@@ -1021,6 +1021,46 @@ def test_state_tracks_guest_and_handler_message_times_and_clears_candidate(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_resolution_rule_migration_reevaluates_legacy_ticket_once(desk):
+    service, api, clock = await desk()
+    item = add_ticket(service, api, clock)
+    item = service.store.save(
+        item,
+        resolution_rule_version=0,
+        scenario="awaiting_handler",
+        evaluated_generation=item["generation"],
+        count=1,
+        last_send=clock() - 30,
+        retry_at=clock() + 20,
+        escalation_started_at=clock() - 100,
+        resolution_candidate_at=clock() - 200,
+        resolution_candidate_message_id="om_old_candidate",
+        resolution_candidate_evidence_ids=["om_old_candidate"],
+        resolution_candidate_reason="old",
+        resolution_deadline=clock() - 60,
+        resolution_reviewed_generation=item["generation"],
+    )
+
+    service._migrate_resolution_rule()
+    migrated = service.store.tickets["t1"]
+    assert migrated["resolution_rule_version"] == 1
+    assert migrated["scenario"] == "unknown"
+    assert migrated["evaluated_generation"] == -1
+    assert migrated["resolution_candidate_message_id"] == ""
+    assert migrated["resolution_candidate_evidence_ids"] == []
+    assert migrated["resolution_deadline"] is None
+    assert migrated["resolution_reviewed_generation"] == -1
+    assert migrated["count"] == 1
+    assert migrated["last_send"] == item["last_send"]
+    assert migrated["retry_at"] == item["retry_at"]
+    assert migrated["escalation_started_at"] == item["escalation_started_at"]
+
+    service.store.save(migrated, evaluated_generation=migrated["generation"])
+    service._migrate_resolution_rule()
+    assert service.store.tickets["t1"]["evaluated_generation"] == migrated["generation"]
+
+
+@pytest.mark.asyncio
 async def test_judge_has_independent_budget_and_requires_latest_evidence():
     provider = SimpleNamespace(
         chat=AsyncMock(

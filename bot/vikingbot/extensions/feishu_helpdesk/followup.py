@@ -31,7 +31,11 @@ from vikingbot.extensions.feishu_helpdesk.escalation import (
     normalize_system,
     render_escalation,
 )
-from vikingbot.extensions.feishu_helpdesk.state import HelpdeskState, timestamp
+from vikingbot.extensions.feishu_helpdesk.state import (
+    RESOLUTION_RULE_VERSION,
+    HelpdeskState,
+    timestamp,
+)
 from vikingbot.extensions.feishu_helpdesk.sync import HelpdeskSync
 from vikingbot.extensions.feishu_helpdesk.worktime import is_business_time
 
@@ -103,6 +107,35 @@ class HelpdeskFollowup:
             item = self.store.tickets.get(out.get("ticket"))
             if item and item.get("paused") and item.get("pause_reason") == "actor_not_assigned":
                 self.store.delete_outbox(key)
+
+    def _migrate_resolution_rule(self):
+        """Re-evaluate legacy tickets once without disturbing operational state."""
+        changed = []
+        for ticket_id, item in list(self.store.tickets.items()):
+            version = int(item.get("resolution_rule_version") or 0)
+            if version >= RESOLUTION_RULE_VERSION:
+                continue
+            changes = {"resolution_rule_version": RESOLUTION_RULE_VERSION}
+            if item["status"] not in CLOSED:
+                changes.update(
+                    scenario="unknown",
+                    evaluated_generation=-1,
+                    resolution_candidate_at=None,
+                    resolution_candidate_message_id="",
+                    resolution_candidate_evidence_ids=[],
+                    resolution_candidate_reason="",
+                    resolution_deadline=None,
+                    resolution_reviewed_generation=-1,
+                )
+            self.store.save(item, **changes)
+            changed.append(ticket_id)
+        if changed:
+            logger.info(
+                "Helpdesk resolution rule migrated: version={}, tickets={}",
+                RESOLUTION_RULE_VERSION,
+                len(changed),
+            )
+            self._wakeup.set()
 
     def _followup_scope_configured(self):
         return bool(self.config.helpdesk.escalation.followup_skill_groups)
@@ -265,6 +298,7 @@ class HelpdeskFollowup:
         for ticket in list(self.store.tickets.values()):
             if ticket["status"] not in CLOSED:
                 self._apply_followup_scope(ticket)
+        self._migrate_resolution_rule()
         if background:
             self._tasks = {
                 asyncio.create_task(self._monitor(), name="helpdesk-reconcile"),

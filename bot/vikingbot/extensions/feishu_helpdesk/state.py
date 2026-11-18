@@ -11,6 +11,8 @@ from pathlib import Path
 
 from vikingbot.extensions.feishu_helpdesk.decision import message_role
 
+RESOLUTION_RULE_VERSION = 1
+
 
 def _identity_signature(ticket):
     """Stable ticket participants; Feishu profile/CDN fields are volatile."""
@@ -133,6 +135,7 @@ class HelpdeskState:
                 "welcome_at": None,
                 "scenario": "unknown",
                 "evaluated_generation": -1,
+                "resolution_rule_version": RESOLUTION_RULE_VERSION,
                 "resolution_candidate_at": None,
                 "resolution_candidate_message_id": "",
                 "resolution_candidate_evidence_ids": [],
