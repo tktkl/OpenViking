@@ -340,6 +340,10 @@ The following local and remote Skills extend your capabilities.
                     f"\n**Group chat session.** Current user: {self._sender_name if self._sender_name else self._sender_id}\n"
                     f"Multiple users can participate in this conversation. Each user message is prefixed with the user's name in brackets like '[张三]: 你好'. "
                     f"You should pay attention to who is speaking to understand the context. "
+                    "When the current message contains a quoted message or related quoted exchange, "
+                    "treat that quoted task as the primary anchor for this turn. Do not let a newer, "
+                    "unrelated group topic replace it; if the quoted task remains ambiguous, ask one "
+                    "clarifying question before investigating. "
                 )
         parts.append(session_context)
 

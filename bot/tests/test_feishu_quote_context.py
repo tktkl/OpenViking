@@ -19,6 +19,7 @@ def make_api_message(
     msg_type="text",
     sender_id="ou_mack",
     sender_name="Mack.Luo",
+    sender_type="user",
     create_time=1_794_976_260_000,
     chat_id="oc_chat",
     root_id="",
@@ -29,7 +30,11 @@ def make_api_message(
         message_id=message_id,
         msg_type=msg_type,
         body=SimpleNamespace(content=raw_content),
-        sender=SimpleNamespace(id=sender_id, sender_name=sender_name),
+        sender=SimpleNamespace(
+            id=sender_id,
+            sender_name=sender_name,
+            sender_type=sender_type,
+        ),
         create_time=create_time,
         chat_id=chat_id,
         root_id=root_id,
@@ -97,25 +102,71 @@ def test_media_and_quote_image_limits_are_separate():
 
 
 @pytest.mark.asyncio
-async def test_quoted_text_parent_is_added_without_neighbors():
+async def test_quoted_text_parent_includes_nearest_prior_exchange():
     channel = make_channel()
+    parent_time = 1_794_976_260_000
     parent = make_api_message(
         "om_parent",
-        content={"text": "body_bytes_sent:3579\nhost:hk-wms.wangoon.cn\nrequest_path:/wms-out2b"},
+        content={"text": "dms查了数据再给结论"},
+        sender_id="ou_eden",
+        sender_name="Eden",
+        create_time=parent_time,
+    )
+    prior_user = make_api_message(
+        "om_prior_user",
+        content={"text": "2"},
+        sender_id="ou_eden",
+        sender_name="Eden",
+        create_time=parent_time - 120_000,
+    )
+    prior_assistant = make_api_message(
+        "om_prior_assistant",
+        msg_type="interactive",
+        content={
+            "elements": [
+                [
+                    {
+                        "tag": "text",
+                        "text": "Harry 问的 SDKB25042W-1 禁用 SKU 问题，自动生成路径未校验 use_status。",
+                    }
+                ]
+            ]
+        },
+        sender_id="ou_bot",
+        sender_name="Vikingbot",
+        sender_type="app",
+        create_time=parent_time - 2_000,
+    )
+    current = make_api_message(
+        "om_current",
+        content={"text": "你查的怎么样了"},
+        sender_id="ou_eden",
+        sender_name="Eden",
+        create_time=parent_time + 10_000,
+    )
+    unrelated = make_api_message(
+        "om_unrelated",
+        content={"text": "WMS 302 需要继续查生产日志"},
+        create_time=parent_time + 20_000,
     )
     channel._fetch_message_items = AsyncMock(return_value=[parent])
-    channel._list_messages_near = AsyncMock(return_value=[])
+    channel._list_messages_near = AsyncMock(
+        return_value=[prior_user, prior_assistant, parent, current, unrelated]
+    )
     channel._get_user_name = AsyncMock(return_value="Mack.Luo")
 
     context = await channel._build_quoted_context(
         SimpleNamespace(parent_id="om_parent", chat_id="oc_chat")
     )
 
-    assert "Quoted message from Mack.Luo" in context["text"]
-    assert "body_bytes_sent:3579" in context["text"]
-    assert "request_path:/wms-out2b" in context["text"]
+    assert "Quoted message from Eden" in context["text"]
+    assert "dms查了数据再给结论" in context["text"]
+    assert "[Related prior exchange]" in context["text"]
+    assert "SDKB25042W-1" in context["text"]
+    assert "禁用 SKU" in context["text"]
+    assert "WMS 302" not in context["text"]
     assert context["media"] == []
-    channel._list_messages_near.assert_not_awaited()
+    channel._list_messages_near.assert_awaited_once_with("oc_chat", parent_time)
 
 
 @pytest.mark.asyncio

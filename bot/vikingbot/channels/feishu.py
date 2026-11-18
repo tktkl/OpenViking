@@ -811,6 +811,42 @@ class FeishuChannel(BaseChannel):
         )
 
     @staticmethod
+    def _message_sender_type(message: Any) -> str:
+        sender = getattr(message, "sender", None)
+        return str(getattr(sender, "sender_type", "") or "")
+
+    def _is_assistant_message(self, message: Any) -> bool:
+        sender_id = self._message_sender_id(message)
+        sender_type = self._message_sender_type(message)
+        bot_open_id = str(getattr(self, "bot_open_id", "") or "")
+        return sender_type in {"app", "bot"} or bool(bot_open_id and sender_id == bot_open_id)
+
+    @staticmethod
+    def _interactive_message_text(raw_content: str) -> str:
+        try:
+            payload = json.loads(raw_content)
+        except (TypeError, ValueError):
+            return raw_content.strip()
+
+        texts = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"text", "content", "title"} and isinstance(item, str):
+                        text = item.strip()
+                        if text:
+                            texts.append(text)
+                    else:
+                        collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        collect(payload)
+        return "\n".join(dict.fromkeys(texts)) or raw_content.strip()
+
+    @staticmethod
     def _message_time_ms(message: Any) -> int:
         try:
             timestamp = int(getattr(message, "create_time", 0) or 0)
@@ -1360,8 +1396,10 @@ class FeishuChannel(BaseChannel):
             (parent_time, index, path) for index, path in enumerate(parent_media)
         ]
         captions: list[str] = []
-        if parent_media:
+        nearby: list[Any] = []
+        if parent_media or parent_type in {"text", "post"}:
             nearby = await self._list_messages_near(chat_id, parent_time)
+        if parent_media:
             segment = self._contiguous_same_sender_segment(
                 parent,
                 nearby,
@@ -1417,6 +1455,65 @@ class FeishuChannel(BaseChannel):
                 if text and text not in {"[image]", "[file]", "[audio]", "[sticker]"}:
                     captions.append(text)
 
+        related_exchange: list[tuple[Any, str]] = []
+        if parent_type in {"text", "post"} and nearby:
+            ordered = sorted(nearby, key=self._message_time_ms)
+            parent_index = next(
+                (
+                    index
+                    for index, item in enumerate(ordered)
+                    if str(getattr(item, "message_id", "") or "") == parent_id
+                ),
+                None,
+            )
+            before_parent = (
+                ordered[:parent_index]
+                if parent_index is not None
+                else [item for item in ordered if self._message_time_ms(item) < parent_time]
+            )
+            prior = [
+                item
+                for item in before_parent
+                if str(getattr(item, "message_id", "") or "")
+                not in {parent_id, current_message_id}
+                and self._message_type(item) in {"text", "post", "interactive"}
+            ]
+            assistant_index = next(
+                (
+                    index
+                    for index in range(len(prior) - 1, -1, -1)
+                    if self._is_assistant_message(prior[index])
+                ),
+                None,
+            )
+            if assistant_index is not None:
+                selected = [prior[assistant_index]]
+                user_message = next(
+                    (
+                        item
+                        for item in reversed(prior[:assistant_index])
+                        if not self._is_assistant_message(item)
+                    ),
+                    None,
+                )
+                if user_message is not None:
+                    selected.insert(0, user_message)
+                for item in selected:
+                    item_type = self._message_type(item)
+                    if item_type == "interactive":
+                        text = self._interactive_message_text(self._message_content(item))
+                    else:
+                        text, _, _ = await self._parse_message_content(
+                            item,
+                            item_type,
+                            str(getattr(item, "message_id", "") or ""),
+                            raw_content=self._message_content(item),
+                            max_images=0,
+                        )
+                    text = text.strip()
+                    if text and text not in {"[image]", "[file]", "[audio]", "[sticker]"}:
+                        related_exchange.append((item, text[:600]))
+
         media.sort(key=lambda item: (item[0], item[1]))
         media_paths = [path for _, _, path in media[:image_limit]]
         sender_label = await self._sender_label(parent, chat_id)
@@ -1433,6 +1530,13 @@ class FeishuChannel(BaseChannel):
         if captions:
             parts.append("[Nearby same-sender text]")
             parts.extend(f"- {text}" for text in captions)
+        if related_exchange:
+            parts.append("[Related prior exchange]")
+            for item, text in related_exchange:
+                label = await self._sender_label(item, chat_id)
+                parts.append(
+                    f"- [{label} at {self._message_time_label(item)}] {text}"
+                )
         if not media_paths and image_limit == 0 and parent_type in {"image", "post"}:
             parts.append("[Quoted images omitted: turn image limit reached]")
         if not parent_text and not media_paths and len(parts) == 1:
