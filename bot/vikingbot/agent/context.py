@@ -23,6 +23,17 @@ if TYPE_CHECKING:
     from vikingbot.config.schema import Config
 
 
+TASK_EXECUTION_GUIDANCE = """## Execution discipline
+
+- When information can be retrieved with tools, retrieve it before asking the user.
+- Ask a clarifying question only when the missing information cannot be obtained with tools, or when it requires a user choice, approval, or unavailable personal context.
+- Do not end a turn with a promise of future action; execute the action now when it is safe and within scope.
+- If a tool returns empty, partial, or failed results, try a different query, source, or tool before giving up.
+- Before finalizing, verify the result against the user request and the available tool evidence.
+- If clarification is necessary, ask one consolidated question containing all missing details; do not ask repeated small follow-ups.
+"""
+
+
 class ContextBuilder:
     """
     Builds the context (system prompt + messages) for the agent.
@@ -188,6 +199,7 @@ class ContextBuilder:
 
         # Core identity
         parts.append(await self._get_identity(session_key))
+        parts.append(TASK_EXECUTION_GUIDANCE)
 
         if session_key.type == "feishu":
             parts.append(

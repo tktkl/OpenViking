@@ -124,7 +124,7 @@ class FeishuMediaWindowConfig(BaseModel):
     """Bounded recent-media context for Feishu group conversations."""
 
     enabled: bool = True
-    max_images: int = Field(default=10, ge=1)
+    max_images: int = Field(default=4, ge=1)
     max_age_minutes: int = Field(default=10, ge=1)
     max_messages: int = Field(default=20, ge=1)
     same_sender_only: bool = True
@@ -153,6 +153,8 @@ class FeishuChannelConfig(BaseChannelConfig):
         description="群聊是否需要@才响应：默认True=普通群和话题群的所有消息都必须@才响应；False=普通群无需@，话题群仅首条消息无需@，非DEBUG模式下后续回复必须@",
     )
     media_window: FeishuMediaWindowConfig = Field(default_factory=FeishuMediaWindowConfig)
+    quote_max_images: int = Field(default=10, ge=1)
+    turn_max_images: int = Field(default=10, ge=1)
 
     def channel_id(self) -> str:
         # Use app_id directly as the ID

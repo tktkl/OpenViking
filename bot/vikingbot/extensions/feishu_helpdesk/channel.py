@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import httpx
 from loguru import logger
@@ -104,6 +105,8 @@ class FeishuHelpdeskChannel(FeishuChannel):
         self._helpdesk_ready = False
         self._join_tasks: dict[str, asyncio.Task] = {}
         self._media_summary_keys: set[str] = set()
+        self._quoted_parent_media_refs: dict[str, list[dict[str, Any]]] = {}
+        self._quoted_parent_summary_context: dict[str, str] = {}
         self._ticket_chats: OrderedDict[str, str] = OrderedDict()
         self._followup = None
         self._followup_deps = {
@@ -196,6 +199,8 @@ class FeishuHelpdeskChannel(FeishuChannel):
         self._helpdesk_tasks.clear()
         self._join_tasks.clear()
         self._media_summary_keys.clear()
+        self._quoted_parent_media_refs.clear()
+        self._quoted_parent_summary_context.clear()
         self._ticket_chats.clear()
         if self._resolver_task is not None:
             self._resolver_task.cancel()
@@ -312,7 +317,53 @@ class FeishuHelpdeskChannel(FeishuChannel):
         if self._followup is not None and self._followup.running:
             if self._followup.native(data) != "pass":
                 return
+            await self._observe_quoted_parent_for_ticket(data)
         await super()._on_message(data)
+
+    async def _observe_quoted_parent_for_ticket(self, data):
+        """Give ticket automation only the quoted parent, never a full expansion."""
+        event = getattr(data, "event", None)
+        message = getattr(event, "message", None)
+        if message is None or not getattr(message, "parent_id", None):
+            return
+        if any(
+            self._is_bot_mention(mention)
+            for mention in (getattr(message, "mentions", None) or [])
+        ):
+            # @Bot messages are enriched by the normal reply path, which can
+            # include bounded thread/merge_forward context.
+            return
+        ticket = self._followup.for_chat(getattr(message, "chat_id", ""))
+        if ticket is None:
+            return
+        quoted = await self._build_quoted_parent_context(message)
+        if not quoted:
+            return
+        current_text = message_text(getattr(message, "content", ""))
+        if getattr(message, "message_type", "") == "image":
+            current_text = "[image]"
+        combined = (
+            f"{current_text}\n\n{quoted['text']}"
+            if current_text
+            else quoted["text"]
+        )
+        message_id = str(getattr(message, "message_id", "") or "")
+        self._followup.observe(
+            ticket["id"],
+            {"im_id": message_id, "text": combined},
+        )
+        self._followup.dirty(ticket["id"])
+        refs = [
+            {
+                "message_id": quoted.get("parent_id") or message_id,
+                "cache_path": path,
+            }
+            for path in quoted.get("media") or []
+            if isinstance(path, str) and path
+        ]
+        if refs:
+            self._quoted_parent_media_refs[message_id] = refs
+            self._quoted_parent_summary_context[message_id] = combined
 
     def _schedule_ticket(self, data):
         if not self._running or not self._helpdesk_ready:
@@ -463,11 +514,50 @@ class FeishuHelpdeskChannel(FeishuChannel):
             metadata["helpdesk_ticket_id"] = ticket_id
             metadata["helpdesk_id"] = self.config.helpdesk.helpdesk_id
             content = args[2] if len(args) > 2 else kwargs.get("content", "")
+            message_id = str(metadata.get("message_id") or "")
+            update_text = not metadata.get("parent_id") or bool(
+                metadata.get("quoted_context_applied")
+            )
+            if (
+                update_text
+                and message_id
+                and content
+                and self._followup is not None
+                and self._followup.running
+            ):
+                # native() observed the raw inbound text before quoted context
+                # was expanded. Merge the enriched text back before the next
+                # judge run so ticket automation sees the same context.
+                self._followup.observe(
+                    ticket_id,
+                    {"im_id": message_id, "text": content},
+                )
+                self._followup.dirty(ticket_id)
+            media_refs = list(kwargs.get("media_refs") or [])
+            media_refs.extend(self._quoted_parent_media_refs.pop(message_id, []))
+            summary_content = self._quoted_parent_summary_context.pop(
+                message_id, content
+            )
+            seen_paths = {
+                ref.get("cache_path")
+                for ref in media_refs
+                if isinstance(ref, dict) and ref.get("cache_path")
+            }
+            for path in metadata.get("quoted_media_paths") or []:
+                if not isinstance(path, str) or not path or path in seen_paths:
+                    continue
+                media_refs.append(
+                    {
+                        "message_id": metadata.get("quoted_message_id") or message_id,
+                        "cache_path": path,
+                    }
+                )
+                seen_paths.add(path)
             self._observe_ticket_media(
                 ticket_id,
                 metadata,
-                kwargs.get("media_refs") or [],
-                content=content,
+                media_refs,
+                content=summary_content,
             )
         return await super()._handle_message(*args, metadata=metadata, **kwargs)
 

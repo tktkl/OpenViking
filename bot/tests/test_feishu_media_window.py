@@ -235,3 +235,28 @@ def test_session_fields_preserve_source_identity_without_entering_history():
     assert session.messages[0]["media_refs"][0]["image_key"] == "img_1"
     assert session.messages[0]["media_paths"] == ["/tmp/one.png"]
     assert session.get_history()[0] == {"role": "user", "content": message.content}
+
+
+def test_session_fields_exclude_quoted_media_paths():
+    message = inbound(
+        media=["/tmp/current.png", "/tmp/quoted.png"],
+        refs=[ref("om_current", "img_current", "/tmp/current.png")],
+    )
+    message.metadata["quoted_media_paths"] = ["/tmp/quoted.png"]
+
+    fields = session_media_fields(message)
+
+    assert fields["media_paths"] == ["/tmp/current.png"]
+
+
+def test_current_turn_images_are_not_dropped_by_small_recent_media_limit():
+    paths = [f"/tmp/current-{index}.png" for index in range(6)]
+    message = inbound(media=paths)
+
+    selected = select_recent_media(
+        Session(SESSION_KEY),
+        message,
+        FeishuMediaWindowConfig(max_images=4, max_age_minutes=10, max_messages=20),
+    )
+
+    assert selected == paths

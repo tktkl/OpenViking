@@ -30,7 +30,16 @@ def session_media_fields(message: InboundMessage) -> dict[str, Any]:
     refs = message.media_refs or metadata.get("media_refs")
     if isinstance(refs, list) and refs:
         fields["media_refs"] = refs
-    paths = [item for item in message.media if isinstance(item, str) and item]
+    quoted_paths = {
+        item
+        for item in (metadata.get("quoted_media_paths") or [])
+        if isinstance(item, str) and item
+    }
+    paths = [
+        item
+        for item in message.media
+        if isinstance(item, str) and item and item not in quoted_paths
+    ]
     if paths:
         fields["media_paths"] = paths
     return fields
@@ -137,4 +146,7 @@ def select_recent_media(
             if isinstance(path, str) and path and path not in selected:
                 selected.append(path)
 
-    return selected[: config.max_images]
+    # Current-turn media (including quoted media) is already bounded by the
+    # adapter; never let the recent-history window drop it. The configured
+    # max_images applies to additional historical media.
+    return selected[: max(config.max_images, len(current_paths))]

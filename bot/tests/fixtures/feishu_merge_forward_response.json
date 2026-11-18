@@ -1,0 +1,98 @@
+{
+  "items": [
+    {
+      "message_id": "om_x100b6088667f34b0de014600d5c09a6",
+      "root_id": "",
+      "parent_id": "",
+      "thread_id": "",
+      "msg_type": "merge_forward",
+      "create_time": 1794884235299,
+      "chat_id": "oc_c3deaf22ddfa568d745fd4d881e2ddde",
+      "sender": {
+        "id": "ou_thunder_fixture",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "sender_name": "Thunder.Wu"
+      },
+      "body": {
+        "content": "Merged and Forwarded Message"
+      }
+    },
+    {
+      "message_id": "om_x100b608f19ba3508c308aaea5ede4ee",
+      "root_id": "",
+      "parent_id": "",
+      "thread_id": "",
+      "msg_type": "image",
+      "create_time": 1794880887805,
+      "chat_id": "oc_c3deaf22ddfa568d745fd4d881e2ddde",
+      "sender": {
+        "id": "ou_eason_fixture",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "sender_name": "Eason"
+      },
+      "body": {
+        "content": "{\"image_key\":\"img_v3_0217h_447f61e6-96ea-47c8-a5c5-bea42076c44g\"}"
+      },
+      "upper_message_id": "om_x100b6088667f34b0de014600d5c09a6"
+    },
+    {
+      "message_id": "om_x100b608f195b38b0c4e85d963b9499d",
+      "root_id": "om_x100b608f19ba3508c308aaea5ede4ee",
+      "parent_id": "om_x100b608f19ba3508c308aaea5ede4ee",
+      "thread_id": "",
+      "msg_type": "text",
+      "create_time": 1794880889534,
+      "chat_id": "oc_c3deaf22ddfa568d745fd4d881e2ddde",
+      "sender": {
+        "id": "ou_eason_fixture",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "sender_name": "Eason"
+      },
+      "body": {
+        "content": "{\"text\":\"<p>这个供应商变更的，怎么会用到我的账号发起呢</p>\"}"
+      },
+      "upper_message_id": "om_x100b6088667f34b0de014600d5c09a6"
+    },
+    {
+      "message_id": "om_x100b608f162948a4cd0c15d412e5b67",
+      "root_id": "",
+      "parent_id": "",
+      "thread_id": "",
+      "msg_type": "text",
+      "create_time": 1794880910402,
+      "chat_id": "oc_c3deaf22ddfa568d745fd4d881e2ddde",
+      "sender": {
+        "id": "ou_eason_fixture",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "sender_name": "Eason"
+      },
+      "body": {
+        "content": "{\"text\":\"[当前版本不支持查看此类卡片消息]\"}"
+      },
+      "upper_message_id": "om_x100b6088667f34b0de014600d5c09a6"
+    },
+    {
+      "message_id": "om_x100b608f1496cca0df810dfa6002ded",
+      "root_id": "",
+      "parent_id": "",
+      "thread_id": "",
+      "msg_type": "text",
+      "create_time": 1794880933954,
+      "chat_id": "oc_c3deaf22ddfa568d745fd4d881e2ddde",
+      "sender": {
+        "id": "ou_eason_fixture",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "sender_name": "Eason"
+      },
+      "body": {
+        "content": "{\"text\":\"[当前版本不支持查看此类卡片消息]\"}"
+      },
+      "upper_message_id": "om_x100b6088667f34b0de014600d5c09a6"
+    }
+  ]
+}

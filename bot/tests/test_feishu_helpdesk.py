@@ -478,6 +478,125 @@ async def test_stop_clears_ticket_binding_before_late_im_is_received(channel):
 
 
 @pytest.mark.asyncio
+async def test_helpdesk_handle_message_merges_quoted_context_into_ticket_state(channel):
+    channel._ticket_chats["oc_ticket"] = "ticket_1"
+    observe = Mock()
+    dirty = Mock()
+    channel._followup = SimpleNamespace(
+        running=True,
+        observe=observe,
+        dirty=dirty,
+        close=AsyncMock(),
+    )
+    channel._observe_ticket_media = Mock()
+    content = "当前问题\n\n[Quoted message from Mack.Luo]\nrequest log\n[End quoted message]"
+
+    await channel._handle_message(
+        sender_id="ou_user",
+        chat_id="oc_ticket",
+        content=content,
+        media_refs=[
+            {"message_id": "om_current", "cache_path": "/tmp/current.png"}
+        ],
+        metadata={
+            "message_id": "om_current",
+            "reply_to": "oc_ticket",
+            "chat_type": "group",
+            "quoted_message_id": "om_parent",
+            "quoted_context_applied": True,
+            "quoted_media_paths": ["/tmp/quoted.png"],
+        },
+    )
+
+    observe.assert_any_call(
+        "ticket_1",
+        {"im_id": "om_current", "text": content},
+    )
+    dirty.assert_called_with("ticket_1")
+    observed_refs = channel._observe_ticket_media.call_args.args[2]
+    assert observed_refs == [
+        {"message_id": "om_current", "cache_path": "/tmp/current.png"},
+        {"message_id": "om_parent", "cache_path": "/tmp/quoted.png"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_mentioned_ticket_quote_adds_only_parent_context(channel):
+    observe = Mock()
+    dirty = Mock()
+    channel.bot_open_id = "ou_bot"
+    channel._followup = SimpleNamespace(
+        running=True,
+        for_chat=Mock(return_value={"id": "ticket_1"}),
+        observe=observe,
+        dirty=dirty,
+        close=AsyncMock(),
+    )
+    channel._build_quoted_parent_context = AsyncMock(
+        return_value={
+            "text": "[Quoted message from Mack.Luo]\n父消息\n[End quoted message]",
+            "media": ["/tmp/quoted.png"],
+            "parent_id": "om_parent",
+            "image_count": 1,
+        }
+    )
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_current",
+                chat_id="oc_ticket",
+                parent_id="om_parent",
+                mentions=[],
+                message_type="text",
+                content=json.dumps({"text": "补充一下"}),
+            )
+        )
+    )
+
+    await channel._observe_quoted_parent_for_ticket(data)
+
+    observe.assert_called_once_with(
+        "ticket_1",
+        {
+            "im_id": "om_current",
+            "text": "补充一下\n\n[Quoted message from Mack.Luo]\n父消息\n[End quoted message]",
+        },
+    )
+    dirty.assert_called_once_with("ticket_1")
+    assert channel._quoted_parent_media_refs["om_current"] == [
+        {"message_id": "om_parent", "cache_path": "/tmp/quoted.png"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_does_not_overwrite_parent_only_quote_text(channel):
+    channel._ticket_chats["oc_ticket"] = "ticket_1"
+    observe = Mock()
+    channel._followup = SimpleNamespace(
+        running=True,
+        observe=observe,
+        dirty=Mock(),
+        close=AsyncMock(),
+    )
+    channel._observe_ticket_media = Mock()
+
+    await channel._handle_message(
+        sender_id="ou_user",
+        chat_id="oc_ticket",
+        content="raw current text",
+        metadata={
+            "message_id": "om_current",
+            "reply_to": "oc_ticket",
+            "chat_type": "group",
+            "parent_id": "om_parent",
+            "quoted_context_applied": False,
+        },
+    )
+
+    observe.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_websocket_thread_dispatch_and_shutdown_cancel_background_work(channel):
     started = asyncio.Event()
 
